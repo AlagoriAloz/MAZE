@@ -687,32 +687,15 @@ jobs:
             })();
             const btcR5=(()=>{ const c=(kBTC5||[]).map(x=>+x[4]); const r=[]; for(let i=1;i<c.length;i++) r.push(Math.log(c[i]/c[i-1])); return r.slice(-120); })();
 
-            // Universe build - Fixed 120 coins
-            const FIXED_120_BASES = ["BTC","ETH","BNB","SOL","XRP","ADA","AVAX","DOGE","DOT","MATIC","LTC","SHIB","TRX","LINK","ATOM","UNI","XLM","ETC","BCH","NEAR","APT","ARB","OP","LDO","STX","IMX","INJ","VET","FIL","HBAR","MKR","AAVE","QNT","GRT","ALGO","RUNE","SAND","MANA","XTZ","AXS","EOS","THETA","FTM","ICP","EGLD","FLOW","XMR","APE","CHZ","KLAY","GALA","SNX","CRV","ZEC","ENJ","DASH","NEO","COMP","KCS","ZIL","BAT","WAVES","IOTA","1INCH","LRC","SUSHI","YFI","RVN","CELO","HOT","OMG","ZRX","ICX","ONT","QTUM","SKL","AR","GMT","JST","RSR","ONE","AUDIO","ANKR","CKB","MASK","DYDX","BLUR","SUI","SEI","TIA","JUP","WLD","PEPE","FET","RENDER","AGIX","ORDI","WIF","BONK","FLOKI","PYTH","JTO","STRK","MEME","DYM","PORTAL","XAI","ALT","PIXEL","AEVO","NFP","ACE","RDNT","MAV","PENDLE","AI","ID","JOE"];
+            // Universe build
             const QUOTES=["USDT","USDC","USD"];
             const split=(sym)=>{ for(const q of QUOTES) if(sym.endsWith(q)) return { base:sym.slice(0,-q.length), quote:q }; return null; };
-            const all24Map=new Map(); for(const t of ALL24||[]){ const sym=t.symbol||t.s; if(sym) all24Map.set(sym,t); }
-            const universe=[];
-            for(const base of FIXED_120_BASES){
-              let found=false;
-              for(const q of QUOTES){
-                const sym=base+q;
-                const t=all24Map.get(sym);
-                if(t){
-                  const qv=+(t.quoteVolume||t.q||0);
-                  if(qv>0){
-                    universe.push({ symbol:sym, base, quote:q, qv });
-                    found=true;
-                    break;
-                  }
-                }
-              }
-              if(!found && universe.length<120){
-                // Fallback: assume symbol exists with minimal volume
-                universe.push({ symbol:base+"USDT", base, quote:"USDT", qv:1000000 });
-              }
-            }
-            log("universe (fixed 120)", universe.length);
+            const all=[]; for(const t of ALL24||[]){ const sym=t.symbol||t.s; if(!sym) continue; const sq=split(sym); if(!sq) continue; if(STABLES.has(sq.base)) continue; const qv=+(t.quoteVolume||t.q||0); if(!isFinite(qv)||qv<=0) continue; all.push({ symbol:sym, base:sq.base, quote:sq.quote, qv }); }
+            all.sort((a,b)=>b.qv-a.qv);
+            let dynMinQV=Math.max(MIN_QV_ENV||0,DYN_QV_MIN), filt=all.filter(x=>x.qv>=dynMinQV);
+            while(filt.length<UNIV_TARGET_MIN && dynMinQV>1_000_000){ dynMinQV=Math.max(1_000_000, dynMinQV-DYN_QV_STEP); filt=all.filter(x=>x.qv>=dynMinQV); }
+            const universe=filt.slice(0,UNIV_TARGET_MAX);
+            log("universe", universe.length, "dyn_min_qv", dynMinQV);
 
             // DD/throttle
             const equityStats=(eq)=>{ const day=Date.now()-24*3600*1000; let pnl24=0,cum=0,peak=0,dd=0; for(const e of eq||[]){ if(e.ts_ms>=day) pnl24+=e.pnl_bps; cum+=e.pnl_bps; if(cum>peak) peak=cum; dd=Math.min(dd,cum-peak); } return { pnl24_bps:Math.round(pnl24), peak_dd_bps:Math.round(dd) }; };
