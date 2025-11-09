@@ -1,4 +1,4 @@
-name: Ideas Pusher (MEXC Ultimate 7.7.7)
+name: Ideas Pusher (MEXC Ultimate 7.7.7 - Production Ready)
 
 on:
   schedule:
@@ -6,7 +6,6 @@ on:
   repository_dispatch:
     types: [run_B]
   workflow_dispatch: {}
- 
 
 permissions:
   contents: read
@@ -109,7 +108,7 @@ jobs:
           (async ()=>{
           'use strict';
           const crypto = require('crypto');
-          const MODEL_VERSION=(process.env.MODEL_VERSION||"7.7.7");
+          const MODEL_VERSION=(process.env.MODEL_VERSION||"8.0.0");
           const UA = `gh-actions-ideas-mexc-ultimate/${MODEL_VERSION} (+https://github.com/)`;
           
           // ========== PHASE 2: TRAINING GATES + REGIME CONFIG ==========
@@ -493,7 +492,7 @@ jobs:
           // ---------- State (Gist) + Calibration + Audit ----------
           async function loadState(){
             const token=process.env.GIST_TOKEN, id=process.env.GIST_ID;
-            const init={ v:"mexc-ultimate-7.7.7-audit-mtf",
+            const init={ v:"mexc-ultimate-8.0.0-audit-mtf",
               cooldown:{}, cooldown_side:{}, pending:[], equity:[], closed:[],
               mr_lockout:{}, sym_stats:{}, sym_stats_real:{}, calibCoeffs:{}, lastReconcileTs:0,
               calibration_holdout:[],
@@ -1619,6 +1618,7 @@ jobs:
                 }
               }
               state.ml_models.logistic = { w, bias, trained_at: nowTs, n_samples: n };
+              log("  ✅ Logistic Regression trained.");
             }
             
             // Naive Bayes
@@ -1637,6 +1637,7 @@ jobs:
                 prior_short: short_samples.length / n,
                 trained_at: nowTs, n_samples: n
               };
+              log("  ✅ Naive Bayes trained.");
             }
             
             // Decision Tree
@@ -1645,6 +1646,7 @@ jobs:
                 root: buildTree(X, y, 0, 5),
                 trained_at: nowTs, n_samples: n
               };
+              log("  ✅ Decision Tree trained.");
             }
             
             // Random Forest
@@ -1661,11 +1663,12 @@ jobs:
                 trees.push({ root: buildTree(bootstrap_X, bootstrap_y, 0, 5) });
               }
               state.ml_models.randomforest = { trees, trained_at: nowTs, n_samples: n };
+              log("  ✅ Random Forest trained.");
             }
 
             state.ml_models.meanreversion = { trained_at: nowTs, n_samples: n };
             state.ml_models.momentum = { trained_at: nowTs, n_samples: n };
-            log(`✅ Models trained.`);
+            log(`✅ Models training process complete.`);
           }
 
           /**
@@ -1870,7 +1873,7 @@ jobs:
               after: state.closed.length,
               unprocessed: unprocessed.length,
               processed_kept: processedKept.length,
-              processed_dropped: processed.length - processed.length
+              processed_dropped: processed.length - processedKept.length // ✅ Corrected
             };
             
             if (report.processed_dropped > 0 || report.unprocessed > 0) {
@@ -2342,10 +2345,8 @@ jobs:
                   state.model_scoreboard[model].total++;
                   if (wasCorrect) {
                     state.model_scoreboard[model].correct++;
-                    correct.push(model);
                   } else {
                     state.model_scoreboard[model].wrong++;
-                    wrong.push(model);
                   }
                   
                   const sb = state.model_scoreboard[model];
@@ -2488,32 +2489,13 @@ jobs:
               return alerts;
             }
 
-            /**
-             * Optional: Reset calibration if system performed terribly (Phase 6)
-             */
-            function resetCalibrationIfNeeded(state) {
-              const sl = state.system_learning;
-              if (!sl) return false;
-              const overallWinrate = sl.winrate;
-              const totalTrades = sl.total_trades;
-              if (overallWinrate < 0.35 && totalTrades >= 20) {
-                log('\n' + '🔄'.repeat(40));
-                log('🔄 CALIBRATION RESET TRIGGERED');
-                log(`   Reason: Win rate ${(overallWinrate*100).toFixed(1)}% < 35% over ${totalTrades} trades`);
-                log('   Action: Clearing calibration coefficients (will re-learn from scratch)');
-                log('🔄'.repeat(40) + '\n');
-                state.calibCoeffs = {};
-                for (const c of state.closed || []) c.learned = false;
-                return true;
-              }
-              return false;
-            }
-
             const alerts = checkCriticalConditions(state);
             
             // Heartbeat existing pending
             const heartbeat = await heartbeatCheck(state);
             if((heartbeat?.zombies||0)>0) log("heartbeat zombies", heartbeat.zombies, (heartbeat.details||[]).slice(0,5));
+            if (state.system_learning?.health) state.system_learning.health.zombie_count = heartbeat?.zombies||0;
+
 
             // Strict pre-clean of orphan pendings
             const cleaned = await cleanupPendingBeforePlanning(state, heartbeat);
@@ -2531,7 +2513,7 @@ jobs:
             if(!todOK) reason="tod_gate";
 
             // BTC regimes
-            const BTC="BTCUSDT", ETH="ETHUSDT", SOL="SOLUSDT";
+            const BTC="BTCUSDT";
             const kBTC1H=await getKCached(BTC,"1h",K1H);
             const kBTC5=await getKCached(BTC,"5m",K5M);
             const btcUp1h = (() => {
@@ -2543,7 +2525,6 @@ jobs:
 
             const FIXED_120_BASES = ["BTC","ETH","BNB","SOL","XRP","ADA","AVAX","DOGE","DOT","MATIC","LTC","SHIB","TRX","LINK","ATOM","UNI","XLM","ETC","BCH","NEAR","APT","ARB","OP","LDO","STX","IMX","INJ","VET","FIL","HBAR","MKR","AAVE","QNT","GRT","ALGO","RUNE","SAND","MANA","XTZ","AXS","EOS","THETA","FTM","ICP","EGLD","FLOW","XMR","APE","CHZ","KLAY","GALA","SNX","CRV","ZEC","ENJ","DASH","NEO","COMP","KCS","ZIL","BAT","WAVES","IOTA","1INCH","LRC","SUSHI","YFI","RVN","CELO","HOT","OMG","ZRX","ICX","ONT","QTUM","SKL","AR","GMT","JST","RSR","ONE","AUDIO","ANKR","CKB","MASK","DYDX","BLUR","SUI","SEI","TIA","JUP","WLD","PEPE","FET","RENDER","AGIX","ORDI","WIF","BONK","FLOKI","PYTH","JTO","STRK","MEME","DYM","PORTAL","XAI","ALT","PIXEL","AEVO","NFP","ACE","RDNT","MAV","PENDLE","AI","ID","JOE"];
             const QUOTES=["USDT","USDC","USD"];
-            const split=(sym)=>{ for(const q of QUOTES) if(sym.endsWith(q)) return { base:sym.slice(0,-q.length), quote:q }; return null; };
             const all24Map=new Map(); for(const t of ALL24||[]){ const sym=t.symbol||t.s; if(sym) all24Map.set(sym,t); }
             const universe=[];
             for(const base of FIXED_120_BASES){
@@ -2656,7 +2637,6 @@ jobs:
                 const depth=depthB||depthA; if(!depth?.bids?.length || !depth?.asks?.length) continue;
                 const obi=computeOBI(depth,OBI_TOPN);
                 const ofi30s=ofiProxy(depthA,depthB);
-                const slopeObj=bookSlope(depth,mid);
                 const bestBid=+depth?.bids?.[0]?.[0], bestAsk=+depth?.asks?.[0]?.[0], bidQ=+depth?.bids?.[0]?.[1], askQ=+depth?.asks?.[0]?.[1];
                 const mp=(bestBid&&bestAsk&&bidQ&&askQ)?microprice(bestBid,bestAsk,bidQ,askQ):null;
                 const micro_bias_bps=(mp&&mid)?Math.round((mp-mid)/mid*10000):null;
@@ -2794,14 +2774,6 @@ jobs:
               pick.ml_ensemble=ensemble;
               pick.ml_features=features;
               
-              pick.ml_ensemble.training_buffer_size = state.ml_training_buffer?.length || 0;
-              state.buffer_at_plan = state.buffer_at_plan || {};
-              state.buffer_at_plan[pick.idea_id] = state.ml_training_buffer?.length || 0;
-              const bufferKeys = Object.keys(state.buffer_at_plan);
-              if (bufferKeys.length > 300) {
-                bufferKeys.slice(0, bufferKeys.length - 300).forEach(k => delete state.buffer_at_plan[k]);
-              }
-              
               log(`  📝 RESULT: side=${oldSide}→${pick.side}, conf=${oldConf}→${pick.confidence} (+${ensemble.confidence_boost})`);
             }
 
@@ -2829,16 +2801,6 @@ jobs:
             state.ml_voting_history.push(votingRecord);
             if(state.ml_voting_history.length>20) state.ml_voting_history=state.ml_voting_history.slice(-20);
 
-            try {
-              safeTrimClosed(state);
-              trimStateForGist(state);
-              const auditOut=buildAuditOutputs(state);
-              await saveState(persist, state, auditOut, 2, true);
-              log(`✅ ML voting record saved to Gist (${votingRecord.votes.length} votes)`);
-            } catch(e) {
-              log(`⚠️  Failed to save voting record:`, e?.message||e);
-            }
-
             const wEv=softmax(selected.map(x=>x.exp_lcb_bps),20);
 
             if(FIXED_SIZE_BPS > 0) log(`\n💰 Using FIXED capital allocation: ${CAPITAL_PCT_PER_TRADE}% per trade (${FIXED_SIZE_BPS} bps)`);
@@ -2846,6 +2808,16 @@ jobs:
             else log(`\n💰 Using DYNAMIC risk-based sizing (max ${TARGET_PORT_RISK_BPS} bps portfolio risk)`);
 
             let picksV2 = selected.map((x,i)=>{
+              const idea_id = uuidv4();
+              const client_order_id = mkClientOrderId("mxu");
+
+              // ========== Phase 5: Track buffer size at trade time (MOVED HERE) ==========
+              if (x.ml_ensemble) {
+                x.ml_ensemble.training_buffer_size = state.ml_training_buffer?.length || 0;
+              }
+              state.buffer_at_plan = state.buffer_at_plan || {};
+              state.buffer_at_plan[idea_id] = state.ml_training_buffer?.length || 0;  // ✅ Now idea_id exists!
+
               const bk = bookMap.get(x.symbol);
               const mid = (bk?.bid && bk?.ask) ? ((+bk.bid + +bk.ask)/2) : null;
 
@@ -2862,9 +2834,6 @@ jobs:
                   sl_abs = entry_limit * (1 + slF);
                 }
               }
-
-              const idea_id = uuidv4();
-              const client_order_id = mkClientOrderId("mxu");
 
               const ttl = clamp(Math.round((x.hold_sec || 720)+i*12), TTL_MIN, TTL_MAX);
               let size_bps = FIXED_SIZE_BPS > 0 ? FIXED_SIZE_BPS : (Number(process.env.FORCE_SIZE_BPS||"0")>0) ? Math.round(Number(process.env.FORCE_SIZE_BPS)) : (x.sl_bps>0?Math.min(220,Math.round((wEv[i]*TARGET_PORT_RISK_BPS/x.sl_bps)*100)):0);
@@ -2887,6 +2856,12 @@ jobs:
                 trend5m: x.trend5m, ml_features: x.ml_features, ml_ensemble: x.ml_ensemble
               };
             });
+
+            // Clean buffer_at_plan (keep last 300)
+            const bufferKeys = Object.keys(state.buffer_at_plan || {});
+            if (bufferKeys.length > 300) {
+              bufferKeys.slice(0, bufferKeys.length - 300).forEach(k => delete state.buffer_at_plan[k]);
+            }
 
             const toV1Compat = (pv2) => ({
               ...pv2,
