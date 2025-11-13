@@ -2,7 +2,7 @@ name: Ideas Pusher (MEXC Ultimate 7.7.7 - Production Ready)
 
 on:
   schedule:
-    - cron: "0 */2 * * *"
+    - cron: "0 */3 * * *"
   repository_dispatch:
     types: [run_B]
   workflow_dispatch: {}
@@ -80,8 +80,6 @@ jobs:
       REGIME_EXPLORE_RISK_FACTOR: ${{ vars.REGIME_EXPLORE_RISK_FACTOR }}
       MIN_SAMPLES_LOGISTIC: ${{ vars.MIN_SAMPLES_LOGISTIC }}
       MIN_SAMPLES_NAIVEBAYES: ${{ vars.MIN_SAMPLES_NAIVEBAYES }}
-      MIN_SAMPLES_HOEFFDINGTREE: ${{ vars.MIN_SAMPLES_HOEFFDINGTREE }}
-      MIN_SAMPLES_ADAPTIVERF: ${{ vars.MIN_SAMPLES_ADAPTIVERF }}
       WEIGHT_MIN_RULE_BASED: ${{ vars.WEIGHT_MIN_RULE_BASED }}
       EWAF_HALF_LIFE: ${{ vars.EWAF_HALF_LIFE }}
       EWAF_TEMPERATURE: ${{ vars.EWAF_TEMPERATURE }}
@@ -91,15 +89,6 @@ jobs:
       KEEP_PROCESSED_TRADES: 0 # CRITICAL: Set to 0 for aggregate-only
       MAX_PENDING: 50
       MAX_EQUITY_POINTS: 100
-
-      # Feature toggles
-      ENABLE_INTERACTIONS: ${{ vars.ENABLE_INTERACTIONS }}
-      ENABLE_UNCERTAINTY: ${{ vars.ENABLE_UNCERTAINTY }}
-      ENABLE_BAYES: ${{ vars.ENABLE_BAYES }}
-      ENABLE_ADAPTIVE_DECAY: ${{ vars.ENABLE_ADAPTIVE_DECAY }}
-      ENABLE_ADAPTIVE_RISK: ${{ vars.ENABLE_ADAPTIVE_RISK }}
-      ENABLE_TREE: ${{ vars.ENABLE_TREE }}
-      ENABLE_RF: ${{ vars.ENABLE_RF }}
 
     steps:
       - name: Setup Node 20
@@ -123,41 +112,19 @@ jobs:
           (async ()=>{
           'use strict';
           const crypto = require('crypto');
-          const MODEL_VERSION=(process.env.MODEL_VERSION||"9.1.0-robust");
+          const MODEL_VERSION=(process.env.MODEL_VERSION||"9.0.0-ewaf");
           const UA = `gh-actions-ideas-mexc-ultimate/${MODEL_VERSION} (+https://github.com/)`;
           
-          // ===== NEW: Global constants, registry, toggles =====
-          const FEATURE_DIM = 23; // 18 base + 5 interactions
-          const MODELS = ['Original','Momentum','MeanReversion','Logistic','NaiveBayes','HoeffdingTree','AdaptiveRF'];
-
-          // Safety toggles (env overrides)
-          const ENABLE_INTERACTIONS   = (process.env.ENABLE_INTERACTIONS   || "true")==="true";
-          const ENABLE_UNCERTAINTY    = (process.env.ENABLE_UNCERTAINTY    || "true")==="true";
-          const ENABLE_BAYES          = (process.env.ENABLE_BAYES          || "true")==="true";
-          const ENABLE_ADAPTIVE_DECAY = (process.env.ENABLE_ADAPTIVE_DECAY || "true")==="true";
-          const ENABLE_ADAPTIVE_RISK  = (process.env.ENABLE_ADAPTIVE_RISK  || "true")==="true";
-          const ENABLE_TREE           = (process.env.ENABLE_TREE           || "true")==="true";
-          const ENABLE_RF             = (process.env.ENABLE_RF             || "true")==="true";
-
+          // ========== PHASE 2: TRAINING GATES + REGIME CONFIG ==========
           const MIN_SAMPLES_REQUIRED = {
             logistic: Number(process.env.MIN_SAMPLES_LOGISTIC || "50"),
             naivebayes: Number(process.env.MIN_SAMPLES_NAIVEBAYES || "30"),
-            hoeffdingtree: Number(process.env.MIN_SAMPLES_HOEFFDINGTREE || "30"),
-            adaptiverf: Number(process.env.MIN_SAMPLES_ADAPTIVERF || "50"),
+            // Rule-based models always active (0 samples needed)
             original: 0,
             momentum: 0,
             meanreversion: 0
           };
 
-          // Helper to normalize feature length (backward compatibility for older fills)
-          function normalizeFeaturesDim(feat) {
-            if (!Array.isArray(feat)) return Array(FEATURE_DIM).fill(0);
-            const a = feat.slice(0, FEATURE_DIM);
-            while (a.length < FEATURE_DIM) a.push(0);
-            return a;
-          }
-
-          // ========== PHASE 2: TRAINING GATES + REGIME CONFIG ==========
           const MODEL_STATUS = {
             ACTIVE: 'active',
             TRAINING: 'training',
@@ -326,21 +293,6 @@ jobs:
           const choleskySafe=(S)=>{ const L=cholesky(S); if(L) return L; const n=S.length; const Sc=S.map((r,i)=> r.map((v,j)=> v + (i===j?1e-6:0))); return cholesky(Sc); };
           const sampleMultiT=(muVec,Sigma,df=6,M=1000)=>{ const n=muVec.length; const L=choleskySafe(Sigma); if(!L) return []; const out=[]; for(let m=0;m<M;m++){ const z=Array(n).fill(0).map(()=>randn()); const y=Array(n).fill(0); for(let i=0;i<n;i++){ let s=0; for(let k=0;k<=i;k++) s+=L[i][k]*z[k]; y[i]=s; } let chi=0; for(let i=0;i<df;i++){ const zc=randn(); chi+=zc*zc; } const scale=Math.sqrt(df/Math.max(1e-9,chi)); out.push(y.map((yi,i)=> (muVec[i]||0) + yi*scale)); } return out; };
           const portfolioVaR_ES_tCopula=(picks, df=6)=>{ if(!picks.length) return { VaR95_bps:0, ES95_bps:0 }; const n=picks.length, mu=Array(n).fill(0), sd=Array(n).fill(0); for(let i=0;i<n;i++){ const r5=picks[i].ret5||[]; const rMean=mean(r5), rStd=std(r5)||1e-4; const steps=Math.max(1, Math.round((picks[i].ttl_sec||600)/300)); mu[i]=rMean*steps*10000; sd[i]=rStd*Math.sqrt(steps)*10000; } const R=Array.from({length:n},()=>Array(n).fill(0)); for(let i=0;i<n;i++){ for(let j=i;j<n;j++) R[i][j]=corr(picks[i].ret5||[], picks[j].ret5||[]); R[i][i]=1; } const Sigma=Array.from({length:n},()=>Array(n).fill(0)); for(let i=0;i<n;i++) for(let j=0;j<n;j++) Sigma[i][j]=R[i][j]*sd[i]*sd[j]; const draws=sampleMultiT(mu,Sigma,df,1200); if(!draws.length) return { VaR95_bps:0, ES95_bps:0 }; const w0=picks.map(p=> p.size_bps||0); const ws=sum(w0)||1; const w=w0.map(x=> x/ws); const port=draws.map(d=> d.reduce((acc,di,ii)=> acc + w[ii]*di, 0)); port.sort((a,b)=>a-b); const idx=Math.floor(0.05*port.length); const VaR95=port[idx]||0; const ES=mean(port.slice(0,idx+1)); return { VaR95_bps:Math.round(VaR95), ES95_bps:Math.round(ES) }; };
-
-          function expandFeaturesWithInteractions(base) {
-            if (!ENABLE_INTERACTIONS) return base;
-            // Indices from your extractMLFeatures output: [0..17]
-            const pairs = [
-              [3,4],   // RSI × ADX
-              [0,5],   // ROC1 × zVWAP
-              [2,10],  // ATR × MTF_ADX
-              [6,7],   // Spread × OBI
-              [11,12]  // TFAlign × MTF_ROC1
-            ];
-            const out = [...base];
-            for (const [i,j] of pairs) if (i<base.length && j<base.length) out.push(base[i]*base[j]);
-            return out; // 18 → 23
-          }
 
           // ---------- HTTP + Concurrency ----------
           async function fetchWithTimeout(url,opts={},ms=12000){ const ac=new AbortController(); const t=setTimeout(()=>ac.abort(),ms); try{ return await fetch(url,{...opts,signal:ac.signal,headers:{"User-Agent":UA,...(opts?.headers||{})}});} finally{ clearTimeout(t);} }
@@ -524,11 +476,16 @@ jobs:
           // ---------- State (Gist) + Calibration + Audit ----------
           async function loadState(){
             const token=process.env.GIST_TOKEN, id=process.env.GIST_ID;
-            const init={ v:"mexc-ultimate-9.1.0-robust-aggregate",
+            const init={ v:"mexc-ultimate-9.0.0-ewaf-aggregate",
               cooldown:{}, cooldown_side:{}, pending:[], equity:[], closed:[],
               mr_lockout:{}, sym_stats:{}, sym_stats_real:{}, calibCoeffs:{}, lastReconcileTs:0,
-              model_ewaf: {}, ml_models: {}, model_weights: {}, model_weights_frozen: null,
-              model_scoreboard: {}, system_learning: {}
+              // NEW: Aggregate-only learning state
+              model_ewaf: {},
+              ml_models: {},
+              model_weights: {},
+              model_weights_frozen: null,
+              model_scoreboard: {},
+              system_learning: {}
             };
             if(!token||!id) return { state:init, persist:null };
             try{
@@ -553,109 +510,81 @@ jobs:
               s.calibCoeffs = s.calibCoeffs || {};
               s.lastReconcileTs = s.lastReconcileTs || 0;
               
-              // ========== MIGRATION: Aggregate-only + EWAF + Robustness ==========
-              if (!s.__migrated_robust_ewaf) {
-                log("🔄 Migrating to robust aggregate-only state...");
+              // ========== MIGRATION: Aggregate-only + EWAF ==========
+              if (!s.__migrated_aggregate_ewaf) {
+                log("🔄 Migrating to aggregate-only + EWAF...");
 
-                // Ensure feature dimension in online models
-                const ensureDim = (arr, n=FEATURE_DIM) => {
-                  const a = Array.isArray(arr) ? arr.slice(0, n) : [];
-                  while (a.length < n) a.push(0);
-                  return a;
-                };
-
-                if (!s.ml_models) s.ml_models = {};
-
-                // Logistic / Naive Bayes
-                if (!s.ml_models.logistic || (s.ml_models.logistic.w||[]).length !== FEATURE_DIM) {
-                  s.ml_models.logistic = { w: Array(FEATURE_DIM).fill(0), bias: 0, n_updates: 0, learning_rate: 0.01 };
-                }
-                if (!s.ml_models.naivebayes ||
-                    !s.ml_models.naivebayes.long || (s.ml_models.naivebayes.long.feature_sums||[]).length !== FEATURE_DIM) {
-                  s.ml_models.naivebayes = {
-                    long:  { feature_sums: Array(FEATURE_DIM).fill(0), feature_sq_sums: Array(FEATURE_DIM).fill(0), count: 0 },
-                    short: { feature_sums: Array(FEATURE_DIM).fill(0), feature_sq_sums: Array(FEATURE_DIM).fill(0), count: 0 }
-                  };
-                }
-
-                // Momentum/MeanReversion stubs (already exist)
-                s.ml_models.momentum = s.ml_models.momentum || { n_updates: 0 };
-                s.ml_models.meanreversion = s.ml_models.meanreversion || { n_updates: 0 };
-                s.ml_models.original = s.ml_models.original || { n_updates: 0 };
-
-                // Hoeffding Tree
-                if (ENABLE_TREE && !s.ml_models.hoeffding) {
-                  s.ml_models.hoeffding = {
-                    root: {
-                      type: 'leaf',
-                      class_counts: { long: 0, short: 0 },
-                      feature_stats: Array(FEATURE_DIM).fill(0).map(()=>({
-                        long_sum:0,long_sq:0,long_n:0, short_sum:0,short_sq:0,short_n:0
-                      })),
-                      n_samples: 0, depth: 0
-                    },
-                    max_depth: 5, split_threshold: 30, n_updates: 0
-                  };
-                }
-
-                // Adaptive Random Forest (3 trees)
-                if (ENABLE_RF && !s.ml_models.adaptive_rf) {
-                  const all = Array(FEATURE_DIM).fill(0).map((_,i)=>i);
-                  const shuffle=a=>{const b=[...a]; for(let i=b.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1)); [b[i],b[j]]=[b[j],b[i]];} return b;};
-                  const subset = () => shuffle(all).slice(0, Math.ceil(FEATURE_DIM*0.6));
-                  const makeLeaf = () => ({
-                    type:'leaf', class_counts:{long:0,short:0},
-                    feature_stats:Array(FEATURE_DIM).fill(0).map(()=>({long_sum:0,long_sq:0,long_n:0, short_sum:0,short_sq:0,short_n:0})),
-                    n_samples:0, depth:0
-                  });
-                  const makeTree = () => ({ root: makeLeaf(), max_depth:4, split_threshold:25, feature_subset: subset(), n_updates: 0 });
-                  s.ml_models.adaptive_rf = { trees: [makeTree(), makeTree(), makeTree()], n_updates: 0 };
-                }
-
-                // EWAF (ensure both new models exist in both regimes)
+                const models = ['Original', 'Momentum', 'MeanReversion', 'Logistic', 'NaiveBayes'];
+                
+                // 1. Initialize EWAF
                 if (!s.model_ewaf || !s.model_ewaf.params) {
                   s.model_ewaf = {
-                    trend: {}, meanrevert: {},
+                    trend: {},
+                    meanrevert: {},
                     params: {
                       half_life: EWAF_HALF_LIFE,
-                      gamma: Math.exp(-Math.log(2)/EWAF_HALF_LIFE),
+                      gamma: Math.exp(-Math.log(2) / EWAF_HALF_LIFE),
                       temperature: EWAF_TEMPERATURE,
                       exploration_rho: EWAF_EXPLORATION_RHO,
                       reward_scale_bps: EWAF_REWARD_SCALE_BPS
                     }
                   };
+                  for (const regime of ['trend', 'meanrevert']) {
+                    for (const model of models) {
+                      const sb = s.model_scoreboard?.[model];
+                      s.model_ewaf[regime][model] = {
+                        R: (sb && sb.total > 0) ? (sb.correct / sb.total) * sb.total : 0,
+                        N: sb?.total || 0
+                      };
+                    }
+                  }
                 }
-                for (const regime of ['trend','meanrevert']) {
-                  s.model_ewaf[regime] = s.model_ewaf[regime] || {};
-                  for (const m of MODELS) s.model_ewaf[regime][m] = s.model_ewaf[regime][m] || { R:0, N:0 };
+                
+                // 2. Initialize online ML models
+                if (!s.ml_models || !s.ml_models.logistic) {
+                  s.ml_models = {
+                    logistic: { w: Array(18).fill(0), bias: 0, n_updates: 0, learning_rate: 0.01 },
+                    naivebayes: {
+                      long: { feature_sums: Array(18).fill(0), feature_sq_sums: Array(18).fill(0), count: 0 },
+                      short: { feature_sums: Array(18).fill(0), feature_sq_sums: Array(18).fill(0), count: 0 }
+                    },
+                    momentum: {n_updates: 0},
+                    meanreversion: {n_updates: 0},
+                    original: {n_updates: 0}
+                  };
+                  if (s.ml_training_buffer?.length > 0) {
+                    log(`  Bootstrapping ML from ${s.ml_training_buffer.length} samples...`);
+                    for (const sample of s.ml_training_buffer.slice(-200)) {
+                      if (sample.features) {
+                        updateLogisticOnline(s.ml_models.logistic, sample.features, sample.label);
+                        updateNaiveBayesOnline(s.ml_models.naivebayes, sample.features, sample.label);
+                      }
+                    }
+                  }
                 }
-
-                // Bayesian weights
-                if (ENABLE_BAYES && !s.bayesian_weights) {
-                  s.bayesian_weights = { trend:{}, meanrevert:{} };
-                  for (const regime of ['trend','meanrevert'])
-                    for (const m of MODELS)
-                      s.bayesian_weights[regime][m] = { alpha: 1, beta: 1 };
-                }
-
-                // Adaptive risk memory
-                if (ENABLE_ADAPTIVE_RISK && !s.adaptive_risk) {
-                  s.adaptive_risk = { recent_pnl_ema: 0, volatility_ema: 50, kelly_fraction: 0.25, gamma: 0.95 };
-                }
-
-                // Last-10 migration (outcomes only)
+                
+                // 3. Convert system_learning.last_10
                 if (s.system_learning?.last_10?.trades) {
-                  const outcomes = s.system_learning.last_10.trades.slice(-10).map(t => (t.pnl_bps||0) > 0 ? 1 : 0);
+                  const outcomes = s.system_learning.last_10.trades.slice(-10).map(t => (t.pnl_bps || 0) > 0 ? 1 : 0);
                   s.system_learning.last_10 = {
-                    outcomes, wins: outcomes.filter(x=>x===1).length, losses: outcomes.filter(x=>x===0).length,
-                    winrate: outcomes.length ? outcomes.filter(x=>x===1).length/outcomes.length : 0,
+                    outcomes,
+                    wins: outcomes.filter(x => x === 1).length,
+                    losses: outcomes.length - outcomes.filter(x => x === 1).length,
+                    winrate: outcomes.length > 0 ? outcomes.filter(x => x === 1).length / outcomes.length : 0,
                     pnl_bps: 0, avg_pnl_bps: 0
                   };
+                  log(`  Converted last_10 to outcomes`);
                 }
 
-                // Remove bulky per-trade buffers (aggregate-only)
-                delete s.ml_training_buffer; delete s.calibration_holdout; delete s.ml_voting_history; delete s.buffer_at_plan;
-                s.__migrated_robust_ewaf = true;
+                // 4. Delete non-aggregate fields
+                delete s.ml_training_buffer;
+                delete s.calibration_holdout;
+                delete s.ml_voting_history;
+                delete s.buffer_at_plan;
+                delete s.ml_models?.decisiontree;
+                delete s.ml_models?.randomforest;
+
+                s.__migrated_aggregate_ewaf = true;
                 s.__migration_ts = Date.now();
                 log("✅ Migration complete\n");
               }
@@ -687,8 +616,6 @@ jobs:
             merged.system_learning = local.system_learning || remote.system_learning || {};
             merged.model_ewaf = local.model_ewaf || remote.model_ewaf || {};
             merged.ml_models = local.ml_models || remote.ml_models || {};
-            merged.bayesian_weights = local.bayesian_weights || remote.bayesian_weights || {};
-            merged.adaptive_risk    = local.adaptive_risk    || remote.adaptive_risk    || {};
             merged.model_weights_frozen = local.model_weights_frozen !== undefined ? local.model_weights_frozen : (remote.model_weights_frozen !== undefined ? remote.model_weights_frozen : null);
             merged.regime_history = local.regime_history || remote.regime_history || [];
             
@@ -806,13 +733,6 @@ jobs:
               sl.last_10.outcomes.push(won ? 1 : 0);
               if (sl.last_10.outcomes.length > 10) sl.last_10.outcomes.shift();
               log(`  ✅ ${trade.symbolFull || trade.symbol} ${trade.side} ${won ? "WIN" : "LOSS"} (${trade.pnl_bps} bps)`);
-
-              if (state.adaptive_risk) {
-                const ar = state.adaptive_risk;
-                const pnl = trade.pnl_bps || 0;
-                ar.recent_pnl_ema = ar.gamma*ar.recent_pnl_ema + (1-ar.gamma)*pnl;
-                ar.volatility_ema = ar.gamma*ar.volatility_ema + (1-ar.gamma)*Math.abs(pnl);
-              }
             }
             
             // Recalculate aggregates
@@ -908,12 +828,8 @@ jobs:
               if (c.ml_features) {
                 try {
                   const label = outcome;
-                  const f = normalizeFeaturesDim(c.ml_features);
-                  updateLogisticOnline(state.ml_models.logistic, f, label);
-                  updateNaiveBayesOnline(state.ml_models.naivebayes, f, label);
-                  if (ENABLE_TREE) updateHoeffdingTreeOnline(state.ml_models.hoeffding, f, label);
-                  if (ENABLE_RF)   updateAdaptiveRFOnline(state.ml_models.adaptive_rf, f, label);
-                  
+                  updateLogisticOnline(state.ml_models.logistic, c.ml_features, label);
+                  updateNaiveBayesOnline(state.ml_models.naivebayes, c.ml_features, label);
                   if (state.ml_models.momentum) state.ml_models.momentum.n_updates++;
                   if (state.ml_models.meanreversion) state.ml_models.meanreversion.n_updates++;
                   if (state.ml_models.original) state.ml_models.original.n_updates++;
@@ -949,30 +865,68 @@ jobs:
 
           function updateLogisticOnline(model, features, label) {
             if (!model || !model.w) return;
-            const f = normalizeFeaturesDim(features);
             let z = model.bias;
-            for (let i = 0; i < f.length; i++) z += model.w[i] * f[i];
+            for (let i = 0; i < features.length; i++) z += model.w[i] * features[i];
             const prediction = 1 / (1 + Math.exp(-z));
             const error = label - prediction;
             const lr = model.learning_rate || 0.01;
             model.bias += lr * error;
-            for (let i = 0; i < f.length; i++) model.w[i] += lr * error * f[i];
+            for (let i = 0; i < features.length; i++) model.w[i] += lr * error * features[i];
             model.n_updates++;
           }
 
           function updateNaiveBayesOnline(model, features, label) {
             if (!model || !model.long || !model.short) return;
-            const f = normalizeFeaturesDim(features);
             const classKey = label === 1 ? 'long' : 'short';
             const classModel = model[classKey];
             classModel.count++;
-            for (let i = 0; i < f.length; i++) {
-              const x = f[i];
+            for (let i = 0; i < features.length; i++) {
+              const x = features[i];
               classModel.feature_sums[i] += x;
               classModel.feature_sq_sums[i] += x * x;
             }
           }
           
+          function computeEWAFWeights(state, regime) {
+            const params = state.model_ewaf.params;
+            const models = ['Original', 'Momentum', 'MeanReversion', 'Logistic', 'NaiveBayes'];
+            const edges = {};
+            for (const model of models) {
+              const ewaf = state.model_ewaf[regime]?.[model];
+              const avgReward = (ewaf && ewaf.N > 0) ? ewaf.R / ewaf.N : 0.5;
+              edges[model] = avgReward - 0.5;
+            }
+            const rawWeights = {};
+            let sumRaw = 0;
+            for (const model of models) {
+              const w = Math.exp(params.temperature * edges[model]);
+              rawWeights[model] = w;
+              sumRaw += w;
+            }
+            const normalized = {};
+            for (const model of models) normalized[model] = rawWeights[model] / sumRaw;
+            
+            const rho = params.exploration_rho;
+            const uniform = 1 / models.length;
+            const final = {};
+            for (const model of models) final[model] = (1 - rho) * normalized[model] + rho * uniform;
+
+            const weights = {};
+            for (const model of models) weights[model] = Math.round(20 * final[model]);
+            
+            for (const model of models) {
+              const ewaf = state.model_ewaf[regime]?.[model];
+              if (ewaf && ewaf.N >= 20) {
+                const avgReward = ewaf.R / ewaf.N;
+                if (wilsonLCB(avgReward, ewaf.N, 1.28) < EWAF_BACKSTOP_LCB) weights[model] = 0;
+              }
+            }
+            const ruleBased = ['Original', 'Momentum', 'MeanReversion'];
+            for (const model of ruleBased) if (weights[model] < WEIGHT_MIN_RULE_BASED) weights[model] = WEIGHT_MIN_RULE_BASED;
+            
+            return weights;
+          }
+
           function updateEWAFFromTrade(state, trade) {
             const regime = trade.regime || 'meanrevert';
             const params = state.model_ewaf.params;
@@ -982,15 +936,13 @@ jobs:
             const g = Math.tanh(Math.abs(trade.pnl_bps || 0) / A);
             const votes = trade.ml_ensemble?.votes || {};
             const takenSide = trade.side;
-            const elig  = trade.ml_ensemble?.eligibility_snapshot || {};
             
             for (const [modelName, votedSide] of Object.entries(votes)) {
-              // Eligibility gate at plan-time
-              const key = modelName.toLowerCase().replace(/\s/g,'');
-              const req = MIN_SAMPLES_REQUIRED[key] ?? 0;
-              const seen = elig[modelName] || 0;
-              if (req > 0 && seen < req) continue;
-
+              const eligibility = trade.ml_ensemble?.eligibility_snapshot || {};
+              const updatesAtPlan = eligibility[modelName] || 0;
+              const required = MIN_SAMPLES_REQUIRED[modelName.toLowerCase()] || 0;
+              if (required > 0 && updatesAtPlan < required) continue;
+              
               const v = (votedSide === takenSide) ? 1 : -1;
               const r = 0.5 + 0.5 * y * v * g;
               const ewaf = state.model_ewaf[regime]?.[modelName];
@@ -1020,27 +972,25 @@ jobs:
             return [ roc1||0, roc3||0, (atr_bps||0)/100, (rsi14||50)/100, (adx5||0)/100, z_vwap||0, (spreadBps||0)/100, obi||0, ofi30s||0, (mtfAgg.rsi||50)/100, (mtfAgg.adx||0)/100, tfAlign||0, (mtfAgg.roc1||0)*100, (mtfAgg.roc3||0)*100, (mtfAgg.atr_bps||0)/100, (volMean||0)/1e6, (volStd||0)/1e6, (priceStd||0)/100 ];
           };
 
-          const predictLogistic = (model, features) => {
+          const predictLogistic = (model, feat) => {
             if (!model?.w) return Math.random() > 0.5 ? "long" : "short";
-            const f = normalizeFeaturesDim(features);
             let z = model.bias || 0;
-            for (let i = 0; i < Math.min(f.length, model.w.length); i++) z += f[i] * model.w[i];
+            for (let i = 0; i < Math.min(feat.length, model.w.length); i++) z += feat[i] * model.w[i];
             return sigmoid(z) > 0.5 ? "long" : "short";
           };
 
           function predictNaiveBayes(model, features) {
             if (!model || !model.long || !model.short) return Math.random() > 0.5 ? "long" : "short";
-            const f = normalizeFeaturesDim(features);
             const computeLogProb = (classKey) => {
               const c = model[classKey];
               if (c.count === 0) return -Infinity;
               const prior = c.count / ((model.long.count + model.short.count) || 1);
               let logProb = Math.log(prior || 1e-9);
-              for (let i = 0; i < f.length; i++) {
+              for (let i = 0; i < features.length; i++) {
                 const mean = c.feature_sums[i] / c.count;
                 const variance = (c.feature_sq_sums[i] / c.count) - (mean * mean);
                 const std = Math.sqrt(Math.max(1e-6, variance));
-                const x = f[i];
+                const x = features[i];
                 logProb += -0.5 * Math.log(2 * Math.PI * std * std) - ((x - mean) ** 2) / (2 * std * std);
               }
               return logProb;
@@ -1061,306 +1011,58 @@ jobs:
             return score >= 0 ? "long" : "short";
           };
           
-          function updateHoeffdingTreeOnline(tree, features, label) {
-            if (!tree || !tree.root) return;
-            const f = normalizeFeaturesDim(features);
-            let node = tree.root;
-            while (node.type === 'split' && node.left && node.right) {
-              node = f[node.feature_idx] < node.threshold ? node.left : node.right;
-            }
-            const classKey = label === 1 ? 'long' : 'short';
-            node.class_counts[classKey] = (node.class_counts[classKey]||0)+1;
-            node.n_samples++;
-            for (let i=0;i<Math.min(f.length, node.feature_stats.length);i++) {
-              const x=f[i], st=node.feature_stats[i];
-              st[`${classKey}_sum`]+=x; st[`${classKey}_sq`]+=x*x; st[`${classKey}_n`] = (st[`${classKey}_n`]||0)+1;
-            }
-            if (node.n_samples >= (tree.split_threshold||30) && node.n_samples % 10 === 0 && (node.depth||0) < (tree.max_depth||5)) {
-              attemptHoeffdingSplit(tree, node);
-            }
-            tree.n_updates = (tree.n_updates||0)+1;
-          }
-          function attemptHoeffdingSplit(tree, node) {
-            const N=node.n_samples||0, nL=node.class_counts.long||0, nS=node.class_counts.short||0;
-            if (N<20 || nL<5 || nS<5) return;
-            const pL=nL/N, pS=nS/N;
-            const baseH = -(pL*Math.log2(pL+1e-9) + pS*Math.log2(pS+1e-9));
-            let bestGain=0, bestF=null, bestThr=null;
-            for (let f=0; f<node.feature_stats.length; f++) {
-              const st=node.feature_stats[f], totalN=(st.long_n||0)+(st.short_n||0);
-              if (totalN<10) continue;
-              const thr = (st.long_sum+st.short_sum)/Math.max(1,totalN);
-              const mL = (st.long_n>0)?st.long_sum/st.long_n:0;
-              const mS = (st.short_n>0)?st.short_sum/st.short_n:0;
-              const sep = Math.abs(mL - mS);
-              const gain = sep * baseH; // proxy
-              if (gain>bestGain){ bestGain=gain; bestF=f; bestThr=thr; }
-            }
-            const eps = Math.sqrt(Math.log(1/0.05)/(2*Math.max(1,N))); // 95%
-            if (bestGain>eps && bestF!=null) {
-              node.type='split'; node.feature_idx=bestF; node.threshold=bestThr;
-              const makeLeaf=(d)=>({
-                type:'leaf', class_counts:{long:0,short:0},
-                feature_stats:Array(FEATURE_DIM).fill(0).map(()=>({long_sum:0,long_sq:0,long_n:0, short_sum:0,short_sq:0,short_n:0})),
-                n_samples:0, depth:d
-              });
-              node.left = makeLeaf((node.depth||0)+1);
-              node.right= makeLeaf((node.depth||0)+1);
-              log(`🌳 Hoeffding split: f=${bestF} thr=${bestThr.toFixed(4)} gain=${bestGain.toFixed(3)}`);
-            }
-          }
-          function predictHoeffdingTree(tree, features) {
-            if (!tree || !tree.root) return Math.random()>0.5?'long':'short';
-            const f = normalizeFeaturesDim(features);
-            let node=tree.root;
-            while (node.type==='split' && node.left && node.right)
-              node = f[node.feature_idx] < node.threshold ? node.left : node.right;
-            return (node.class_counts.long||0) >= (node.class_counts.short||0) ? 'long' : 'short';
+          function getModelStatus(modelName, baseWeight, state) {
+            const modelKey = modelName.toLowerCase();
+            const required = MIN_SAMPLES_REQUIRED[modelKey];
+            if (required === undefined) return { status: MODEL_STATUS.DISABLED, effectiveWeight: 0, canVote: false };
+            if (required === 0) return { status: MODEL_STATUS.ACTIVE, effectiveWeight: Math.max(WEIGHT_MIN_RULE_BASED, baseWeight), canVote: true };
+            const n_updates = state.ml_models?.[modelKey]?.n_updates || 0;
+            if (n_updates < required) return { status: MODEL_STATUS.TRAINING, effectiveWeight: 0, canVote: false };
+            return { status: MODEL_STATUS.ACTIVE, effectiveWeight: baseWeight, canVote: true };
           }
 
-          // Adaptive Random Forest (uses Hoeffding nodes)
-          function updateAdaptiveRFOnline(forest, features, label) {
-            if (!forest?.trees?.length) return;
-            const f = normalizeFeaturesDim(features);
-            for (const t of forest.trees) {
-              if (Math.random()>0.63) continue; // bootstrap sampling
-              const masked = f.map((v,i)=> t.feature_subset.includes(i) ? v : 0);
-              updateHoeffdingTreeOnline(t, masked, label);
-            }
-            forest.n_updates = (forest.n_updates||0)+1;
-          }
-          function predictAdaptiveRF(forest, features) {
-            if (!forest?.trees?.length) return Math.random()>0.5?'long':'short';
-            const f = normalizeFeaturesDim(features);
-            let L=0,S=0;
-            for (const t of forest.trees) {
-              const masked = f.map((v,i)=> t.feature_subset.includes(i) ? v : 0);
-              const vote = predictHoeffdingTree(t, masked);
-              if (vote==='long') L++; else S++;
-            }
-            return L>=S ? 'long' : 'short';
-          }
-          
           async function mlEnsembleVote(symbol, features, originalSide, state) {
-            const modelKeyMap = { hoeffdingtree: 'hoeffding', adaptiverf: 'adaptive_rf' };
-            const weightSource = (state.model_weights_frozen && state.system_learning?.regime?.current === 'exploit')
-              ? state.model_weights_frozen : (state.model_weights || {});
+            const weightSource = (state.model_weights_frozen && state.system_learning?.regime?.current === 'exploit') ? state.model_weights_frozen : (state.model_weights || {});
+            
             const getWeight = (model) => {
               const baseWeight = weightSource[model] || 0;
-              const key = model.toLowerCase().replace(/\s/g,'');
-              const required = MIN_SAMPLES_REQUIRED[key];
-              if (required === undefined) return 0;
-              if (required === 0) return Math.max(WEIGHT_MIN_RULE_BASED, baseWeight);
-              const storeKey = modelKeyMap[key] || key;
-              const n_updates = state.ml_models?.[storeKey]?.n_updates || 0;
-              return n_updates < required ? 0 : baseWeight;
+              const status = getModelStatus(model, baseWeight, state);
+              return status.effectiveWeight;
             };
 
-            let longScore=0, shortScore=0;
-            const details=[], votes={};
+            let longScore = 0, shortScore = 0;
+            const details = [], votes = {};
+            
+            // Voter 0: Original
+            const w0 = getWeight("Original"); if (originalSide === "long") longScore += w0; else shortScore += w0;
+            details.push({ model: "Original", vote: originalSide, weight: w0 }); votes["Original"] = originalSide;
 
-            // Original
-            { const w=getWeight("Original"); if (originalSide==='long') longScore+=w; else shortScore+=w;
-              details.push({model:"Original", vote:originalSide, weight:w}); votes["Original"]=originalSide; }
+            // Voter 1: Momentum
+            const v1 = predictMomentum(state.ml_models.momentum, features); const w1 = getWeight("Momentum");
+            if (v1 === "long") longScore += w1; else shortScore += w1;
+            details.push({ model: "Momentum", vote: v1, weight: w1 }); votes["Momentum"] = v1;
 
-            // Momentum
-            { const v=predictMomentum(state.ml_models.momentum, features); const w=getWeight("Momentum");
-              if (v==='long') longScore+=w; else shortScore+=w;
-              details.push({model:"Momentum", vote:v, weight:w}); votes["Momentum"]=v; }
+            // Voter 2: MeanReversion
+            const v2 = predictMeanReversion(state.ml_models.meanreversion, features); const w2 = getWeight("MeanReversion");
+            if (v2 === "long") longScore += w2; else shortScore += w2;
+            details.push({ model: "MeanReversion", vote: v2, weight: w2 }); votes["MeanReversion"] = v2;
 
-            // MeanReversion
-            { const v=predictMeanReversion(state.ml_models.meanreversion, features); const w=getWeight("MeanReversion");
-              if (v==='long') longScore+=w; else shortScore+=w;
-              details.push({model:"MeanReversion", vote:v, weight:w}); votes["MeanReversion"]=v; }
-
-            // Logistic
-            { const v=predictLogistic(state.ml_models.logistic, features); const w=getWeight("Logistic");
-              if (v==='long') longScore+=w; else shortScore+=w;
-              details.push({model:"Logistic", vote:v, weight:w}); votes["Logistic"]=v; }
-
-            // NaiveBayes
-            { const v=predictNaiveBayes(state.ml_models.naivebayes, features); const w=getWeight("NaiveBayes");
-              if (v==='long') longScore+=w; else shortScore+=w;
-              details.push({model:"NaiveBayes", vote:v, weight:w}); votes["NaiveBayes"]=v; }
-
-            // HoeffdingTree (optional)
-            if (ENABLE_TREE) {
-              const v=predictHoeffdingTree(state.ml_models.hoeffding, features); const w=getWeight("HoeffdingTree");
-              if (v==='long') longScore+=w; else shortScore+=w;
-              details.push({model:"HoeffdingTree", vote:v, weight:w}); votes["HoeffdingTree"]=v;
-            }
-
-            // AdaptiveRF (optional)
-            if (ENABLE_RF) {
-              const v=predictAdaptiveRF(state.ml_models.adaptive_rf, features); const w=getWeight("AdaptiveRF");
-              if (v==='long') longScore+=w; else shortScore+=w;
-              details.push({model:"AdaptiveRF", vote:v, weight:w}); votes["AdaptiveRF"]=v;
-            }
+            // Voter 3: Logistic
+            const v3 = predictLogistic(state.ml_models.logistic, features); const w3 = getWeight("Logistic");
+            if (v3 === "long") longScore += w3; else shortScore += w3;
+            details.push({ model: "Logistic", vote: v3, weight: w3 }); votes["Logistic"] = v3;
+            
+            // Voter 4: NaiveBayes
+            const v4 = predictNaiveBayes(state.ml_models.naivebayes, features); const w4 = getWeight("NaiveBayes");
+            if (v4 === "long") longScore += w4; else shortScore += w4;
+            details.push({ model: "NaiveBayes", vote: v4, weight: w4 }); votes["NaiveBayes"] = v4;
 
             const majoritySide = longScore >= shortScore ? 'long' : 'short';
-            let confidenceBoost = Math.round(Math.abs(longScore - shortScore) / 10);
+            const confidenceBoost = Math.round(Math.abs(longScore - shortScore) / 10);
             const totalWeight = longScore + shortScore;
             const agreement = (Math.max(longScore, shortScore) / (totalWeight || 1)).toFixed(2);
-
-            // Uncertainty penalty (vote entropy)
-            let uncertainty = 0, entropy = 0;
-            if (ENABLE_UNCERTAINTY) {
-              const arr = Object.values(votes).filter(Boolean);
-              const pL = arr.filter(v=>v==='long').length / Math.max(1, arr.length);
-              const pS = 1 - pL;
-              entropy = (pL>0&&pS>0) ? -(pL*Math.log2(pL)+pS*Math.log2(pS)) : 0; // 0..1
-              uncertainty = entropy;
-              const penalty = 1 - 0.30*uncertainty; // max -30%
-              confidenceBoost = Math.round(confidenceBoost * penalty);
-            }
-
-            return {
-              ensemble_side: majoritySide,
-              votes_long: longScore, votes_short: shortScore,
-              confidence_boost: confidenceBoost, agreement,
-              details, votes, uncertainty: +uncertainty.toFixed(3), entropy: +entropy.toFixed(3)
-            };
-          }
-          
-          function updateAdaptiveEWAFParams(state) {
-            if (!ENABLE_ADAPTIVE_DECAY) return;
-            const vol = state.adaptive_risk?.volatility_ema ?? 50;
-            const half = vol>80 ? 12 : (vol>50 ? 20 : 28);
-            const gamma = Math.exp(-Math.log(2)/half);
-            state.model_ewaf.params.half_life = half;
-            state.model_ewaf.params.gamma = gamma;
-            log(`🔄 Adaptive EWAF: vol=${vol.toFixed(1)} → half_life=${half} γ=${gamma.toFixed(3)}`);
-          }
-
-          function computeEWAFWeights(state, regime) {
-            const params = state.model_ewaf.params;
-            const activeModels = MODELS.filter(m => {
-              if (m==='HoeffdingTree' && !ENABLE_TREE) return false;
-              if (m==='AdaptiveRF' && !ENABLE_RF) return false;
-              return true;
-            });
-            const edges = {};
-            for (const model of activeModels) {
-              const ewaf = state.model_ewaf[regime]?.[model];
-              const avg = (ewaf && ewaf.N>0) ? ewaf.R/ewaf.N : 0.5;
-              edges[model] = avg - 0.5;
-            }
-            const raw = {}, t=params.temperature||6; let sumW=0;
-            for (const m of activeModels) { const w = Math.exp(t * edges[m]); raw[m]=w; sumW+=w; }
-            const rho = params.exploration_rho || 0.05;
-            const uniform = 1/(activeModels.length||1);
-            const final = {};
-            for (const m of activeModels) final[m] = (1-rho)*(raw[m]/Math.max(1e-9,sumW)) + rho*uniform;
-
-            const weights = {};
-            for (const m of activeModels) weights[m] = Math.round(20 * final[m]);
-
-            for (const m of activeModels) {
-              const ewaf = state.model_ewaf[regime]?.[m];
-              if (!ewaf || ewaf.N < 20) continue;
-              const avg=ewaf.R/Math.max(1,ewaf.N);
-              if (wilsonLCB(avg, ewaf.N, 1.28) < (EWAF_BACKSTOP_LCB||0.45)) weights[m]=0;
-            }
-            for (const m of ['Original','Momentum','MeanReversion']) {
-              if (activeModels.includes(m) && weights[m] < WEIGHT_MIN_RULE_BASED) weights[m] = WEIGHT_MIN_RULE_BASED;
-            }
-            return weights;
-          }
-
-          function sampleBeta(alpha, beta) {
-            const gammaRand = (shape, scale=1) => {
-              if (shape < 1) { const u=Math.random(); return gammaRand(1+shape, scale) * Math.pow(u, 1/shape); }
-              const d=shape-1/3, c=1/Math.sqrt(9*d);
-              for(;;){
-                let x,v,u;
-                do { x=randn(); v=1+c*x; } while (v<=0);
-                v=v*v*v; u=Math.random();
-                if (u < 1 - 0.0331*(x**4)) return d*v*scale;
-                if (Math.log(u) < 0.5*x*x + d*(1 - v + Math.log(v))) return d*v*scale;
-              }
-            };
-            const ga=gammaRand(alpha), gb=gammaRand(beta);
-            return ga/(ga+gb);
-          }
-          function computeBayesianWeights(state, regime) {
-            if (!ENABLE_BAYES) return {};
-            const activeModels = MODELS.filter(m => {
-              if (m==='HoeffdingTree' && !ENABLE_TREE) return false;
-              if (m==='AdaptiveRF' && !ENABLE_RF) return false;
-              return true;
-            });
-            const samples={};
-            for (const m of activeModels) {
-              const b = state.bayesian_weights?.[regime]?.[m];
-              if (!b) continue;
-              const p = sampleBeta(b.alpha, b.beta);
-              samples[m] = Math.max(0, p - 0.5);
-            }
-            const total = Object.values(samples).reduce((a,b)=>a+b,0) || 1;
-            const w={}; for (const m of activeModels) w[m] = Math.round(20 * (samples[m]/total));
-            for (const m of ['Original','Momentum','MeanReversion'])
-              if (activeModels.includes(m) && (w[m]||0) < WEIGHT_MIN_RULE_BASED) w[m] = WEIGHT_MIN_RULE_BASED;
-            return w;
-          }
-
-          function updateModelWeights(state) {
-            const frozen = state.model_weights_frozen && state.system_learning?.regime?.current === 'exploit';
-            updateAdaptiveEWAFParams(state);
-            const learnable = (state.closed||[]).filter(t => t.reconciliation==="exchange_trade_history" && !t.weights_learned && t.ml_ensemble);
-            for (const trade of learnable) {
-              try {
-                updateEWAFFromTrade(state, trade);
-                updateScoreboardDiagnostics(state, trade);
-                if (ENABLE_BAYES) {
-                  const regime = trade.regime || 'meanrevert';
-                  const votes = trade.ml_ensemble?.votes || {};
-                  const elig  = trade.ml_ensemble?.eligibility_snapshot || {};
-                  const isWin = (trade.pnl_bps||0) > 0;
-                  const taken = trade.side;
-                  for (const [model, votedSide] of Object.entries(votes)) {
-                    const key = model.toLowerCase().replace(/\s/g,'');
-                    const req = MIN_SAMPLES_REQUIRED[key] ?? 0;
-                    const seen = elig[model] || 0;
-                    if (req > 0 && seen < req) continue;
-                    const bayes = state.bayesian_weights?.[regime]?.[model];
-                    if (!bayes) continue;
-                    const votedForTaken = (votedSide === taken);
-                    const correct = (votedForTaken && isWin) || (!votedForTaken && !isWin);
-                    if (correct) bayes.alpha++; else bayes.beta++;
-                  }
-                }
-                trade.weights_learned = true;
-                trade.weights_learned_at = Date.now();
-              } catch(e){ log("weights learn warn", e?.message||e); }
-            }
-
-            if (!frozen) {
-              const regime = determinePrimaryRegime(state) || 'meanrevert';
-              const ew = computeEWAFWeights(state, regime);
-              const bw = computeBayesianWeights(state, regime);
-              const blended = {};
-              for (const m of MODELS) {
-                if (m==='HoeffdingTree' && !ENABLE_TREE) continue;
-                if (m==='AdaptiveRF' && !ENABLE_RF) continue;
-                blended[m] = Math.round(0.7*(ew[m]||0) + 0.3*(bw[m]||0));
-              }
-              state.model_weights = blended;
-              log("📊 Model weights (EWAF 70% + Bayes 30%)", blended);
-            } else {
-              log("⏸️ Weights frozen in EXPLOIT mode");
-            }
-          }
-          
-          function adaptivePositionSize(base_bps, confidence, state) {
-            if (!ENABLE_ADAPTIVE_RISK) return base_bps;
-            const ar = state.adaptive_risk || { recent_pnl_ema: 0, volatility_ema: 50 };
-            let dd = 1.0;
-            if (ar.recent_pnl_ema < -150) dd = 0.4;
-            else if (ar.recent_pnl_ema < -100) dd = 0.5;
-            else if (ar.recent_pnl_ema < -50)  dd = 0.75;
-            const conf = clamp((confidence||70)/70, 0.5, 1.3);
-            const cap = Math.min(base_bps, 150);
-            return Math.round(cap * dd * conf);
+            
+            return { ensemble_side: majoritySide, votes_long: longScore, votes_short: shortScore, confidence_boost: confidenceBoost, agreement, details, votes };
           }
 
           function getSymbolAdj(state, base) {
@@ -1395,10 +1097,11 @@ jobs:
             for (const [sym, ts] of Object.entries(state.cooldown || {})) if (ts < weekAgo) { delete state.cooldown[sym]; cleaned++; }
             if (cleaned > 0) { trimReport.push(`cooldowns`); trimmed = true; }
             
+            // Delete non-aggregate fields
+            if (state.ml_voting_history) { delete state.ml_voting_history; trimReport.push('ml_voting_history'); trimmed=true; }
             if (state.regime_history?.length > 5) { state.regime_history = state.regime_history.slice(-5); trimReport.push('regime_history'); trimmed=true; }
-            
-            // Remove bulky per-trade buffers (aggregate-only)
-            delete state.ml_training_buffer; delete s.calibration_holdout; delete s.ml_voting_history; delete s.buffer_at_plan;
+            if (state.buffer_at_plan) { delete state.buffer_at_plan; trimReport.push('buffer_at_plan'); trimmed=true; }
+            if (state.ml_training_buffer) { delete state.ml_training_buffer; trimReport.push('ml_training_buffer'); trimmed=true; }
 
             const sizeKB = Math.round(JSON.stringify(state).length / 1024);
             if (state.system_learning?.health) state.system_learning.health.gist_size_kb = sizeKB;
@@ -1433,17 +1136,27 @@ jobs:
           try{
             const { state, persist } = await loadState();
             
+            // Learn from Worker's closed[] inbox
             const newClosedTrades = (state.closed || []).filter(c => c.reconciliation === "exchange_trade_history" && !c.system_learning_updated);
             if (newClosedTrades.length > 0) {
               updateSystemLearning(state, newClosedTrades);
               for (const c of newClosedTrades) c.system_learning_updated = true;
             }
             
+            // Update regime based on latest performance
             const regime = updateRegime(state);
             
-            learnFromGistRealFills(state);
-            updateModelWeights(state);
+            // Learn calibration, online ML, and EWAF weights
+            if (regime && regime.weight_updates_enabled) {
+              log("✅ EXPLORE mode: Learning enabled");
+              learnFromGistRealFills(state); // Updates calibration + online ML
+              updateModelWeights(state); // Updates EWAF weights
+            } else {
+              log("⏸️  EXPLOIT mode: Weights frozen");
+              learnFromGistRealFills(state); // Still update calibration + online ML even if weights are frozen
+            }
 
+            // Validation and heartbeat
             validateActiveModels(state);
             checkCriticalConditions(state);
             const heartbeat = await heartbeatCheck(state);
@@ -1566,25 +1279,15 @@ jobs:
             
             log(`\n🤖 ===== APPLYING ML ENSEMBLE TO TOP ${selected.length} PICKS =====`);
             const eligibilitySnapshot = {};
-            for (const m of MODELS) {
-              const key = m.toLowerCase().replace(/\s/g,'');
-              const map = { hoeffdingtree: 'hoeffding', adaptiverf: 'adaptive_rf' };
-              const storeKey = map[key] || key;
-              eligibilitySnapshot[m] = (state.ml_models[storeKey]?.n_updates || 0);
+            for (const model of ['Original', 'Momentum', 'MeanReversion', 'Logistic', 'NaiveBayes']) {
+              eligibilitySnapshot[model] = state.ml_models[model.toLowerCase()]?.n_updates || 0;
             }
 
             for(let i=0;i<selected.length;i++){
               const pick=selected[i];
-              const base_features = extractMLFeatures(
-                pick.c5_raw, pick.h5_raw, pick.l5_raw, pick.v5_raw,
-                pick.rsi14, pick.adx, pick.atr_bps, pick.z_vwap,
-                (pick.mtf_agg?.roc1||0), (pick.mtf_agg?.roc3||0),
-                pick.spread_bps, pick.obi, pick.ofi30s, pick.mtf_agg, pick.tfAlign
-              );
-              const features = normalizeFeaturesDim(expandFeaturesWithInteractions(base_features));
+              const features=extractMLFeatures(pick.c5_raw, pick.h5_raw, pick.l5_raw, pick.v5_raw, pick.rsi14, pick.adx, pick.atr_bps, pick.z_vwap, (pick.mtf_agg?.roc1||0), (pick.mtf_agg?.roc3||0), pick.spread_bps, pick.obi, pick.ofi30s, pick.mtf_agg, pick.tfAlign);
               const oldSide=pick.side;
-              const ensemble=await mlEnsembleVote(pick.symbol, features, oldSide, state);
-
+              const ensemble=await mlEnsembleVote(pick.symbol,features,oldSide,state);
               pick.side=ensemble.ensemble_side;
               if (pick.side === 'long') { pick.p_raw = pick.p_raw_long; pick.p_lcb = pick.p_lcb_long; } else { pick.p_raw = pick.p_raw_short; pick.p_lcb = pick.p_lcb_short; }
               pick.confidence+=ensemble.confidence_boost;
@@ -1610,7 +1313,6 @@ jobs:
 
               let size_bps = FIXED_SIZE_BPS > 0 ? FIXED_SIZE_BPS : (Number(process.env.FORCE_SIZE_BPS||"0")>0) ? Math.round(Number(process.env.FORCE_SIZE_BPS)) : (x.sl_bps>0?Math.min(220,Math.round((wEv[i]*TARGET_PORT_RISK_BPS/x.sl_bps)*100)):0);
               if (regime && regime.current === "explore") size_bps = Math.round(size_bps * REGIME_EXPLORE_RISK_FACTOR);
-              size_bps = adaptivePositionSize(size_bps, x.confidence, state);
               
               return {
                 idea_id, client_order_id, symbol: x.base, symbolFull: x.symbol, side: x.side, rank: i+1, target_exchange: TARGET_EXCHANGE, market_type: MARKET_TYPE, margin_mode: MARGIN_MODE, leverage: LEVERAGE, 
