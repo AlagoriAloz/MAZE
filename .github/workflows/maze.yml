@@ -123,7 +123,7 @@ jobs:
           (async ()=>{
           'use strict';
           const crypto = require('crypto');
-          const MODEL_VERSION=(process.env.MODEL_VERSION||"9.1.1-robust-fixed");
+          const MODEL_VERSION=(process.env.MODEL_VERSION||"9.1.0-robust");
           const UA = `gh-actions-ideas-mexc-ultimate/${MODEL_VERSION} (+https://github.com/)`;
           
           // ===== NEW: Global constants, registry, toggles =====
@@ -524,7 +524,7 @@ jobs:
           // ---------- State (Gist) + Calibration + Audit ----------
           async function loadState(){
             const token=process.env.GIST_TOKEN, id=process.env.GIST_ID;
-            const init={ v:"mexc-ultimate-9.1.1-robust-aggregate",
+            const init={ v:"mexc-ultimate-9.1.0-robust-aggregate",
               cooldown:{}, cooldown_side:{}, pending:[], equity:[], closed:[],
               mr_lockout:{}, sym_stats:{}, sym_stats_real:{}, calibCoeffs:{}, lastReconcileTs:0,
               model_ewaf: {}, ml_models: {}, model_weights: {}, model_weights_frozen: null,
@@ -1385,41 +1385,20 @@ jobs:
           }
           
           function trimStateForGist(state) {
-            let trimmed = false; 
-            const trimReport = [];
-            
-            if (state.equity?.length > MAX_EQUITY_POINTS) { 
-              state.equity = state.equity.slice(-MAX_EQUITY_POINTS); 
-              trimReport.push(`equity`); 
-              trimmed = true; 
-            }
-            if (state.pending?.length > MAX_PENDING) { 
-              state.pending = state.pending.slice(-MAX_PENDING); 
-              trimReport.push(`pending`); 
-              trimmed = true; 
-            }
+            let trimmed = false; const trimReport = [];
+            if (state.equity?.length > MAX_EQUITY_POINTS) { state.equity = state.equity.slice(-MAX_EQUITY_POINTS); trimReport.push(`equity`); trimmed = true; }
+            if (state.pending?.length > MAX_PENDING) { state.pending = state.pending.slice(-MAX_PENDING); trimReport.push(`pending`); trimmed = true; }
             
             const weekAgo = Date.now() - 7*24*3600*1000;
             let cleaned = 0;
-            for (const [sym, ts] of Object.entries(state.mr_lockout || {})) {
-              if (ts < weekAgo) { delete state.mr_lockout[sym]; cleaned++; }
-            }
-            for (const [sym, ts] of Object.entries(state.cooldown || {})) {
-              if (ts < weekAgo) { delete state.cooldown[sym]; cleaned++; }
-            }
+            for (const [sym, ts] of Object.entries(state.mr_lockout || {})) if (ts < weekAgo) { delete state.mr_lockout[sym]; cleaned++; }
+            for (const [sym, ts] of Object.entries(state.cooldown || {})) if (ts < weekAgo) { delete state.cooldown[sym]; cleaned++; }
             if (cleaned > 0) { trimReport.push(`cooldowns`); trimmed = true; }
             
-            if (state.regime_history?.length > 5) { 
-              state.regime_history = state.regime_history.slice(-5); 
-              trimReport.push('regime_history'); 
-              trimmed = true; 
-            }
+            if (state.regime_history?.length > 5) { state.regime_history = state.regime_history.slice(-5); trimReport.push('regime_history'); trimmed=true; }
             
-            // Remove bulky per-trade buffers (aggregate-only) — FIXED
-            delete state.ml_training_buffer; 
-            delete state.calibration_holdout; 
-            delete state.ml_voting_history; 
-            delete state.buffer_at_plan;
+            // Remove bulky per-trade buffers (aggregate-only)
+            delete state.ml_training_buffer; delete s.calibration_holdout; delete s.ml_voting_history; delete s.buffer_at_plan;
 
             const sizeKB = Math.round(JSON.stringify(state).length / 1024);
             if (state.system_learning?.health) state.system_learning.health.gist_size_kb = sizeKB;
@@ -1448,55 +1427,6 @@ jobs:
           }
           
           async function candleSimForIdea(p){ /* unchanged */ return { status:"sim_error", closed:false }; }
-          
-          // ========== MISSING HELPER FUNCTIONS (ADD BEFORE MAIN LOGIC) ==========
-          function validateActiveModels(state) {
-            const active = [];
-            for (const m of MODELS) {
-              const key = m.toLowerCase().replace(/\s/g,'');
-              const map = { hoeffdingtree: 'hoeffding', adaptiverf: 'adaptive_rf' };
-              const storeKey = map[key] || key;
-              const n = state.ml_models?.[storeKey]?.n_updates || 0;
-              const req = MIN_SAMPLES_REQUIRED[key] || 0;
-              if (n >= req || req === 0) active.push(m);
-            }
-            log(`✅ Active models (${active.length}/${MODELS.length}):`, active.join(", "));
-          }
-
-          function checkCriticalConditions(state) {
-            const issues = [];
-            if (!state.model_weights || Object.keys(state.model_weights).length === 0) {
-              issues.push("model_weights empty");
-            }
-            if (!state.model_ewaf?.params) {
-              issues.push("EWAF params missing");
-            }
-            if (issues.length > 0) {
-              log("⚠️ Critical conditions:", issues.join(", "));
-            }
-          }
-
-          function equityStats(equity) {
-            if (!equity || equity.length === 0) return { pnl24_bps: 0, peak_dd_bps: 0 };
-            
-            const now = Date.now();
-            const oneDayAgo = now - 24*3600*1000;
-            
-            // 24h P&L
-            const recent = equity.filter(e => e.ts_ms >= oneDayAgo);
-            const pnl24_bps = recent.reduce((sum, e) => sum + (e.pnl_bps || 0), 0);
-            
-            // Peak drawdown
-            let peak = 0, runningSum = 0, maxDD = 0;
-            for (const e of equity) {
-              runningSum += (e.pnl_bps || 0);
-              if (runningSum > peak) peak = runningSum;
-              const dd = runningSum - peak;
-              if (dd < maxDD) maxDD = dd;
-            }
-            
-            return { pnl24_bps: Math.round(pnl24_bps), peak_dd_bps: Math.round(maxDD) };
-          }
           
           // ---------- Main ----------
           let reason="ok", selectionTier="confidence";
@@ -1528,9 +1458,6 @@ jobs:
             const kBTC1H=await getKCached("BTCUSDT","1h",K1H); const kBTC5=await getKCached("BTCUSDT","5m",K5M);
             const btcR5=(()=>{ const c=(kBTC5||[]).map(x=>+x[4]); const r=[]; for(let i=1;i<c.length;i++) r.push(Math.log(c[i]/c[i-1])); return r.slice(-120); })();
             
-            const { pnl24_bps, peak_dd_bps } = equityStats(state.equity);
-            const throttle=(pnl24_bps<=DD_24H_LIMIT_BPS) || (peak_dd_bps<=DD_PEAK_LIMIT_BPS);
-
             const FIXED_120_BASES = ["BTC","ETH","BNB","SOL","XRP","ADA","AVAX","DOGE","DOT","MATIC","LTC","SHIB","TRX","LINK","ATOM","UNI","XLM","ETC","BCH","NEAR","APT","ARB","OP","LDO","STX","IMX","INJ","VET","FIL","HBAR","MKR","AAVE","QNT","GRT","ALGO","RUNE","SAND","MANA","XTZ","AXS","EOS","THETA","FTM","ICP","EGLD","FLOW","XMR","APE","CHZ","KLAY","GALA","SNX","CRV","ZEC","ENJ","DASH","NEO","COMP","KCS","ZIL","BAT","WAVES","IOTA","1INCH","LRC","SUSHI","YFI","RVN","CELO","HOT","OMG","ZRX","ICX","ONT","QTUM","SKL","AR","GMT","JST","RSR","ONE","AUDIO","ANKR","CKB","MASK","DYDX","BLUR","SUI","SEI","TIA","JUP","WLD","PEPE","FET","RENDER","AGIX","ORDI","WIF","BONK","FLOKI","PYTH","JTO","STRK","MEME","DYM","PORTAL","XAI","ALT","PIXEL","AEVO","NFP","ACE","RDNT","MAV","PENDLE","AI","ID","JOE"];
             const QUOTES=["USDT","USDC","USD"];
             const all24Map=new Map(); for(const t of ALL24||[]){ const sym=t.symbol||t.s; if(sym) all24Map.set(sym,t); }
@@ -1542,7 +1469,9 @@ jobs:
               }
             }
             log("universe (fixed 120)", universe.length);
-            
+
+            const { pnl24_bps, peak_dd_bps } = equityStats(state.equity);
+            const throttle=(pnl24_bps<=DD_24H_LIMIT_BPS) || (peak_dd_bps<=DD_PEAK_LIMIT_BPS);
             const liqPct=new Map(); for(let i=0;i<universe.length;i++) liqPct.set(universe[i].symbol,1-i/(universe.length-1));
 
             const picksRaw=[]; const B=10;
