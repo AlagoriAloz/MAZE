@@ -92,6 +92,13 @@ jobs:
       EWAF_EXPLORATION_RHO: ${{ vars.EWAF_EXPLORATION_RHO }}
       EWAF_REWARD_SCALE_BPS: ${{ vars.EWAF_REWARD_SCALE_BPS }}
 
+      # Rahman Configuration (OPTIONAL)
+      RAHMAN_ENABLE: ${{ vars.RAHMAN_ENABLE }}
+      RAHMAN_INIT: ${{ vars.RAHMAN_INIT }}
+      RAHMAN_STEP: ${{ vars.RAHMAN_STEP }}
+      RAHMAN_MIN: ${{ vars.RAHMAN_MIN }}
+      RAHMAN_MAX: ${{ vars.RAHMAN_MAX }}
+
     steps:
       - name: Setup Node 20
         uses: actions/setup-node@v4
@@ -121,6 +128,13 @@ jobs:
           const EWAF_TEMPERATURE = Number(process.env.EWAF_TEMPERATURE || "6");  // Softmax temp
           const EWAF_EXPLORATION_RHO = Number(process.env.EWAF_EXPLORATION_RHO || "0.05");  // 5% exploration
           const EWAF_REWARD_SCALE_BPS = Number(process.env.EWAF_REWARD_SCALE_BPS || "80");  // Reward normalization
+
+          // ========== RAHMAN CONFIGURATION ==========
+          const RAHMAN_ENABLE = (process.env.RAHMAN_ENABLE || "true").toLowerCase() === "true";
+          const RAHMAN_INIT = Number(process.env.RAHMAN_INIT || "10");   // neutral starting weight
+          const RAHMAN_STEP = Number(process.env.RAHMAN_STEP || "1");    // step per trade
+          const RAHMAN_MIN = Number(process.env.RAHMAN_MIN || "0");
+          const RAHMAN_MAX = Number(process.env.RAHMAN_MAX || "20");
           
           const UA = `gh-actions-ideas-mexc-ultimate/${MODEL_VERSION} (+https://github.com/)`;
           
@@ -293,7 +307,32 @@ jobs:
             
             return ewaf.weight;
           };
-          
+
+          // ========== RAHMAN HELPER FUNCTIONS ==========
+          const getRahmanState = (state, model) => {
+            if (!state.model_rahman) state.model_rahman = {};
+            if (!state.model_rahman[model]) {
+              state.model_rahman[model] = { weight: RAHMAN_INIT, last_updated_ts: Date.now() };
+            }
+            return state.model_rahman[model];
+          };
+
+          /**
+           * Update Rahman short-term recency weight (0..20)
+           * +1 on correct, -1 on incorrect. Frozen in EXPLOIT (handled by caller).
+           */
+          const updateRahmanForModel = (state, model, wasCorrect, now_ts) => {
+            if (!RAHMAN_ENABLE) return getRahmanState(state, model).weight;
+            const st = getRahmanState(state, model);
+            let w = Number.isFinite(st.weight) ? st.weight : RAHMAN_INIT;
+            w = wasCorrect ? (w + RAHMAN_STEP) : (w - RAHMAN_STEP);
+            w = clamp(Math.round(w), RAHMAN_MIN, RAHMAN_MAX);
+            st.weight = w;
+            st.last_updated_ts = now_ts;
+            state.model_rahman[model] = st;
+            return st.weight;
+          };
+
           const sleep=(ms)=>new Promise(r=>setTimeout(r,ms));
           const jitter=(ms)=>ms + Math.floor(Math.random()*ms*0.25);
           const log=(...a)=>console.log("[gha]",...a);
@@ -776,6 +815,20 @@ jobs:
                 };
               }
 
+              // ========== RAHMAN STATE INITIALIZATION ==========
+              if (!s.model_rahman) {
+                const now = Date.now();
+                s.model_rahman = {
+                  Original:     { weight: RAHMAN_INIT, last_updated_ts: now },
+                  Momentum:     { weight: RAHMAN_INIT, last_updated_ts: now },
+                  MeanReversion:{ weight: RAHMAN_INIT, last_updated_ts: now },
+                  Logistic:     { weight: RAHMAN_INIT, last_updated_ts: now },
+                  NaiveBayes:   { weight: RAHMAN_INIT, last_updated_ts: now },
+                  DecisionTree: { weight: RAHMAN_INIT, last_updated_ts: now },
+                  RandomForest: { weight: RAHMAN_INIT, last_updated_ts: now }
+                };
+              }
+
               // ========== PHASE 4: REGIME HISTORY (last 10 periods) ==========
               if(!Array.isArray(s.regime_history)) {
                 s.regime_history = [];
@@ -840,7 +893,25 @@ jobs:
                 merged.model_ewaf[model] = (r.last_updated_ts >= l.last_updated_ts) ? r : l;
               }
             }
-            
+
+            // ========== RAHMAN MERGE (keep most recent) ==========
+            merged.model_rahman = {};
+            const allRahmanModels = new Set([
+              ...Object.keys(remote.model_rahman || {}),
+              ...Object.keys(local.model_rahman || {})
+            ]);
+            for (const model of allRahmanModels) {
+              const r = remote.model_rahman?.[model];
+              const l = local.model_rahman?.[model];
+              if (!r) {
+                merged.model_rahman[model] = l;
+              } else if (!l) {
+                merged.model_rahman[model] = r;
+              } else {
+                merged.model_rahman[model] = (r.last_updated_ts >= l.last_updated_ts) ? r : l;
+              }
+            }
+
             merged.system_learning = local.system_learning || remote.system_learning || {};
             merged.regime_history = local.regime_history || remote.regime_history || [];
             merged.model_weights = local.model_weights || remote.model_weights || {};
@@ -1019,135 +1090,6 @@ jobs:
           }
           
           const regFromKey = (k) => k?.includes("regime:trend") ? "trend" : k?.includes("regime:meanrevert") ? "meanrevert" : null;
-
-          /**
-           * Update system learning metrics from closed trades (Phase 3)
-           * Only learns from Worker-reconciled fills (reconciliation === "exchange_trade_history")
-           */
-          function updateSystemLearning(state, newClosedTrades) {
-            if (!newClosedTrades || newClosedTrades.length === 0) return;
-            
-            const sl = state.system_learning;
-            
-            log(`\n📊 Updating system learning from ${newClosedTrades.length} new closed trades`);
-            
-            // Update totals (aggregates)
-            for (const trade of newClosedTrades) {
-              // CRITICAL: Only learn from Worker's real fills
-              if (trade.reconciliation !== "exchange_trade_history") {
-                log(`⏭️  Skipping ${trade.symbol} (reconciliation: ${trade.reconciliation || "none"})`);
-                continue;
-              }
-              
-              sl.total_trades++;
-              const won = (trade.pnl_bps || 0) > 0;
-              
-              if (won) {
-                sl.total_wins++;
-              } else {
-                sl.total_losses++;
-              }
-              
-              sl.cumulative_pnl_bps += (trade.pnl_bps || 0);
-              
-              // Add to last 10 window (MINIMAL data only - Gist optimization)
-              sl.last_10.trades.push({
-                symbol: trade.symbolFull || trade.symbol,
-                side: trade.side,
-                pnl_bps: trade.pnl_bps,
-                outcome: won ? "win" : "loss",
-                ts_ms: trade.ts_exit_ms || Date.now()
-              });
-              
-              // Keep only last 10 (Phase 7: Gist size control)
-              if (sl.last_10.trades.length > 10) {
-                sl.last_10.trades = sl.last_10.trades.slice(-10);
-              }
-              
-              log(`  ✅ ${trade.symbolFull || trade.symbol} ${trade.side} ${won ? "WIN" : "LOSS"} (${trade.pnl_bps} bps)`);
-            }
-            
-            // Recalculate aggregates
-            sl.winrate = sl.total_trades > 0 ? sl.total_wins / sl.total_trades : 0;
-            sl.avg_pnl_bps = sl.total_trades > 0 ? Math.round(sl.cumulative_pnl_bps / sl.total_trades) : 0;
-            
-            // Last 10 stats
-            const l10 = sl.last_10.trades;
-            sl.last_10.wins = l10.filter(t => t.outcome === "win").length;
-            sl.last_10.losses = l10.length - sl.last_10.wins;
-            sl.last_10.winrate = l10.length > 0 ? sl.last_10.wins / l10.length : 0;
-            sl.last_10.pnl_bps = l10.reduce((sum, t) => sum + (t.pnl_bps || 0), 0);
-            sl.last_10.avg_pnl_bps = l10.length > 0 ? Math.round(sl.last_10.pnl_bps / l10.length) : 0;
-            
-            // Update learning metrics
-            sl.learning.trades_learned_from = sl.total_trades;
-            sl.learning.ml_training_buffer_size = state.ml_training_buffer?.length || 0;
-            sl.learning.ml_training_progress = sl.learning.ml_training_buffer_size / sl.learning.ml_training_target;
-            
-            // Count trained models
-            sl.learning.models_trained = 0;
-            const mlModels = ['logistic', 'randomforest', 'decisiontree', 'naivebayes'];
-            for (const m of mlModels) {
-              const required = MIN_SAMPLES_REQUIRED[m];
-              if (sl.learning.ml_training_buffer_size >= required) {
-                sl.learning.models_trained++;
-              }
-            }
-            sl.learning.models_waiting = 4 - sl.learning.models_trained;
-            
-            // Check milestones
-            updateMilestones(state);
-            
-            // Update timestamp
-            sl.last_updated_ts = Date.now();
-            
-            log(`📊 System: ${sl.total_trades} trades, ${(sl.winrate*100).toFixed(1)}% WR, ${sl.cumulative_pnl_bps} bps total`);
-          }
-
-          /**
-           * Check and update milestones (Phase 3)
-           */
-          function updateMilestones(state) {
-            const sl = state.system_learning;
-            const m = sl.milestones;
-            const now = new Date().toISOString().split('T')[0];
-            
-            if (!m["10_trades"].reached && sl.total_trades >= 10) {
-              m["10_trades"].reached = true;
-              m["10_trades"].date = now;
-              log("🎉 MILESTONE: 10 trades reached!");
-            }
-            
-            if (!m["20_trades"].reached && sl.total_trades >= 20) {
-              m["20_trades"].reached = true;
-              m["20_trades"].date = now;
-              log("🎉 MILESTONE: 20 trades reached!");
-            }
-            
-            if (!m["50_samples"].reached && sl.learning.ml_training_buffer_size >= 50) {
-              m["50_samples"].reached = true;
-              m["50_samples"].date = now;
-              log("🎉 MILESTONE: 50 ML samples - Models unlocking!");
-            }
-            
-            if (!m["first_6_10"].reached && sl.last_10.wins >= 6) {
-              m["first_6_10"].reached = true;
-              m["first_6_10"].date = now;
-              log("🎉 MILESTONE: First 6/10 win run - EXPLOIT mode eligible!");
-            }
-            
-            if (!m["100_trades"].reached && sl.total_trades >= 100) {
-              m["100_trades"].reached = true;
-              m["100_trades"].date = now;
-              log("🎉 MILESTONE: 100 trades - Statistical significance!");
-            }
-            
-            if (!m["break_even"].reached && sl.cumulative_pnl_bps >= 0) {
-              m["break_even"].reached = true;
-              m["break_even"].date = now;
-              log("🎉 MILESTONE: Break-even achieved!");
-            }
-          }
           
           /**
            * Update regime based on 6/10 rule with hysteresis (Phase 4)
@@ -1274,7 +1216,7 @@ jobs:
           }
           
           /**
-           * Print Model Scoreboard Table (Phase 3 + EWAF)
+           * Print Model Scoreboard Table (Phase 3 + EWAF + RAHMAN)
            */
           function printModelScoreboard(state) {
             const sb = state.model_scoreboard || {};
@@ -1286,27 +1228,28 @@ jobs:
             log('');
             
             // Table header
-            log('╔══════════════╦═════════╦═══════╦═══════╦═════════╦════════╦════════╦════════╦════════╗');
-            log('║ Model        ║ Correct ║ Wrong ║ Total ║ Win%    ║ Wilson ║ EWAF   ║ FINAL  ║ Status ║');
-            log('╠══════════════╬═════════╬═══════╬═══════╬═════════╬════════╬════════╬════════╬════════╣');
+            log('╔══════════════╦═════════╦═══════╦═══════╦═════════╦════════╦════════╦════════╦════════╦════════╗');
+            log('║ Model        ║ Correct ║ Wrong ║ Total ║ Win%    ║ Wilson ║ EWAF   ║ Rahman ║ FINAL  ║ Status ║');
+            log('╠══════════════╬═════════╬═══════╬═══════╬═════════╬════════╬════════╬════════╬════════╬════════╣');
 
             // Sort by final weight (descending)
             const models = Object.entries(sb).map(([name, stats]) => {
               const w_wilson = stats.weight || 0;
               const w_ewaf = state.model_ewaf?.[name]?.weight || 0;
-              const final = state.model_weights?.[name] || (w_wilson + w_ewaf);
-              return { name, stats, w_wilson, w_ewaf, final };
+              const w_rahman = state.model_rahman?.[name]?.weight ?? RAHMAN_INIT;
+              const final = state.model_weights?.[name] || (w_wilson + w_ewaf + w_rahman);
+              return { name, stats, w_wilson, w_ewaf, w_rahman, final };
             }).sort((a, b) => b.final - a.final);
 
-            for (const { name, stats, w_wilson, w_ewaf, final } of models) {
+            for (const { name, stats, w_wilson, w_ewaf, w_rahman, final } of models) {
               const status = getModelStatus(name, final, trainingBufferSize);
               const statusIcon = status.canVote ? '✅ ON ' : '⏸️ OFF';
               const winPct = stats.total > 0 ? ((stats.winrate || (stats.correct / stats.total)) * 100).toFixed(1) + '%' : '-';
               
-              log(`║ ${name.padEnd(12)} ║ ${String(stats.correct).padStart(7)} ║ ${String(stats.wrong).padStart(5)} ║ ${String(stats.total).padStart(5)} ║ ${winPct.padStart(7)} ║ ${String(w_wilson).padStart(6)} ║ ${String(w_ewaf).padStart(6)} ║ ${String(final).padStart(6)} ║ ${statusIcon} ║`);
+              log(`║ ${name.padEnd(12)} ║ ${String(stats.correct).padStart(7)} ║ ${String(stats.wrong).padStart(5)} ║ ${String(stats.total).padStart(5)} ║ ${winPct.padStart(7)} ║ ${String(w_wilson).padStart(6)} ║ ${String(w_ewaf).padStart(6)} ║ ${String(w_rahman).padStart(6)} ║ ${String(final).padStart(6)} ║ ${statusIcon} ║`);
             }
 
-            log('╚══════════════╩═════════╩═══════╩═══════╩═════════╩════════╩════════╩════════╩════════╝');
+            log('╚══════════════╩═════════╩═══════╩═══════╩═════════╩════════╩════════╩════════╩════════╩════════╝');
             
             // Training progress
             if (trainingBufferSize < 50) {
@@ -1370,7 +1313,6 @@ jobs:
             log(`  ${regimeIcon} ${sl.regime.current.toUpperCase()} (${regimeDays} days) - ${sl.regime.reason}`);
             log(`  Weight updates: ${sl.regime.weight_updates_enabled ? '✅ ENABLED' : '❌ FROZEN'}`);
             log('');
-            
             // Milestones
             const m = sl.milestones;
             const mSymbol = (reached) => reached ? '✅' : '⏳';
@@ -1891,7 +1833,7 @@ jobs:
               // ✅ Validate it's a valid positive number (NO UPPER CAP)
               const normalized = (typeof baseWeight === 'number' && 
                                   Number.isFinite(baseWeight) && 
-                                  baseWeight >= 0)  // ✅ Removed <= 20 cap
+                                  baseWeight >= 0)
                 ? baseWeight 
                 : 0;
               
@@ -2058,7 +2000,7 @@ jobs:
               after: state.closed.length,
               unprocessed: unprocessed.length,
               processed_kept: processedKept.length,
-              processed_dropped: processed.length - processedKept.length // ✅ Corrected
+              processed_dropped: processed.length - processedKept.length
             };
             
             if (report.processed_dropped > 0 || report.unprocessed > 0) {
@@ -2438,6 +2380,23 @@ jobs:
                 migrated = true;
                 log('✅ EWAF initialized with neutral weights (R=0)');
               }
+
+              // ========== RAHMAN MIGRATION ==========
+              if (!state.model_rahman) {
+                log('Initializing RAHMAN state...');
+                const now = Date.now();
+                state.model_rahman = {
+                  Original:     { weight: RAHMAN_INIT, last_updated_ts: now },
+                  Momentum:     { weight: RAHMAN_INIT, last_updated_ts: now },
+                  MeanReversion:{ weight: RAHMAN_INIT, last_updated_ts: now },
+                  Logistic:     { weight: RAHMAN_INIT, last_updated_ts: now },
+                  NaiveBayes:   { weight: RAHMAN_INIT, last_updated_ts: now },
+                  DecisionTree: { weight: RAHMAN_INIT, last_updated_ts: now },
+                  RandomForest: { weight: RAHMAN_INIT, last_updated_ts: now }
+                };
+                migrated = true;
+                log('✅ RAHMAN initialized to neutral (10)');
+              }
               
               if (state.closed?.length > 0) {
                 let marked = 0;
@@ -2543,7 +2502,6 @@ jobs:
                     state.model_scoreboard[model] = { correct: 0, wrong: 0, total: 0, winrate: 0, weight: state.model_weights?.[model] || 0, last_updated_ts: Date.now() };
                   }
                   
-                  // ========== PARALLEL UPDATE: WILSON + EWAF ==========
                   const votedForTakenSide = (votedSide === takenSide);
                   const wasCorrect = (votedForTakenSide && isWin) || (!votedForTakenSide && !isWin);
 
@@ -2563,7 +2521,7 @@ jobs:
                   let w_wilson;
                   if (wilson_lcb > 0.52) {
                     w_wilson = Math.round(((wilson_lcb - 0.52) / 0.48) * 20);
-                    w_wilson = Math.max(0, Math.min(20, w_wilson));  // ✅ Wilson clamped 0-20
+                    w_wilson = Math.max(0, Math.min(20, w_wilson));
                   } else {
                     w_wilson = 0;
                   }
@@ -2578,10 +2536,12 @@ jobs:
 
                   // ========== UPDATE 2: EWAF (0-20 range) ==========
                   const w_ewaf = updateEWAFForModel(state, model, votedSide, takenSide, trade.pnl_bps, now_ts);
-                  // ✅ w_ewaf already clamped 0-20 inside updateEWAFForModel
 
-                  // ========== FINAL WEIGHT = WILSON + EWAF (NO CAP) ==========
-                  const final_weight = w_wilson + w_ewaf;  // ✅ Can be 0-40+
+                  // ========== UPDATE 3: RAHMAN (0-20 range, ±1 per trade) ==========
+                  const w_rahman = updateRahmanForModel(state, model, wasCorrect, now_ts);
+
+                  // ========== FINAL WEIGHT = WILSON + EWAF + RAHMAN (NO CAP) ==========
+                  const final_weight = w_wilson + w_ewaf + w_rahman;  // 0..60
                   const oldWeight = state.model_weights[model] || 0;
                   state.model_weights[model] = final_weight;
 
@@ -2596,7 +2556,7 @@ jobs:
                   }
 
                   log(`   ${model.padEnd(15)}: ${wasCorrect ? "✅" : "❌"} | ${sb.correct}/${sb.total} (${(winrate*100).toFixed(1)}%)`);
-                  log(`      Wilson: ${w_wilson} (LCB=${(wilson_lcb*100).toFixed(1)}%) | EWAF: ${w_ewaf} | FINAL: ${oldWeight}${arrow}${final_weight} (${change>=0?'+':''}${change})`);
+                  log(`      Wilson: ${w_wilson} (LCB=${(wilson_lcb*100).toFixed(1)}%) | EWAF: ${w_ewaf} | Rahman: ${w_rahman} | FINAL: ${oldWeight}${arrow}${final_weight} (${change>=0?'+':''}${change})`);
 
                   totalWeightChanges++;
                 }
@@ -3032,7 +2992,7 @@ jobs:
                 x.ml_ensemble.training_buffer_size = state.ml_training_buffer?.length || 0;
               }
               state.buffer_at_plan = state.buffer_at_plan || {};
-              state.buffer_at_plan[idea_id] = state.ml_training_buffer?.length || 0;  // ✅ Now idea_id exists!
+              state.buffer_at_plan[idea_id] = state.ml_training_buffer?.length || 0;
 
               const bk = bookMap.get(x.symbol);
               const mid = (bk?.bid && bk?.ask) ? ((+bk.bid + +bk.ask)/2) : null;
@@ -3154,7 +3114,7 @@ jobs:
               const payloadV2 = { ts: new Date().toISOString(), mode: "normal", source: "external_pusher", meta: { origin: "github_actions_v2" }, top_n: picksV2.length, ideas: picksV2 };
               log(`pushing ${picksV2.length} v2 ideas to ${PUSH_URL_V2}`);
               try {
-                const r2 = await fetchWithTimeout(PUSH_URL_V2, { method:"POST", headers:{ "Content-Type":"application/json", "Authorization":"Bearer " + PUSH_TOKEN }, body: JSON.stringify(payloadV2) }, 15000);
+                const r2 = await fetchWithTimeout(PUSH_URL_V2, { method:"POST", headers:{ "Content-Type": "application/json", "Authorization":"Bearer " + PUSH_TOKEN }, body: JSON.stringify(payloadV2) }, 15000);
                 let txt2=""; try{ txt2=await r2.text(); }catch{}
                 log("push v2 status", r2?.status||"ERR", (txt2||"").slice(0,400));
               } catch (e) { log("push v2 failed", e?.message||e); }
