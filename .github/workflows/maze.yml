@@ -1,3 +1,117 @@
+name: Ideas Pusher (MEXC Ultimate 7.7.7 - Production Ready)
+
+on:
+  schedule:
+    - cron: "0 */3 * * *"
+  repository_dispatch:
+    types: [run_B]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ideas-mexc-ultimate
+  cancel-in-progress: true
+
+jobs:
+  push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+
+    env:
+      # Required secrets
+      WORKER_PUSH_URL: ${{ secrets.WORKER_PUSH_URL }}
+      PUSH_TOKEN: ${{ secrets.PUSH_TOKEN }}
+      WORKER_PUSH_URL_V2: ${{ secrets.WORKER_PUSH_URL_V2 }}
+
+      # Required for trade reconciliation
+      MEXC_API_KEY: ${{ secrets.MEXC_API_KEY }}
+      MEXC_SECRET_KEY: ${{ secrets.MEXC_SECRET_KEY }}
+
+      # Optional (safe defaults inside the script)
+      GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+      GIST_ID: ${{ secrets.GIST_ID }}
+
+      # Exchange + tuning knobs (via Repo/Org Variables)
+      EXCHANGE: mexc
+      MIN_QV_USD: ${{ vars.MIN_QV_USD }}
+      TOP_N: ${{ vars.TOP_N }}
+      MAX_SPREAD_BPS: ${{ vars.MAX_SPREAD_BPS }}
+      EXP_LCB_MIN_BPS: ${{ vars.EXP_LCB_MIN_BPS }}
+      FEES_BPS: ${{ vars.FEES_BPS }}
+      NOTIONAL_USD: ${{ vars.NOTIONAL_USD }}
+      MEXC_DEPTH_LIMIT: ${{ vars.MEXC_DEPTH_LIMIT }}
+      OBI_TOPN: ${{ vars.OBI_TOPN }}
+      ACTIVE_UTC_START: ${{ vars.ACTIVE_UTC_START }}
+      ACTIVE_UTC_END: ${{ vars.ACTIVE_UTC_END }}
+      MEXC_BASE: ${{ vars.MEXC_BASE }}
+      FORCE_SIZE_BPS: ${{ vars.FORCE_SIZE_BPS }}
+      CAPITAL_PCT_PER_TRADE: ${{ vars.CAPITAL_PCT_PER_TRADE }}
+
+      # Confidence Model Knobs
+      DIRECTION: ${{ vars.DIRECTION }}
+      MR_SLOPE_MAX_ATR50: ${{ vars.MR_SLOPE_MAX_ATR50 }}
+      MR_BREAKOUT_DC_N: ${{ vars.MR_BREAKOUT_DC_N }}
+      MR_BREAKOUT_RET15_ATR: ${{ vars.MR_BREAKOUT_RET15_ATR }}
+      MR_LOCKOUT_SEC: ${{ vars.MR_LOCKOUT_SEC }}
+      MAX_COST_BPS_HARD: ${{ vars.MAX_COST_BPS_HARD }}
+      MIN_VOL_1H_USD: ${{ vars.MIN_VOL_1H_USD }}
+      DEPTH_1P_MIN_USD: ${{ vars.DEPTH_1P_MIN_USD }}
+      NO_LONG_DOWN_ENABLE: ${{ vars.NO_LONG_DOWN_ENABLE }}
+      LONG_DOWN_RSI_CUTOFF: ${{ vars.LONG_DOWN_RSI_CUTOFF }}
+      LONG_MR_DIVERGENCE_REQ: ${{ vars.LONG_MR_DIVERGENCE_REQ }}
+      LONG_EDGE_MULT_MIN: ${{ vars.LONG_EDGE_MULT_MIN }}
+      LONG_BOUNCE_SL_ATR: ${{ vars.LONG_BOUNCE_SL_ATR }}
+      LONG_BOUNCE_TP_ATR: ${{ vars.LONG_BOUNCE_TP_ATR }}
+      LONG_SIMILARITY_RHO: ${{ vars.LONG_SIMILARITY_RHO }}
+
+      # MTF + Provenance + Align
+      MIN_TF_ALIGN: ${{ vars.MIN_TF_ALIGN }}
+      TF_WEIGHTS: ${{ vars.TF_WEIGHTS }}
+      STRATEGY_NAME: ${{ vars.STRATEGY_NAME }}
+      MODEL_VERSION: ${{ vars.MODEL_VERSION }}
+      SCHEMA_VERSION: ${{ vars.SCHEMA_VERSION }}
+      GIT_SHA: ${{ github.sha }}
+
+      # ========== NEW REPO VARIABLES (ML ENSEMBLE OVERHAUL) ==========
+      REGIME_EXPLOIT_ENTER: ${{ vars.REGIME_EXPLOIT_ENTER }}
+      REGIME_EXPLOIT_EXIT: ${{ vars.REGIME_EXPLOIT_EXIT }}
+      REGIME_EXPLORE_RISK_FACTOR: ${{ vars.REGIME_EXPLORE_RISK_FACTOR }}
+      MIN_SAMPLES_LOGISTIC: ${{ vars.MIN_SAMPLES_LOGISTIC }}
+      MIN_SAMPLES_RANDOMFOREST: ${{ vars.MIN_SAMPLES_RANDOMFOREST }}
+      MIN_SAMPLES_DECISIONTREE: ${{ vars.MIN_SAMPLES_DECISIONTREE }}
+      MIN_SAMPLES_NAIVEBAYES: ${{ vars.MIN_SAMPLES_NAIVEBAYES }}
+      WEIGHT_WILSON_Z: ${{ vars.WEIGHT_WILSON_Z }}
+      WEIGHT_MIN_RULE_BASED: ${{ vars.WEIGHT_MIN_RULE_BASED }}
+      KEEP_PROCESSED_TRADES: ${{ vars.KEEP_PROCESSED_TRADES }}
+
+      # EWAF Configuration (OPTIONAL - defaults work)
+      EWAF_HALF_LIFE: ${{ vars.EWAF_HALF_LIFE }}
+      EWAF_TEMPERATURE: ${{ vars.EWAF_TEMPERATURE }}
+      EWAF_EXPLORATION_RHO: ${{ vars.EWAF_EXPLORATION_RHO }}
+      EWAF_REWARD_SCALE_BPS: ${{ vars.EWAF_REWARD_SCALE_BPS }}
+
+    steps:
+      - name: Setup Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Run pusher (always-push + clear logs)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Hard fail only on true misconfig (so setup problems aren't hidden)
+          if [[ -z "${WORKER_PUSH_URL:-}" || -z "${PUSH_TOKEN:-}" ]]; then
+            echo "[gha] Missing WORKER_PUSH_URL or PUSH_TOKEN"
+            exit 1
+          fi
+
+          set +e
+          node - <<'NODE'
+          (async ()=>{
           'use strict';
           const crypto = require('crypto');
           const MODEL_VERSION=(process.env.MODEL_VERSION||"8.0.0");
@@ -179,7 +293,7 @@
             
             return ewaf.weight;
           };
-
+          
           const sleep=(ms)=>new Promise(r=>setTimeout(r,ms));
           const jitter=(ms)=>ms + Math.floor(Math.random()*ms*0.25);
           const log=(...a)=>console.log("[gha]",...a);
@@ -705,7 +819,7 @@
             
             // ========== Phase 3-8: New fields (Pusher-owned) ==========
             merged.model_scoreboard = local.model_scoreboard || remote.model_scoreboard || {};
-            
+
             // ========== EWAF MERGE (keep most recent) ==========
             merged.model_ewaf = {};
             const allEwafModels = new Set([
@@ -726,7 +840,7 @@
                 merged.model_ewaf[model] = (r.last_updated_ts >= l.last_updated_ts) ? r : l;
               }
             }
-
+            
             merged.system_learning = local.system_learning || remote.system_learning || {};
             merged.regime_history = local.regime_history || remote.regime_history || [];
             merged.model_weights = local.model_weights || remote.model_weights || {};
@@ -905,7 +1019,7 @@
           }
           
           const regFromKey = (k) => k?.includes("regime:trend") ? "trend" : k?.includes("regime:meanrevert") ? "meanrevert" : null;
-          
+
           /**
            * Update system learning metrics from closed trades (Phase 3)
            * Only learns from Worker-reconciled fills (reconciliation === "exchange_trade_history")
@@ -1159,63 +1273,64 @@
             return sl.regime;
           }
           
-/**
- * Print Model Scoreboard Table (Phase 3 + EWAF)
- */
-function printModelScoreboard(state) {
-  const sb = state.model_scoreboard || {};
-  const trainingBufferSize = state.ml_training_buffer?.length || 0;
-  
-  log('\n' + '═'.repeat(80));
-  log('🎯 MODEL SCOREBOARD');
-  log('═'.repeat(80));
-  log('');
-  
-  // Table header
-  log('╔══════════════╦═════════╦═══════╦═══════╦═════════╦════════╦════════╦════════╦════════╗');
-  log('║ Model        ║ Correct ║ Wrong ║ Total ║ Win%    ║ Wilson ║ EWAF   ║ FINAL  ║ Status ║');
-  log('╠══════════════╬═════════╬═══════╬═══════╬═════════╬════════╬════════╬════════╬════════╣');
-  
-  // Sort by final weight (descending)
-  const models = Object.entries(sb).map(([name, stats]) => {
-    const w_wilson = stats.weight || 0;
-    const w_ewaf = state.model_ewaf?.[name]?.weight || 0;
-    const final = state.model_weights?.[name] || (w_wilson + w_ewaf);
-    return { name, stats, w_wilson, w_ewaf, final };
-  }).sort((a, b) => b.final - a.final);
-  
-  for (const { name, stats, w_wilson, w_ewaf, final } of models) {
-    const status = getModelStatus(name, final, trainingBufferSize);
-    const statusIcon = status.canVote ? '✅ ON ' : '⏸️ OFF';
-    const winPct = stats.total > 0 ? ((stats.winrate || (stats.correct / stats.total)) * 100).toFixed(1) + '%' : '-';
-    
-    log(`║ ${name.padEnd(12)} ║ ${String(stats.correct).padStart(7)} ║ ${String(stats.wrong).padStart(5)} ║ ${String(stats.total).padStart(5)} ║ ${winPct.padStart(7)} ║ ${String(w_wilson).padStart(6)} ║ ${String(w_ewaf).padStart(6)} ║ ${String(final).padStart(6)} ║ ${statusIcon} ║`);
-  }
-  
-  log('╚══════════════╩═════════╩═══════╩═══════╩═════════╩════════╩════════╩════════╩════════╝');
-  
-  // Training progress
-  if (trainingBufferSize < 50) {
-    log('');
-    log(`📦 Training: ${trainingBufferSize}/50 samples`);
-    const need = [
-      { name: 'Logistic', req: MIN_SAMPLES_REQUIRED.logistic },
-      { name: 'RandomForest', req: MIN_SAMPLES_REQUIRED.randomforest },
-      { name: 'NaiveBayes', req: MIN_SAMPLES_REQUIRED.naivebayes },
-      { name: 'DecisionTree', req: MIN_SAMPLES_REQUIRED.decisiontree }
-    ];
-    for (const m of need) {
-      if (trainingBufferSize < m.req) {
-        log(`   ${m.name} needs ${m.req - trainingBufferSize} more`);
-      }
-    }
-  } else {
-    log('');
-    log(`✅ Training complete: ${trainingBufferSize} samples`);
-  }
-  
-  log('');
-}
+          /**
+           * Print Model Scoreboard Table (Phase 3 + EWAF)
+           */
+          function printModelScoreboard(state) {
+            const sb = state.model_scoreboard || {};
+            const trainingBufferSize = state.ml_training_buffer?.length || 0;
+            
+            log('\n' + '═'.repeat(80));
+            log('🎯 MODEL SCOREBOARD');
+            log('═'.repeat(80));
+            log('');
+            
+            // Table header
+            log('╔══════════════╦═════════╦═══════╦═══════╦═════════╦════════╦════════╦════════╦════════╗');
+            log('║ Model        ║ Correct ║ Wrong ║ Total ║ Win%    ║ Wilson ║ EWAF   ║ FINAL  ║ Status ║');
+            log('╠══════════════╬═════════╬═══════╬═══════╬═════════╬════════╬════════╬════════╬════════╣');
+
+            // Sort by final weight (descending)
+            const models = Object.entries(sb).map(([name, stats]) => {
+              const w_wilson = stats.weight || 0;
+              const w_ewaf = state.model_ewaf?.[name]?.weight || 0;
+              const final = state.model_weights?.[name] || (w_wilson + w_ewaf);
+              return { name, stats, w_wilson, w_ewaf, final };
+            }).sort((a, b) => b.final - a.final);
+
+            for (const { name, stats, w_wilson, w_ewaf, final } of models) {
+              const status = getModelStatus(name, final, trainingBufferSize);
+              const statusIcon = status.canVote ? '✅ ON ' : '⏸️ OFF';
+              const winPct = stats.total > 0 ? ((stats.winrate || (stats.correct / stats.total)) * 100).toFixed(1) + '%' : '-';
+              
+              log(`║ ${name.padEnd(12)} ║ ${String(stats.correct).padStart(7)} ║ ${String(stats.wrong).padStart(5)} ║ ${String(stats.total).padStart(5)} ║ ${winPct.padStart(7)} ║ ${String(w_wilson).padStart(6)} ║ ${String(w_ewaf).padStart(6)} ║ ${String(final).padStart(6)} ║ ${statusIcon} ║`);
+            }
+
+            log('╚══════════════╩═════════╩═══════╩═══════╩═════════╩════════╩════════╩════════╩════════╝');
+            
+            // Training progress
+            if (trainingBufferSize < 50) {
+              log('');
+              log(`📦 Training: ${trainingBufferSize}/50 samples`);
+              const need = [
+                { name: 'Logistic', req: MIN_SAMPLES_REQUIRED.logistic },
+                { name: 'RandomForest', req: MIN_SAMPLES_REQUIRED.randomforest },
+                { name: 'NaiveBayes', req: MIN_SAMPLES_REQUIRED.naivebayes },
+                { name: 'DecisionTree', req: MIN_SAMPLES_REQUIRED.decisiontree }
+              ];
+              for (const m of need) {
+                if (trainingBufferSize < m.req) {
+                  log(`   ${m.name} needs ${m.req - trainingBufferSize} more`);
+                }
+              }
+            } else {
+              log('');
+              log(`✅ Training complete: ${trainingBufferSize} samples`);
+            }
+            
+            log('');
+          }
+
           /**
            * Print System Learning Tracker Table (Phase 3)
            */
@@ -1255,6 +1370,7 @@ function printModelScoreboard(state) {
             log(`  ${regimeIcon} ${sl.regime.current.toUpperCase()} (${regimeDays} days) - ${sl.regime.reason}`);
             log(`  Weight updates: ${sl.regime.weight_updates_enabled ? '✅ ENABLED' : '❌ FROZEN'}`);
             log('');
+            
             // Milestones
             const m = sl.milestones;
             const mSymbol = (reached) => reached ? '✅' : '⏳';
