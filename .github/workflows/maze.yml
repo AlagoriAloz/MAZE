@@ -2,7 +2,7 @@ name: Ideas Pusher (MEXC Ultimate 7.7.7 - Production Ready)
 
 on:
   schedule:
-    - cron: "0 */3 * * *"
+    - cron: "0 */4 * * *"
   repository_dispatch:
     types: [run_B]
   workflow_dispatch: {}
