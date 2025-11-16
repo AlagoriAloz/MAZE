@@ -86,19 +86,6 @@ jobs:
       WEIGHT_MIN_RULE_BASED: ${{ vars.WEIGHT_MIN_RULE_BASED }}
       KEEP_PROCESSED_TRADES: ${{ vars.KEEP_PROCESSED_TRADES }}
 
-      # EWAF Configuration (OPTIONAL - defaults work)
-      EWAF_HALF_LIFE: ${{ vars.EWAF_HALF_LIFE }}
-      EWAF_TEMPERATURE: ${{ vars.EWAF_TEMPERATURE }}
-      EWAF_EXPLORATION_RHO: ${{ vars.EWAF_EXPLORATION_RHO }}
-      EWAF_REWARD_SCALE_BPS: ${{ vars.EWAF_REWARD_SCALE_BPS }}
-
-      # Rahman Configuration (OPTIONAL)
-      RAHMAN_ENABLE: ${{ vars.RAHMAN_ENABLE }}
-      RAHMAN_INIT: ${{ vars.RAHMAN_INIT }}
-      RAHMAN_STEP: ${{ vars.RAHMAN_STEP }}
-      RAHMAN_MIN: ${{ vars.RAHMAN_MIN }}
-      RAHMAN_MAX: ${{ vars.RAHMAN_MAX }}
-
     steps:
       - name: Setup Node 20
         uses: actions/setup-node@v4
@@ -122,20 +109,6 @@ jobs:
           'use strict';
           const crypto = require('crypto');
           const MODEL_VERSION=(process.env.MODEL_VERSION||"8.0.0");
-
-          // ========== EWAF CONFIGURATION ==========
-          const EWAF_HALF_LIFE = Number(process.env.EWAF_HALF_LIFE || "20");  // Days
-          const EWAF_TEMPERATURE = Number(process.env.EWAF_TEMPERATURE || "6");  // Softmax temp
-          const EWAF_EXPLORATION_RHO = Number(process.env.EWAF_EXPLORATION_RHO || "0.05");  // 5% exploration
-          const EWAF_REWARD_SCALE_BPS = Number(process.env.EWAF_REWARD_SCALE_BPS || "80");  // Reward normalization
-
-          // ========== RAHMAN CONFIGURATION ==========
-          const RAHMAN_ENABLE = (process.env.RAHMAN_ENABLE || "true").toLowerCase() === "true";
-          const RAHMAN_INIT = Number(process.env.RAHMAN_INIT || "10");   // neutral starting weight
-          const RAHMAN_STEP = Number(process.env.RAHMAN_STEP || "1");    // step per trade
-          const RAHMAN_MIN = Number(process.env.RAHMAN_MIN || "0");
-          const RAHMAN_MAX = Number(process.env.RAHMAN_MAX || "20");
-          
           const UA = `gh-actions-ideas-mexc-ultimate/${MODEL_VERSION} (+https://github.com/)`;
           
           // ========== PHASE 2: TRAINING GATES + REGIME CONFIG ==========
@@ -168,6 +141,11 @@ jobs:
           // Phase 7: Gist SAFE TRIM
           const KEEP_PROCESSED_TRADES = Number(process.env.KEEP_PROCESSED_TRADES || "10");
 
+          // ✅ WEIGHT SYSTEM CONSTANTS
+          const MIN_WEIGHT = 0;
+          const MAX_WEIGHT = 60;
+          const INITIAL_WEIGHT = 30;
+
 
           // ---------------- Utils ----------------
           const clamp=(x,a,b)=>Math.max(a,Math.min(b,x));
@@ -181,158 +159,6 @@ jobs:
           const vwapAnchored=(h,l,c,v,win)=>{ if(!c?.length) return null; const n=c.length,s=Math.max(0,n-win); let pv=0,vv=0; for(let i=s;i<n;i++){ const tp=(h[i]+l[i]+c[i])/3; const vol=+v[i]||0; pv+=tp*vol; vv+=vol; } return vv>0?pv/vv:c.at(-1); };
           const corr=(a,b)=>{ const n=Math.min(a?.length||0,b?.length||0); if(n<5) return 0; const as=a.slice(-n), bs=b.slice(-n); const ma=mean(as), mb=mean(bs); let num=0,da=0,db=0; for(let i=0;i<n;i++){ const xa=as[i]-ma, xb=bs[i]-mb; num+=xa*xb; da+=xa*xa; db+=xb*xb; } const den=Math.sqrt(da*db)||1; return num/den; };
           const wilsonLCB=(p,n,z=1.34)=>{ if(n<=0) return p; const z2=z*z; const a=p + z2/(2*n); const b=z*Math.sqrt((p*(1-p)+z2/(4*n))/n); const c=1+z2/n; return clamp((a-b)/c, 0, 1); };
-
-          // ========== EWAF HELPER FUNCTIONS ==========
-          /**
-           * Calculate exponential decay factor
-           * @param {number} elapsed_days - Days since last update
-           * @param {number} half_life - Half-life in days
-           * @returns {number} γ ∈ (0, 1]
-           */
-          const ewafDecayFactor = (elapsed_days, half_life = EWAF_HALF_LIFE) => {
-            if (elapsed_days <= 0) return 1.0;
-            return Math.pow(0.5, elapsed_days / half_life);
-          };
-
-          /**
-           * Update R with exponential decay + new reward
-           * @param {number} R_old - Previous R value
-           * @param {number} reward - New signed reward
-           * @param {number} gamma - Decay factor
-           * @returns {number} R_new
-           */
-          const ewafUpdateR = (R_old, reward, gamma) => {
-            return gamma * R_old + reward;
-          };
-
-          /**
-           * Convert R to edge score ∈ [-1, 1]
-           * @param {number} R - EWAF R value
-           * @returns {number} edge
-           */
-          const ewafEdge = (R) => {
-            return R / (1 + Math.abs(R));
-          };
-
-          /**
-           * Convert edge to exploit weight (softmax component)
-           * @param {number} edge - Edge score
-           * @param {number} temperature - Softmax temperature
-           * @returns {number} exploit weight
-           */
-          const ewafExploitWeight = (edge, temperature = EWAF_TEMPERATURE) => {
-            return Math.exp(temperature * edge);
-          };
-
-          /**
-           * Apply ε-greedy exploration
-           * @param {number} exploit_w - Exploit weight
-           * @param {number} rho - Exploration factor
-           * @returns {number} weight with exploration
-           */
-          const ewafExplore = (exploit_w, rho = EWAF_EXPLORATION_RHO) => {
-            return (1 - rho) * exploit_w + rho * 1.0;
-          };
-
-          /**
-           * Get EWAF state for a model (with safe defaults)
-           * @param {object} state - Global state
-           * @param {string} model - Model name
-           * @returns {object} { R, last_updated_ts, weight }
-           */
-          const getEWAFState = (state, model) => {
-            if (!state.model_ewaf) state.model_ewaf = {};
-            if (!state.model_ewaf[model]) {
-              state.model_ewaf[model] = { R: 0, last_updated_ts: Date.now(), weight: 0 };
-            }
-            return state.model_ewaf[model];
-          };
-
-          /**
-           * Update EWAF for a single model based on trade result
-           * @param {object} state - Global state
-           * @param {string} model - Model name
-           * @param {string} voted_side - Side the model voted for
-           * @param {string} taken_side - Side actually taken
-           * @param {number} pnl_bps - Trade PnL in bps
-           * @param {number} now_ts - Current timestamp
-           * @returns {number} Updated EWAF weight (0-20 range)
-           */
-          const updateEWAFForModel = (state, model, voted_side, taken_side, pnl_bps, now_ts) => {
-            const ewaf = getEWAFState(state, model);
-            
-            // 1. Calculate elapsed time in days
-            const elapsed_ms = now_ts - ewaf.last_updated_ts;
-            const elapsed_days = elapsed_ms / (24 * 3600 * 1000);
-            
-            // 2. Calculate decay factor
-            const gamma = ewafDecayFactor(elapsed_days);
-            
-            // 3. Calculate signed reward
-            let reward;
-            if (voted_side === taken_side) {
-              // Voted correctly - reward is positive PnL
-              reward = pnl_bps / EWAF_REWARD_SCALE_BPS;
-            } else {
-              // Voted incorrectly - penalty is negative PnL
-              reward = -Math.abs(pnl_bps) / EWAF_REWARD_SCALE_BPS;
-            }
-            
-            // 4. Update R with exponential decay
-            const R_old = ewaf.R || 0;
-            const R_new = ewafUpdateR(R_old, reward, gamma);
-            
-            // 5. Convert R to edge
-            const edge = ewafEdge(R_new);
-            
-            // 6. Calculate exploit weight
-            const exploit_w = ewafExploitWeight(edge);
-            
-            // 7. Apply exploration
-            const explored_w = ewafExplore(exploit_w);
-            
-            // 8. Normalize to 0-20 range (CLAMPED)
-            const max_theoretical = Math.exp(EWAF_TEMPERATURE * 1);
-            const min_theoretical = Math.exp(EWAF_TEMPERATURE * -1);
-            
-            let normalized_w = ((explored_w - min_theoretical) / (max_theoretical - min_theoretical)) * 20;
-            normalized_w = clamp(normalized_w, 0, 20);  // ✅ EWAF component clamped 0-20
-            
-            // 9. Store updated state
-            ewaf.R = R_new;
-            ewaf.last_updated_ts = now_ts;
-            ewaf.weight = Math.round(normalized_w);
-            
-            state.model_ewaf[model] = ewaf;
-            
-            return ewaf.weight;
-          };
-
-          // ========== RAHMAN HELPER FUNCTIONS ==========
-          const getRahmanState = (state, model) => {
-            if (!state.model_rahman) state.model_rahman = {};
-            if (!state.model_rahman[model]) {
-              state.model_rahman[model] = { weight: RAHMAN_INIT, last_updated_ts: Date.now() };
-            }
-            return state.model_rahman[model];
-          };
-
-          /**
-           * Update Rahman short-term recency weight (0..20)
-           * +1 on correct, -1 on incorrect. Frozen in EXPLOIT (handled by caller).
-           */
-          const updateRahmanForModel = (state, model, wasCorrect, now_ts) => {
-            if (!RAHMAN_ENABLE) return getRahmanState(state, model).weight;
-            const st = getRahmanState(state, model);
-            let w = Number.isFinite(st.weight) ? st.weight : RAHMAN_INIT;
-            w = wasCorrect ? (w + RAHMAN_STEP) : (w - RAHMAN_STEP);
-            w = clamp(Math.round(w), RAHMAN_MIN, RAHMAN_MAX);
-            st.weight = w;
-            st.last_updated_ts = now_ts;
-            state.model_rahman[model] = st;
-            return st.weight;
-          };
-
           const sleep=(ms)=>new Promise(r=>setTimeout(r,ms));
           const jitter=(ms)=>ms + Math.floor(Math.random()*ms*0.25);
           const log=(...a)=>console.log("[gha]",...a);
@@ -711,13 +537,13 @@ jobs:
               if(!Array.isArray(s.ml_training_buffer))s.ml_training_buffer=[];
               if(!Array.isArray(s.ml_voting_history))s.ml_voting_history=[];
               if(!s.model_weights)s.model_weights={
-                "Original": 10,
-                "Momentum": 10,
-                "MeanReversion": 10,
-                "Logistic": 0,
-                "NaiveBayes": 0,
-                "DecisionTree": 0,
-                "RandomForest": 0
+                "Original": INITIAL_WEIGHT,
+                "Momentum": INITIAL_WEIGHT,
+                "MeanReversion": INITIAL_WEIGHT,
+                "Logistic": INITIAL_WEIGHT,
+                "NaiveBayes": INITIAL_WEIGHT,
+                "DecisionTree": INITIAL_WEIGHT,
+                "RandomForest": INITIAL_WEIGHT
               };
               if(!s.model_weights_prev)s.model_weights_prev={};
 
@@ -792,40 +618,13 @@ jobs:
               // ========== PHASE 3: MODEL SCOREBOARD (aggregate only) ==========
               if(!s.model_scoreboard) {
                 s.model_scoreboard = {
-                  Original: { correct: 0, wrong: 0, total: 0, winrate: 0, weight: 10, last_updated_ts: Date.now() },
-                  Momentum: { correct: 0, wrong: 0, total: 0, winrate: 0, weight: 10, last_updated_ts: Date.now() },
-                  MeanReversion: { correct: 0, wrong: 0, total: 0, winrate: 0, weight: 10, last_updated_ts: Date.now() },
-                  Logistic: { correct: 0, wrong: 0, total: 0, winrate: 0, weight: 0, last_updated_ts: Date.now() },
-                  NaiveBayes: { correct: 0, wrong: 0, total: 0, winrate: 0, weight: 0, last_updated_ts: Date.now() },
-                  DecisionTree: { correct: 0, wrong: 0, total: 0, winrate: 0, weight: 0, last_updated_ts: Date.now() },
-                  RandomForest: { correct: 0, wrong: 0, total: 0, winrate: 0, weight: 0, last_updated_ts: Date.now() }
-                };
-              }
-
-              // ========== EWAF STATE INITIALIZATION ==========
-              if (!s.model_ewaf) {
-                s.model_ewaf = {
-                  Original: { R: 0, last_updated_ts: Date.now(), weight: 0 },
-                  Momentum: { R: 0, last_updated_ts: Date.now(), weight: 0 },
-                  MeanReversion: { R: 0, last_updated_ts: Date.now(), weight: 0 },
-                  Logistic: { R: 0, last_updated_ts: Date.now(), weight: 0 },
-                  NaiveBayes: { R: 0, last_updated_ts: Date.now(), weight: 0 },
-                  DecisionTree: { R: 0, last_updated_ts: Date.now(), weight: 0 },
-                  RandomForest: { R: 0, last_updated_ts: Date.now(), weight: 0 }
-                };
-              }
-
-              // ========== RAHMAN STATE INITIALIZATION ==========
-              if (!s.model_rahman) {
-                const now = Date.now();
-                s.model_rahman = {
-                  Original:     { weight: RAHMAN_INIT, last_updated_ts: now },
-                  Momentum:     { weight: RAHMAN_INIT, last_updated_ts: now },
-                  MeanReversion:{ weight: RAHMAN_INIT, last_updated_ts: now },
-                  Logistic:     { weight: RAHMAN_INIT, last_updated_ts: now },
-                  NaiveBayes:   { weight: RAHMAN_INIT, last_updated_ts: now },
-                  DecisionTree: { weight: RAHMAN_INIT, last_updated_ts: now },
-                  RandomForest: { weight: RAHMAN_INIT, last_updated_ts: now }
+                  Original: { correct: 0, wrong: 0, total: 0, winrate: 0, weight: INITIAL_WEIGHT, last_updated_ts: Date.now() },
+                  Momentum: { correct: 0, wrong: 0, total: 0, winrate: 0, weight: INITIAL_WEIGHT, last_updated_ts: Date.now() },
+                  MeanReversion: { correct: 0, wrong: 0, total: 0, winrate: 0, weight: INITIAL_WEIGHT, last_updated_ts: Date.now() },
+                  Logistic: { correct: 0, wrong: 0, total: 0, winrate: 0, weight: INITIAL_WEIGHT, last_updated_ts: Date.now() },
+                  NaiveBayes: { correct: 0, wrong: 0, total: 0, winrate: 0, weight: INITIAL_WEIGHT, last_updated_ts: Date.now() },
+                  DecisionTree: { correct: 0, wrong: 0, total: 0, winrate: 0, weight: INITIAL_WEIGHT, last_updated_ts: Date.now() },
+                  RandomForest: { correct: 0, wrong: 0, total: 0, winrate: 0, weight: INITIAL_WEIGHT, last_updated_ts: Date.now() }
                 };
               }
 
@@ -872,46 +671,6 @@ jobs:
             
             // ========== Phase 3-8: New fields (Pusher-owned) ==========
             merged.model_scoreboard = local.model_scoreboard || remote.model_scoreboard || {};
-
-            // ========== EWAF MERGE (keep most recent) ==========
-            merged.model_ewaf = {};
-            const allEwafModels = new Set([
-              ...Object.keys(remote.model_ewaf || {}),
-              ...Object.keys(local.model_ewaf || {})
-            ]);
-
-            for (const model of allEwafModels) {
-              const r = remote.model_ewaf?.[model];
-              const l = local.model_ewaf?.[model];
-              
-              if (!r) {
-                merged.model_ewaf[model] = l;
-              } else if (!l) {
-                merged.model_ewaf[model] = r;
-              } else {
-                // Pick the one with most recent update
-                merged.model_ewaf[model] = (r.last_updated_ts >= l.last_updated_ts) ? r : l;
-              }
-            }
-
-            // ========== RAHMAN MERGE (keep most recent) ==========
-            merged.model_rahman = {};
-            const allRahmanModels = new Set([
-              ...Object.keys(remote.model_rahman || {}),
-              ...Object.keys(local.model_rahman || {})
-            ]);
-            for (const model of allRahmanModels) {
-              const r = remote.model_rahman?.[model];
-              const l = local.model_rahman?.[model];
-              if (!r) {
-                merged.model_rahman[model] = l;
-              } else if (!l) {
-                merged.model_rahman[model] = r;
-              } else {
-                merged.model_rahman[model] = (r.last_updated_ts >= l.last_updated_ts) ? r : l;
-              }
-            }
-
             merged.system_learning = local.system_learning || remote.system_learning || {};
             merged.regime_history = local.regime_history || remote.regime_history || [];
             merged.model_weights = local.model_weights || remote.model_weights || {};
@@ -1092,6 +851,135 @@ jobs:
           const regFromKey = (k) => k?.includes("regime:trend") ? "trend" : k?.includes("regime:meanrevert") ? "meanrevert" : null;
           
           /**
+           * Update system learning metrics from closed trades (Phase 3)
+           * Only learns from Worker-reconciled fills (reconciliation === "exchange_trade_history")
+           */
+          function updateSystemLearning(state, newClosedTrades) {
+            if (!newClosedTrades || newClosedTrades.length === 0) return;
+            
+            const sl = state.system_learning;
+            
+            log(`\n📊 Updating system learning from ${newClosedTrades.length} new closed trades`);
+            
+            // Update totals (aggregates)
+            for (const trade of newClosedTrades) {
+              // CRITICAL: Only learn from Worker's real fills
+              if (trade.reconciliation !== "exchange_trade_history") {
+                log(`⏭️  Skipping ${trade.symbol} (reconciliation: ${trade.reconciliation || "none"})`);
+                continue;
+              }
+              
+              sl.total_trades++;
+              const won = (trade.pnl_bps || 0) > 0;
+              
+              if (won) {
+                sl.total_wins++;
+              } else {
+                sl.total_losses++;
+              }
+              
+              sl.cumulative_pnl_bps += (trade.pnl_bps || 0);
+              
+              // Add to last 10 window (MINIMAL data only - Gist optimization)
+              sl.last_10.trades.push({
+                symbol: trade.symbolFull || trade.symbol,
+                side: trade.side,
+                pnl_bps: trade.pnl_bps,
+                outcome: won ? "win" : "loss",
+                ts_ms: trade.ts_exit_ms || Date.now()
+              });
+              
+              // Keep only last 10 (Phase 7: Gist size control)
+              if (sl.last_10.trades.length > 10) {
+                sl.last_10.trades = sl.last_10.trades.slice(-10);
+              }
+              
+              log(`  ✅ ${trade.symbolFull || trade.symbol} ${trade.side} ${won ? "WIN" : "LOSS"} (${trade.pnl_bps} bps)`);
+            }
+            
+            // Recalculate aggregates
+            sl.winrate = sl.total_trades > 0 ? sl.total_wins / sl.total_trades : 0;
+            sl.avg_pnl_bps = sl.total_trades > 0 ? Math.round(sl.cumulative_pnl_bps / sl.total_trades) : 0;
+            
+            // Last 10 stats
+            const l10 = sl.last_10.trades;
+            sl.last_10.wins = l10.filter(t => t.outcome === "win").length;
+            sl.last_10.losses = l10.length - sl.last_10.wins;
+            sl.last_10.winrate = l10.length > 0 ? sl.last_10.wins / l10.length : 0;
+            sl.last_10.pnl_bps = l10.reduce((sum, t) => sum + (t.pnl_bps || 0), 0);
+            sl.last_10.avg_pnl_bps = l10.length > 0 ? Math.round(sl.last_10.pnl_bps / l10.length) : 0;
+            
+            // Update learning metrics
+            sl.learning.trades_learned_from = sl.total_trades;
+            sl.learning.ml_training_buffer_size = state.ml_training_buffer?.length || 0;
+            sl.learning.ml_training_progress = sl.learning.ml_training_buffer_size / sl.learning.ml_training_target;
+            
+            // Count trained models
+            sl.learning.models_trained = 0;
+            const mlModels = ['logistic', 'randomforest', 'decisiontree', 'naivebayes'];
+            for (const m of mlModels) {
+              const required = MIN_SAMPLES_REQUIRED[m];
+              if (sl.learning.ml_training_buffer_size >= required) {
+                sl.learning.models_trained++;
+              }
+            }
+            sl.learning.models_waiting = 4 - sl.learning.models_trained;
+            
+            // Check milestones
+            updateMilestones(state);
+            
+            // Update timestamp
+            sl.last_updated_ts = Date.now();
+            
+            log(`📊 System: ${sl.total_trades} trades, ${(sl.winrate*100).toFixed(1)}% WR, ${sl.cumulative_pnl_bps} bps total`);
+          }
+
+          /**
+           * Check and update milestones (Phase 3)
+           */
+          function updateMilestones(state) {
+            const sl = state.system_learning;
+            const m = sl.milestones;
+            const now = new Date().toISOString().split('T')[0];
+            
+            if (!m["10_trades"].reached && sl.total_trades >= 10) {
+              m["10_trades"].reached = true;
+              m["10_trades"].date = now;
+              log("🎉 MILESTONE: 10 trades reached!");
+            }
+            
+            if (!m["20_trades"].reached && sl.total_trades >= 20) {
+              m["20_trades"].reached = true;
+              m["20_trades"].date = now;
+              log("🎉 MILESTONE: 20 trades reached!");
+            }
+            
+            if (!m["50_samples"].reached && sl.learning.ml_training_buffer_size >= 50) {
+              m["50_samples"].reached = true;
+              m["50_samples"].date = now;
+              log("🎉 MILESTONE: 50 ML samples - Models unlocking!");
+            }
+            
+            if (!m["first_6_10"].reached && sl.last_10.wins >= 6) {
+              m["first_6_10"].reached = true;
+              m["first_6_10"].date = now;
+              log("🎉 MILESTONE: First 6/10 win run - EXPLOIT mode eligible!");
+            }
+            
+            if (!m["100_trades"].reached && sl.total_trades >= 100) {
+              m["100_trades"].reached = true;
+              m["100_trades"].date = now;
+              log("🎉 MILESTONE: 100 trades - Statistical significance!");
+            }
+            
+            if (!m["break_even"].reached && sl.cumulative_pnl_bps >= 0) {
+              m["break_even"].reached = true;
+              m["break_even"].date = now;
+              log("🎉 MILESTONE: Break-even achieved!");
+            }
+          }
+          
+          /**
            * Update regime based on 6/10 rule with hysteresis (Phase 4)
            * @returns {object} regime info
            */
@@ -1216,7 +1104,7 @@ jobs:
           }
           
           /**
-           * Print Model Scoreboard Table (Phase 3 + EWAF + RAHMAN)
+           * Print Model Scoreboard Table (Phase 3)
            */
           function printModelScoreboard(state) {
             const sb = state.model_scoreboard || {};
@@ -1228,28 +1116,22 @@ jobs:
             log('');
             
             // Table header
-            log('╔══════════════╦═════════╦═══════╦═══════╦═════════╦════════╦════════╦════════╦════════╦════════╗');
-            log('║ Model        ║ Correct ║ Wrong ║ Total ║ Win%    ║ Wilson ║ EWAF   ║ Rahman ║ FINAL  ║ Status ║');
-            log('╠══════════════╬═════════╬═══════╬═══════╬═════════╬════════╬════════╬════════╬════════╬════════╣');
-
-            // Sort by final weight (descending)
-            const models = Object.entries(sb).map(([name, stats]) => {
-              const w_wilson = stats.weight || 0;
-              const w_ewaf = state.model_ewaf?.[name]?.weight || 0;
-              const w_rahman = state.model_rahman?.[name]?.weight ?? RAHMAN_INIT;
-              const final = state.model_weights?.[name] || (w_wilson + w_ewaf + w_rahman);
-              return { name, stats, w_wilson, w_ewaf, w_rahman, final };
-            }).sort((a, b) => b.final - a.final);
-
-            for (const { name, stats, w_wilson, w_ewaf, w_rahman, final } of models) {
-              const status = getModelStatus(name, final, trainingBufferSize);
+            log('╔══════════════╦═════════╦═══════╦═══════╦═════════╦════════╦════════╗');
+            log('║ Model        ║ Correct ║ Wrong ║ Total ║ Win%    ║ Weight ║ Status ║');
+            log('╠══════════════╬═════════╬═══════╬═══════╬═════════╬════════╬════════╣');
+            
+            // Sort by weight (descending)
+            const models = Object.entries(sb).sort((a, b) => b[1].weight - a[1].weight);
+            
+            for (const [name, stats] of models) {
+              const status = getModelStatus(name, stats.weight, trainingBufferSize);
               const statusIcon = status.canVote ? '✅ ON ' : '⏸️ OFF';
               const winPct = stats.total > 0 ? ((stats.winrate || (stats.correct / stats.total)) * 100).toFixed(1) + '%' : '-';
               
-              log(`║ ${name.padEnd(12)} ║ ${String(stats.correct).padStart(7)} ║ ${String(stats.wrong).padStart(5)} ║ ${String(stats.total).padStart(5)} ║ ${winPct.padStart(7)} ║ ${String(w_wilson).padStart(6)} ║ ${String(w_ewaf).padStart(6)} ║ ${String(w_rahman).padStart(6)} ║ ${String(final).padStart(6)} ║ ${statusIcon} ║`);
+              log(`║ ${name.padEnd(12)} ║ ${String(stats.correct).padStart(7)} ║ ${String(stats.wrong).padStart(5)} ║ ${String(stats.total).padStart(5)} ║ ${winPct.padStart(7)} ║ ${String(stats.weight).padStart(6)} ║ ${statusIcon} ║`);
             }
-
-            log('╚══════════════╩═════════╩═══════╩═══════╩═════════╩════════╩════════╩════════╩════════╩════════╝');
+            
+            log('╚══════════════╩═════════╩═══════╩═══════╩═════════╩════════╩════════╝');
             
             // Training progress
             if (trainingBufferSize < 50) {
@@ -1274,9 +1156,6 @@ jobs:
             log('');
           }
 
-          /**
-           * Print System Learning Tracker Table (Phase 3)
-           */
           function printSystemLearning(state) {
             const sl = state.system_learning;
             if (!sl) return;
@@ -1313,6 +1192,7 @@ jobs:
             log(`  ${regimeIcon} ${sl.regime.current.toUpperCase()} (${regimeDays} days) - ${sl.regime.reason}`);
             log(`  Weight updates: ${sl.regime.weight_updates_enabled ? '✅ ENABLED' : '❌ FROZEN'}`);
             log('');
+            
             // Milestones
             const m = sl.milestones;
             const mSymbol = (reached) => reached ? '✅' : '⏳';
@@ -1390,9 +1270,16 @@ jobs:
             log(`📦 Collecting ML training data from fills...`);
             let mlBufferAdded=0;
             for(const c of learnable){
-              if(c.ml_features&&c.p_raw!=null){
-                const label=(c.pnl_bps||0)>0?1:0;
-                state.ml_training_buffer.push({features:c.ml_features,label:label,side:c.side,ts_ms:c.ts_exit_ms||Date.now()});
+              if(c.ml_features&&c.p_raw!=null&&c.side){
+                const label = (c.side === "long") ? 1 : 0;  // ✅ NEW: 1=long, 0=short
+                const outcome = (c.pnl_bps||0) > 0 ? 1 : 0;  // Track outcome separately for debugging
+                state.ml_training_buffer.push({
+                  features: c.ml_features,
+                  label: label,           // 1=long, 0=short
+                  outcome: outcome,       // 1=win, 0=loss
+                  side: c.side,
+                  ts_ms: c.ts_exit_ms||Date.now()
+                });
                 mlBufferAdded++;
               }
             }
@@ -1793,13 +1680,6 @@ jobs:
             log(`✅ Models training process complete.`);
           }
 
-          /**
-           * Get model status and effective weight (Phase 2)
-           * @param {string} modelName - e.g., "Logistic"
-           * @param {number} baseWeight - Weight from scoreboard
-           * @param {number} trainingBufferSize - Current ML buffer size
-           * @returns {object} { status, effectiveWeight, samplesNeeded, canVote, reason }
-           */
           function getModelStatus(modelName, baseWeight, trainingBufferSize) {
             const modelKey = modelName.toLowerCase().replace(/\s/g, '');
             const required = MIN_SAMPLES_REQUIRED[modelKey];
@@ -1808,16 +1688,20 @@ jobs:
               return { status: MODEL_STATUS.DISABLED, effectiveWeight: 0, samplesNeeded: 0, canVote: false, reason: 'Unknown model' };
             }
             
+            // Rule-based: always active, weight can be 0..MAX (no floor)
             if (required === 0) {
-              const safeWeight = Math.max(WEIGHT_MIN_RULE_BASED, baseWeight);
-              return { status: MODEL_STATUS.ACTIVE, effectiveWeight: safeWeight, samplesNeeded: 0, canVote: true, reason: 'Rule-based (always active)' };
+              const w = clamp(baseWeight ?? INITIAL_WEIGHT, MIN_WEIGHT, MAX_WEIGHT);
+              return { status: MODEL_STATUS.ACTIVE, effectiveWeight: w, samplesNeeded: 0, canVote: true, reason: 'Rule-based (always active)' };
             }
             
+            // ML models: blocked until training requirement met
             if (trainingBufferSize < required) {
               return { status: MODEL_STATUS.TRAINING, effectiveWeight: 0, samplesNeeded: required - trainingBufferSize, canVote: false, reason: `Training: ${trainingBufferSize}/${required} samples` };
             }
             
-            return { status: MODEL_STATUS.ACTIVE, effectiveWeight: baseWeight, samplesNeeded: 0, canVote: true, reason: `Trained on ${trainingBufferSize} samples` };
+            // ML models: trained and active, weight can be 0..MAX
+            const w = clamp(baseWeight ?? INITIAL_WEIGHT, MIN_WEIGHT, MAX_WEIGHT);
+            return { status: MODEL_STATUS.ACTIVE, effectiveWeight: w, samplesNeeded: 0, canVote: true, reason: `Trained on ${trainingBufferSize} samples` };
           }
 
           async function mlEnsembleVote(symbol, features, originalSide, state) {
@@ -1828,15 +1712,11 @@ jobs:
               : (state.model_weights || {});
             
             const getWeight = (model) => {
-              const baseWeight = weightSource[model] || 0;
-              
-              // ✅ Validate it's a valid positive number (NO UPPER CAP)
-              const normalized = (typeof baseWeight === 'number' && 
-                                  Number.isFinite(baseWeight) && 
-                                  baseWeight >= 0)
-                ? baseWeight 
-                : 0;
-              
+              const baseWeight = weightSource[model];
+              // ✅ FIX: Remove hardcoded <= 20 clamp
+              const normalized = (typeof baseWeight === 'number' && Number.isFinite(baseWeight)) 
+                ? clamp(baseWeight, MIN_WEIGHT, MAX_WEIGHT)
+                : INITIAL_WEIGHT;
               const status = getModelStatus(model, normalized, trainingBufferSize);
               return status.effectiveWeight;
             };
@@ -1967,19 +1847,13 @@ jobs:
             if (avgPnL < 0) m *= 0.8;
             return clamp(m, 0.5, 1.2);
           }
-          /**
-           * SAFE TRIM: Keep ALL unprocessed + last N processed (Phase 5 + 7)
-           * CRITICAL: Prevents learning loss during Worker → Pusher race conditions
-           * 
-           * @param {object} state - Full state
-           * @returns {object} trim report
-           */
           function safeTrimClosed(state) {
             if (!state.closed || state.closed.length === 0) {
-              return { before: 0, after: 0, unprocessed: 0, processed_kept: 0, processed_dropped: 0 };
+              return { before: 0, after: 0, unprocessed: 0, processed_kept: 0, processed_dropped: 0, emergency: false };
             }
             
             const before = state.closed.length;
+            const EMERGENCY_CAP = 200;  // ✅ Hard limit
             
             const unprocessed = state.closed.filter(c => 
               c.reconciliation === "exchange_trade_history" &&
@@ -1993,32 +1867,41 @@ jobs:
             
             const processedKept = processed.slice(-KEEP_PROCESSED_TRADES);
             
-            state.closed = [...unprocessed, ...processedKept];
+            // ✅ EMERGENCY OVERFLOW PROTECTION
+            let emergency = false;
+            let finalUnprocessed = unprocessed;
+            
+            if ((unprocessed.length + processedKept.length) > EMERGENCY_CAP) {
+              emergency = true;
+              const allowedUnprocessed = EMERGENCY_CAP - processedKept.length;
+              finalUnprocessed = unprocessed.slice(-Math.max(50, allowedUnprocessed));
+              log(`\n🚨 EMERGENCY: closed overflow! Unprocessed ${unprocessed.length} → ${finalUnprocessed.length}`);
+            }
+            
+            state.closed = [...finalUnprocessed, ...processedKept];
             
             const report = {
               before,
               after: state.closed.length,
-              unprocessed: unprocessed.length,
+              unprocessed: finalUnprocessed.length,
               processed_kept: processedKept.length,
-              processed_dropped: processed.length - processedKept.length
+              processed_dropped: processed.length - processedKept.length,
+              emergency
             };
             
-            if (report.processed_dropped > 0 || report.unprocessed > 0) {
+            if (report.processed_dropped > 0 || report.unprocessed > 0 || emergency) {
               log(`\n🛡️  SAFE TRIM (closed trades):`);
               log(`   Before: ${report.before} trades`);
-              log(`   Unprocessed (kept ALL): ${report.unprocessed}`);
-              log(`   Processed (kept last ${KEEP_PROCESSED_TRADES}): ${report.processed_kept}`);
-              log(`   Processed (dropped): ${report.processed_dropped}`);
+              log(`   Unprocessed: ${unprocessed.length} → ${report.unprocessed} ${emergency ? '(EMERGENCY TRIM!)' : '(kept ALL)'}`);
+              log(`   Processed: kept last ${KEEP_PROCESSED_TRADES} = ${report.processed_kept}`);
+              log(`   Processed dropped: ${report.processed_dropped}`);
               log(`   After: ${report.after} trades`);
-              log(`   ✅ Zero learning loss guaranteed\n`);
+              if (emergency) log(`   ⚠️  Emergency cap enforced at ${EMERGENCY_CAP}\n`);
             }
             
             return report;
           }
-          /**
-           * Trim state to keep Gist minimal (Phase 7)
-           * CRITICAL: Only trim Pusher-owned data, never Worker-owned
-           */
+          
           function trimStateForGist(state) {
             let trimmed = false;
             const trimReport = [];
@@ -2101,6 +1984,34 @@ jobs:
               trimmed = true;
             }
             
+            // ✅ EMERGENCY SIZE CHECK
+            let emergencyTriggered = false;
+            let preSizeKB = Math.round(JSON.stringify(state).length / 1024);
+
+            if (preSizeKB > 8000) {  // 8MB = 80% of GitHub's 10MB limit
+              emergencyTriggered = true;
+              log(`\n🚨 EMERGENCY: Gist ${preSizeKB}KB approaching 10MB limit!`);
+              
+              // Aggressive reduction (50% of normal limits)
+              state.equity = (state.equity || []).slice(-100);
+              state.pending = (state.pending || []).slice(-50);
+              state.ml_training_buffer = (state.ml_training_buffer || []).slice(-250);
+              state.ml_voting_history = (state.ml_voting_history || []).slice(-10);
+              state.regime_history = (state.regime_history || []).slice(-5);
+              
+              // Emergency closed trim (override safeTrim)
+              const emergencyClosed = (state.closed || [])
+                .filter(c => !c.system_learning_updated || !c.weights_learned || !c.learned)
+                .slice(-80);  // Keep only last 80 unprocessed
+              const emergencyProcessed = (state.closed || [])
+                .filter(c => c.system_learning_updated && c.weights_learned && c.learned)
+                .slice(-20);  // Keep only last 20 processed
+              state.closed = [...emergencyClosed, ...emergencyProcessed];
+              
+              trimReport.push(`EMERGENCY_TRIM: ${preSizeKB}KB (triggered aggressive reduction)`);
+            }
+
+            // NOW calculate final size (existing code continues below)
             const stateJSON = JSON.stringify(state);
             const sizeKB = Math.round(stateJSON.length / 1024);
             
@@ -2114,8 +2025,12 @@ jobs:
                 log(`   ${item}`);
               }
             }
+
+            if (emergencyTriggered) {
+              log(`   Emergency trim complete: ${preSizeKB}KB → ${sizeKB}KB\n`);
+            }
             
-            log(`💾 Gist size: ${sizeKB} KB ${trimmed ? '(after trimming)' : ''}\n`);
+            log(`💾 Gist size: ${sizeKB} KB ${trimmed || emergencyTriggered ? '(after trimming)' : ''}\n`);
             
             return { trimmed, sizeKB, report: trimReport };
           }
@@ -2237,7 +2152,53 @@ jobs:
               let migrated = false;
               
               if (state.__migrated_v2_complete) {
-                return false;
+                // ✅ Fix existing ML buffer labels (one-time migration)
+                if (state.ml_training_buffer && state.ml_training_buffer.length > 0 && !state.__ml_buffer_fixed) {
+                  let fixed = 0;
+                  for (const sample of state.ml_training_buffer) {
+                    if (sample.side && sample.label != null) {
+                      const correctLabel = (sample.side === "long") ? 1 : 0;
+                      if (sample.label !== correctLabel) {
+                        // If old label was outcome-based, preserve it
+                        if (!sample.outcome) sample.outcome = sample.label;
+                        sample.label = correctLabel;  // Fix to side-based
+                        fixed++;
+                      }
+                    }
+                  }
+                  if (fixed > 0) {
+                    log(`✅ Fixed ${fixed} ML buffer samples (outcome→side labels)`);
+                    state.__ml_buffer_fixed = true;
+                    migrated = true;
+                  }
+                }
+
+                // ✅ Reset weights to new +1/-1 system (one-time migration)
+                if (state.model_weights && !state.__weights_migrated_to_plus1) {
+                  log('Migrating weights to new +1/-1 system (initial=30, min=0, max=60)...');
+                  
+                  state.model_weights = {
+                    "Original": INITIAL_WEIGHT,
+                    "Momentum": INITIAL_WEIGHT,
+                    "MeanReversion": INITIAL_WEIGHT,
+                    "Logistic": INITIAL_WEIGHT,
+                    "NaiveBayes": INITIAL_WEIGHT,
+                    "DecisionTree": INITIAL_WEIGHT,
+                    "RandomForest": INITIAL_WEIGHT
+                  };
+                  
+                  // ✅ Sync frozen weights if in EXPLOIT mode
+                  if (state.model_weights_frozen) {
+                    state.model_weights_frozen = { ...state.model_weights };
+                    log('✅ Synchronized frozen weights to new scheme');
+                  }
+                  
+                  state.__weights_migrated_to_plus1 = true;
+                  log(`✅ Weights reset to ${INITIAL_WEIGHT} for all models`);
+                  migrated = true;
+                }
+
+                return migrated;
               }
               
               log('\n' + '🔄'.repeat(40));
@@ -2362,41 +2323,6 @@ jobs:
                 log('✅ Initialized model_scoreboard from existing trades');
                 migrated = true;
               }
-
-              // ========== EWAF MIGRATION ==========
-              if (!state.model_ewaf) {
-                log('Initializing EWAF state...');
-                
-                state.model_ewaf = {
-                  Original: { R: 0, last_updated_ts: Date.now(), weight: 0 },
-                  Momentum: { R: 0, last_updated_ts: Date.now(), weight: 0 },
-                  MeanReversion: { R: 0, last_updated_ts: Date.now(), weight: 0 },
-                  Logistic: { R: 0, last_updated_ts: Date.now(), weight: 0 },
-                  NaiveBayes: { R: 0, last_updated_ts: Date.now(), weight: 0 },
-                  DecisionTree: { R: 0, last_updated_ts: Date.now(), weight: 0 },
-                  RandomForest: { R: 0, last_updated_ts: Date.now(), weight: 0 }
-                };
-                
-                migrated = true;
-                log('✅ EWAF initialized with neutral weights (R=0)');
-              }
-
-              // ========== RAHMAN MIGRATION ==========
-              if (!state.model_rahman) {
-                log('Initializing RAHMAN state...');
-                const now = Date.now();
-                state.model_rahman = {
-                  Original:     { weight: RAHMAN_INIT, last_updated_ts: now },
-                  Momentum:     { weight: RAHMAN_INIT, last_updated_ts: now },
-                  MeanReversion:{ weight: RAHMAN_INIT, last_updated_ts: now },
-                  Logistic:     { weight: RAHMAN_INIT, last_updated_ts: now },
-                  NaiveBayes:   { weight: RAHMAN_INIT, last_updated_ts: now },
-                  DecisionTree: { weight: RAHMAN_INIT, last_updated_ts: now },
-                  RandomForest: { weight: RAHMAN_INIT, last_updated_ts: now }
-                };
-                migrated = true;
-                log('✅ RAHMAN initialized to neutral (10)');
-              }
               
               if (state.closed?.length > 0) {
                 let marked = 0;
@@ -2437,9 +2363,6 @@ jobs:
               await saveState(persist, state, auditOut, 2, true);
               log('✅ Migrated state saved');
             }
-            /**
-             * Update model weights from closed trades (Phase 5: contamination-free)
-             */
             function updateModelWeights(state) {
               const regime = state.system_learning?.regime;
               if (regime && !regime.weight_updates_enabled) {
@@ -2480,7 +2403,6 @@ jobs:
                 const isWin = (trade.pnl_bps || 0) > 0;
                 const takenSide = trade.side;
                 const votes = trade.ml_ensemble?.votes || {};
-                const now_ts = trade.ts_exit_ms || Date.now();
                 
                 log(`\n📈 ${trade.symbolFull || trade.symbol} ${takenSide.toUpperCase()} ${isWin ? "✅ WIN" : "❌ LOSS"} (${trade.pnl_bps} bps)`);
                 
@@ -2492,72 +2414,65 @@ jobs:
                   const modelKey = model.toLowerCase().replace(/\s/g, '');
                   const minRequired = MIN_SAMPLES_REQUIRED[modelKey] || 0;
                   
+                  // Training gate (unchanged)
                   if (minRequired > 0 && (bufferSizeAtTrade == null || bufferSizeAtTrade < minRequired)) {
                     skipped.push(`${model}(had ${bufferSizeAtTrade ?? '?'}/${minRequired})`);
                     continue;
                   }
                   
+                  // Initialize scoreboard
                   if (!state.model_scoreboard) state.model_scoreboard = {};
                   if (!state.model_scoreboard[model]) {
-                    state.model_scoreboard[model] = { correct: 0, wrong: 0, total: 0, winrate: 0, weight: state.model_weights?.[model] || 0, last_updated_ts: Date.now() };
+                    state.model_scoreboard[model] = { 
+                      correct: 0, 
+                      wrong: 0, 
+                      total: 0, 
+                      winrate: 0, 
+                      weight: INITIAL_WEIGHT,
+                      last_updated_ts: Date.now() 
+                    };
                   }
                   
                   const votedForTakenSide = (votedSide === takenSide);
                   const wasCorrect = (votedForTakenSide && isWin) || (!votedForTakenSide && !isWin);
-
-                  // ========== UPDATE 1: WILSON LCB (0-20 range) ==========
+                  
+                  // Update scoreboard (for stats only)
                   state.model_scoreboard[model].total++;
                   if (wasCorrect) {
                     state.model_scoreboard[model].correct++;
                   } else {
                     state.model_scoreboard[model].wrong++;
                   }
-
+                  
                   const sb = state.model_scoreboard[model];
-                  const winrate = sb.correct / sb.total;
-                  const n = sb.total;
-                  const wilson_lcb = wilsonLCB(winrate, n, WEIGHT_WILSON_Z);
-
-                  let w_wilson;
-                  if (wilson_lcb > 0.52) {
-                    w_wilson = Math.round(((wilson_lcb - 0.52) / 0.48) * 20);
-                    w_wilson = Math.max(0, Math.min(20, w_wilson));
-                  } else {
-                    w_wilson = 0;
-                  }
-
-                  if (MIN_SAMPLES_REQUIRED[modelKey] === 0) {
-                    w_wilson = Math.max(WEIGHT_MIN_RULE_BASED, w_wilson);
-                  }
-
-                  sb.winrate = winrate;
-                  sb.weight = w_wilson;  // Store Wilson component in scoreboard
-                  sb.last_updated_ts = now_ts;
-
-                  // ========== UPDATE 2: EWAF (0-20 range) ==========
-                  const w_ewaf = updateEWAFForModel(state, model, votedSide, takenSide, trade.pnl_bps, now_ts);
-
-                  // ========== UPDATE 3: RAHMAN (0-20 range, ±1 per trade) ==========
-                  const w_rahman = updateRahmanForModel(state, model, wasCorrect, now_ts);
-
-                  // ========== FINAL WEIGHT = WILSON + EWAF + RAHMAN (NO CAP) ==========
-                  const final_weight = w_wilson + w_ewaf + w_rahman;  // 0..60
-                  const oldWeight = state.model_weights[model] || 0;
-                  state.model_weights[model] = final_weight;
-
-                  // ========== LOGGING ==========
-                  const change = final_weight - oldWeight;
-                  const arrow = change > 0 ? '↗' : (change < 0 ? '↘' : '→');
-
+                  sb.winrate = sb.correct / sb.total;  // Overall % (visible only)
+                  
+                  // ✅ NEW WEIGHTING: Simple +1/-1
+                  const oldWeight = state.model_weights[model] || INITIAL_WEIGHT;
+                  let newWeight;
+                  
                   if (wasCorrect) {
-                    correct.push(`${model}(${oldWeight}${arrow}${final_weight})`);
+                    newWeight = Math.min(MAX_WEIGHT, oldWeight + 1);  // +1, cap at 60
                   } else {
-                    wrong.push(`${model}(${oldWeight}${arrow}${final_weight})`);
+                    newWeight = Math.max(MIN_WEIGHT, oldWeight - 1);  // -1, floor at 0
                   }
-
-                  log(`   ${model.padEnd(15)}: ${wasCorrect ? "✅" : "❌"} | ${sb.correct}/${sb.total} (${(winrate*100).toFixed(1)}%)`);
-                  log(`      Wilson: ${w_wilson} (LCB=${(wilson_lcb*100).toFixed(1)}%) | EWAF: ${w_ewaf} | Rahman: ${w_rahman} | FINAL: ${oldWeight}${arrow}${final_weight} (${change>=0?'+':''}${change})`);
-
+                  
+                  state.model_weights[model] = newWeight;
+                  sb.weight = newWeight;
+                  sb.last_updated_ts = Date.now();
+                  
+                  const change = newWeight - oldWeight;
+                  const changeStr = change > 0 ? `+${change}` : String(change);
+                  const arrow = newWeight > oldWeight ? '↗' : (newWeight < oldWeight ? '↘' : '→');
+                  
+                  if (wasCorrect) {
+                    correct.push(`${model}(${oldWeight}${arrow}${newWeight})`);
+                  } else {
+                    wrong.push(`${model}(${oldWeight}${arrow}${newWeight})`);
+                  }
+                  
+                  // Log with overall winrate %
+                  log(`   ${model}: ${wasCorrect ? "✅" : "❌"} | Overall: ${sb.correct}/${sb.total} (${(sb.winrate*100).toFixed(1)}%) | Weight: ${oldWeight}→${newWeight} (${changeStr})`);
                   totalWeightChanges++;
                 }
                 
@@ -2606,9 +2521,6 @@ jobs:
             printModelScoreboard(state);
             printSystemLearning(state);
 
-            /**
-             * Validate at least one model can vote (Phase 6)
-             */
             function validateActiveModels(state) {
               const trainingBufferSize = state.ml_training_buffer?.length || 0;
               const weightSource = (state.model_weights_frozen && state.system_learning?.regime?.current === 'exploit') ? state.model_weights_frozen : (state.model_weights || {});
@@ -2625,7 +2537,15 @@ jobs:
                 log('\n' + '🚨'.repeat(40));
                 log('🚨 CRITICAL: NO ACTIVE MODELS! Emergency reset to safe defaults');
                 log('🚨'.repeat(40) + '\n');
-                state.model_weights = { Original: 10, Momentum: 10, MeanReversion: 10, Logistic: 0, NaiveBayes: 0, DecisionTree: 0, RandomForest: 0 };
+                state.model_weights = {
+                  Original: INITIAL_WEIGHT,
+                  Momentum: INITIAL_WEIGHT,
+                  MeanReversion: INITIAL_WEIGHT,
+                  Logistic: INITIAL_WEIGHT,
+                  NaiveBayes: INITIAL_WEIGHT,
+                  DecisionTree: INITIAL_WEIGHT,
+                  RandomForest: INITIAL_WEIGHT
+                };
                 state.model_weights_frozen = null;
                 if (state.system_learning?.regime) {
                   state.system_learning.regime.current = "explore";
@@ -2992,7 +2912,7 @@ jobs:
                 x.ml_ensemble.training_buffer_size = state.ml_training_buffer?.length || 0;
               }
               state.buffer_at_plan = state.buffer_at_plan || {};
-              state.buffer_at_plan[idea_id] = state.ml_training_buffer?.length || 0;
+              state.buffer_at_plan[idea_id] = state.ml_training_buffer?.length || 0;  // ✅ Now idea_id exists!
 
               const bk = bookMap.get(x.symbol);
               const mid = (bk?.bid && bk?.ask) ? ((+bk.bid + +bk.ask)/2) : null;
@@ -3114,7 +3034,7 @@ jobs:
               const payloadV2 = { ts: new Date().toISOString(), mode: "normal", source: "external_pusher", meta: { origin: "github_actions_v2" }, top_n: picksV2.length, ideas: picksV2 };
               log(`pushing ${picksV2.length} v2 ideas to ${PUSH_URL_V2}`);
               try {
-                const r2 = await fetchWithTimeout(PUSH_URL_V2, { method:"POST", headers:{ "Content-Type": "application/json", "Authorization":"Bearer " + PUSH_TOKEN }, body: JSON.stringify(payloadV2) }, 15000);
+                const r2 = await fetchWithTimeout(PUSH_URL_V2, { method:"POST", headers:{ "Content-Type":"application/json", "Authorization":"Bearer " + PUSH_TOKEN }, body: JSON.stringify(payloadV2) }, 15000);
                 let txt2=""; try{ txt2=await r2.text(); }catch{}
                 log("push v2 status", r2?.status||"ERR", (txt2||"").slice(0,400));
               } catch (e) { log("push v2 failed", e?.message||e); }
