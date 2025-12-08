@@ -233,7 +233,7 @@ jobs:
           const setCached=(map,key,v)=>map.set(key,{ v, ts: Date.now() });
 
           // ---------- Config / ENV ----------
-          const TARGET_EXCHANGE = "coinex_perpetual";
+          const TARGET_EXCHANGE = "bybit_perpetual";
           const MARKET_TYPE     = "futures";
           const MARGIN_MODE     = "isolated";
           const LEVERAGE        = 1;
@@ -244,13 +244,12 @@ jobs:
           const MEXC_SECRET_KEY = process.env.MEXC_SECRET_KEY || "";
           const MEXC_BASES=[process.env.MEXC_BASE,"https://api.mexc.com","https://www.mexc.com"].filter(Boolean);
           
-          // CoinEx Perpetual endpoints (public)
-          const BINANCE_FAPI = "https://api.coinex.com/perpetual/v1";
-          const BINANCE_SPOT = "https://api.coinex.com/v1";
+          const BINANCE_FAPI = "https://api.bybit.com";
+          const BINANCE_SPOT = "https://api.bybit.com";
           
           const MIN_TF_ALIGN=(Number(process.env.MIN_TF_ALIGN||"0.60"));
           let TF_WEIGHTS={}; try{ TF_WEIGHTS=JSON.parse(process.env.TF_WEIGHTS||"{}"); }catch{ TF_WEIGHTS={}; }
-          const STRATEGY_NAME=(process.env.STRATEGY_NAME||"coinex-hedge-ultimate");
+          const STRATEGY_NAME=(process.env.STRATEGY_NAME||"bybit-hedge-ultimate");
           const SCHEMA_VERSION=(process.env.SCHEMA_VERSION||"1");
           const GIT_SHA=(process.env.GIT_SHA||"unknown");
           
@@ -419,7 +418,7 @@ jobs:
               meta: {
                 origin: "github_actions_FAKE_FLUSH",
                 reason: "fake_flush",
-                exchange: "coinex_perpetual",
+                exchange: "bybit_perpetual",
                 strategy: "fake-flush",
                 model_version: "0.0.0",
                 schema_version: "1",
@@ -472,82 +471,76 @@ jobs:
           // ---------- Binance Futures API Functions (Public, No Auth) ----------
           
           async function fetchBinanceFuturesSymbols() {
-            const cacheKey = "coinex_perp_symbols";
+            const cacheKey = "bybit_perp_symbols";
             const cached = getCached(cache.binance, cacheKey, 300_000);
             if (cached) return cached;
           
             try {
-              const url = `${BINANCE_FAPI}/market/list`;
-              log("Fetching CoinEx perpetual market list from:", url);
+              const url = `${BINANCE_FAPI}/v5/market/instruments-info?category=linear`;
+              log("Fetching Bybit perpetual list from:", url);
           
               const response = await fetchWithTimeout(url, {}, 20000);
               if (!response.ok) {
-                log(`CoinEx market list failed: ${response.status}`);
+                log(`Bybit instruments-info failed: ${response.status}`);
                 return [];
               }
           
               const data = await response.json();
-              if (!data || data.code !== 0 || !Array.isArray(data.data)) {
-                log("CoinEx /market/list: unexpected response", JSON.stringify(data || {}).slice(0, 200));
+              if (!data || data.retCode !== 0 || !data.result?.list) {
+                log("Bybit instruments: unexpected response", JSON.stringify(data || {}).slice(0, 200));
                 return [];
               }
           
-              const symbols = data.data
-                .filter(m =>
-                  m.available === true &&
-                  String(m.money || "").toUpperCase() === "USDT"
+              const symbols = data.result.list
+                .filter(s =>
+                  s.quoteCoin === "USDT" &&
+                  s.status === "Trading" &&
+                  s.contractType === "LinearPerpetual"
                 )
-                .map(m => ({
-                  symbol: m.name,
-                  base: m.stock,
-                  quote: m.money,
-                  pricePrecision: m.money_prec != null ? Number(m.money_prec) : 4,
-                  quantityPrecision: m.stock_prec != null ? Number(m.stock_prec) : 4
+                .map(s => ({
+                  symbol: s.symbol,
+                  base: s.baseCoin,
+                  quote: s.quoteCoin,
+                  pricePrecision: s.priceScale || 2,
+                  quantityPrecision: s.qtyStep ? String(s.qtyStep).split('.')[1]?.length || 0 : 2
                 }));
           
               setCached(cache.binance, cacheKey, symbols);
-              log(`📊 CoinEx Perp: ${symbols.length} USDT perpetuals found`);
+              log(`📊 Bybit Perp: ${symbols.length} USDT perpetuals found`);
               return symbols;
             } catch (e) {
-              log("fetchBinanceFuturesSymbols (CoinEx) error:", e?.message || e);
+              log("fetchBinanceFuturesSymbols (Bybit) error:", e?.message || e);
               return [];
             }
           }
 
           // Fetch 1h kline for price change % and volume
           async function fetchBinance1hKline(symbol) {
-            const cacheKey = `coinex_1h_${symbol}`;
+            const cacheKey = `bybit_1h_${symbol}`;
             const cached = getCached(cache.binance, cacheKey, TTL.binance);
             if (cached) return cached;
           
             try {
-              const url = `${BINANCE_FAPI}/market/kline?market=${encodeURIComponent(symbol)}&type=1hour&limit=2`;
+              const endTime = Date.now();
+              const startTime = endTime - 2 * 60 * 60 * 1000;
+              const url = `${BINANCE_FAPI}/v5/market/kline?category=linear&symbol=${symbol}&interval=60&start=${startTime}&end=${endTime}`;
+              
               const data = await getJSON(url, 10000, 2);
-              if (!data || data.code !== 0 || !Array.isArray(data.data) || data.data.length < 2) {
-                log(`KLINE FAIL: ${symbol} - no data`);
+              if (!data || data.retCode !== 0 || !data.result?.list || data.result.list.length < 2) {
                 return null;
               }
           
-              const prev = data.data[0];
-              const curr = data.data[1];
+              const curr = data.result.list[0];
+              const prev = data.result.list[1];
           
-              const prevClose = +prev[2];
-              const currClose = +curr[2];
-              const currHigh  = +curr[3];
-              const currLow   = +curr[4];
-              const baseVol = +curr[5] || 0;
-              const quoteVol = +curr[6] || 0;
-              
-              // Use quote volume if available, else estimate from base
-              const volumeQuote = quoteVol > 0 ? quoteVol : baseVol * currClose;
+              const currClose = +curr[4];
+              const prevClose = +prev[4];
+              const currHigh = +curr[2];
+              const currLow = +curr[3];
+              const volumeQuote = +curr[6];
           
               const priceChange1h = prevClose > 0 ? (currClose - prevClose) / prevClose : 0;
               const vol1hPct = Math.abs(priceChange1h) * 100;
-          
-              // DEBUG LOG for first 5 symbols
-              if (Math.random() < 0.2) {
-                log(`KLINE ${symbol}: close=${currClose.toFixed(4)} baseVol=${baseVol.toFixed(2)} quoteVol=${quoteVol.toFixed(2)} final=${volumeQuote.toFixed(2)}`);
-              }
           
               const result = {
                 symbol,
@@ -564,30 +557,29 @@ jobs:
               setCached(cache.binance, cacheKey, result);
               return result;
             } catch (e) {
-              log(`KLINE ERROR ${symbol}:`, e?.message || e);
               return null;
             }
           }
 
           // Fetch current funding rate
           async function fetchBinanceFundingRate(symbol) {
-            const cacheKey = `coinex_funding_${symbol}`;
+            const cacheKey = `bybit_funding_${symbol}`;
             const cached = getCached(cache.binance, cacheKey, TTL.binance);
             if (cached) return cached;
           
             try {
-              const url = `${BINANCE_FAPI}/market/ticker?market=${encodeURIComponent(symbol)}`;
+              const url = `${BINANCE_FAPI}/v5/market/tickers?category=linear&symbol=${symbol}`;
               const data = await getJSON(url, 10000, 2);
-              if (!data || data.code !== 0 || !data.data || !data.data.ticker) return null;
+              if (!data || data.retCode !== 0 || !data.result?.list?.[0]) return null;
           
-              const t = data.data.ticker;
+              const t = data.result.list[0];
           
               const result = {
                 symbol,
-                markPrice: +t.sign_price || +t.last || 0,
-                indexPrice: +t.index_price || +t.last || 0,
-                lastFundingRate: +t.funding_rate_last || 0,
-                nextFundingTime: 0,
+                markPrice: +t.markPrice || +t.lastPrice || 0,
+                indexPrice: +t.indexPrice || +t.lastPrice || 0,
+                lastFundingRate: +t.fundingRate || 0,
+                nextFundingTime: +t.nextFundingTime || 0,
                 ts: Date.now()
               };
           
@@ -600,20 +592,18 @@ jobs:
 
           // Fetch current Open Interest
           async function fetchBinanceOI(symbol) {
-            const cacheKey = `coinex_oi_${symbol}`;
+            const cacheKey = `bybit_oi_${symbol}`;
             const cached = getCached(cache.binance, cacheKey, TTL.binance);
             if (cached) return cached;
           
             try {
-              const url = `${BINANCE_FAPI}/market/ticker?market=${encodeURIComponent(symbol)}`;
+              const url = `${BINANCE_FAPI}/v5/market/open-interest?category=linear&symbol=${symbol}&intervalTime=1h&limit=1`;
               const data = await getJSON(url, 10000, 2);
-              if (!data || data.code !== 0 || !data.data || !data.data.ticker) return null;
-          
-              const t = data.data.ticker;
+              if (!data || data.retCode !== 0 || !data.result?.list?.[0]) return null;
           
               const result = {
                 symbol,
-                openInterest: +t.position_amount || 0,
+                openInterest: +data.result.list[0].openInterest || 0,
                 ts: Date.now()
               };
           
@@ -626,28 +616,30 @@ jobs:
 
           // Fetch OI history for ΔOI calculation
           async function fetchBinanceOIHist(symbol) {
-            const cacheKey = `coinex_oi_hist_${symbol}`;
+            const cacheKey = `bybit_oi_hist_${symbol}`;
             const cached = getCached(cache.binance, cacheKey, TTL.binance);
             if (cached) return cached;
           
             try {
-              const [funding, oiNow] = await Promise.all([
-                fetchBinanceFundingRate(symbol),
-                fetchBinanceOI(symbol)
-              ]);
-              if (!funding || !oiNow) return null;
+              const url = `${BINANCE_FAPI}/v5/market/open-interest?category=linear&symbol=${symbol}&intervalTime=1h&limit=3`;
+              const data = await getJSON(url, 10000, 2);
+              if (!data || data.retCode !== 0 || !data.result?.list || data.result.list.length < 2) return null;
           
-              const px = funding.indexPrice || funding.markPrice || 0;
-              const current = oiNow.openInterest * px;
+              const curr = +data.result.list[0].openInterest || 0;
+              const prev1h = +data.result.list[1].openInterest || 0;
+              const prev2h = data.result.list[2] ? +data.result.list[2].openInterest : prev1h;
+          
+              const oiDelta1h = prev1h > 0 ? ((curr - prev1h) / prev1h) : 0;
+              const oiDelta2h = prev2h > 0 ? ((curr - prev2h) / prev2h) : 0;
           
               const result = {
                 symbol,
-                currentOI_USD: current,
-                prev1hOI_USD: current,
-                prev2hOI_USD: current,
-                oiDelta1hPct: 0,
-                oiDelta2hPct: 0,
-                oiDelta1hRaw: 0,
+                currentOI_USD: curr,
+                prev1hOI_USD: prev1h,
+                prev2hOI_USD: prev2h,
+                oiDelta1hPct: Math.abs(oiDelta1h) * 100,
+                oiDelta2hPct: Math.abs(oiDelta2h) * 100,
+                oiDelta1hRaw: oiDelta1h,
                 ts: Date.now()
               };
           
@@ -672,19 +664,23 @@ jobs:
 
           // NEW: Fetch Binance Futures orderbook
           async function fetchBinanceFuturesDepth(symbol) {
-            const cacheKey = `coinex_depth_${symbol}`;
+            const cacheKey = `bybit_depth_${symbol}`;
             const cached = getCached(cache.binance, cacheKey, 5000);
             if (cached) return cached;
           
             try {
-              const url = `${BINANCE_FAPI}/market/depth?market=${encodeURIComponent(symbol)}&limit=${DEPTH_LIMIT}&merge=0`;
+              const url = `${BINANCE_FAPI}/v5/market/orderbook?category=linear&symbol=${symbol}&limit=${DEPTH_LIMIT}`;
               const data = await getJSON(url, 8000, 2);
-              if (!data || data.code !== 0 || !data.data || !data.data.bids || !data.data.asks) {
-                return null;
-              }
+              if (!data || data.retCode !== 0 || !data.result) return null;
           
-              setCached(cache.binance, cacheKey, data.data);
-              return data.data;
+              const result = {
+                bids: data.result.b,
+                asks: data.result.a,
+                ts: data.result.ts
+              };
+          
+              setCached(cache.binance, cacheKey, result);
+              return result;
             } catch (e) {
               return null;
             }
@@ -692,23 +688,23 @@ jobs:
 
           // NEW: Fetch Binance Futures ticker (bid/ask)
           async function fetchBinanceFuturesTicker(symbol) {
-            const cacheKey = `coinex_ticker_${symbol}`;
+            const cacheKey = `bybit_ticker_${symbol}`;
             const cached = getCached(cache.binance, cacheKey, 5000);
             if (cached) return cached;
           
             try {
-              const url = `${BINANCE_FAPI}/market/ticker?market=${encodeURIComponent(symbol)}`;
+              const url = `${BINANCE_FAPI}/v5/market/tickers?category=linear&symbol=${symbol}`;
               const data = await getJSON(url, 8000, 2);
-              if (!data || data.code !== 0 || !data.data || !data.data.ticker) return null;
+              if (!data || data.retCode !== 0 || !data.result?.list?.[0]) return null;
           
-              const t = data.data.ticker;
+              const t = data.result.list[0];
           
               const result = {
                 symbol,
-                bid: +t.buy || +t.last || 0,
-                ask: +t.sell || +t.last || 0,
-                bidQty: +t.buy_amount || 0,
-                askQty: +t.sell_amount || 0,
+                bid: +t.bid1Price || 0,
+                ask: +t.ask1Price || 0,
+                bidQty: +t.bid1Size || 0,
+                askQty: +t.ask1Size || 0,
                 ts: Date.now()
               };
           
@@ -803,7 +799,7 @@ jobs:
           // ⚠️ THIS SECTION IS 100% UNCHANGED FROM ORIGINAL
           async function loadState(){
             const token=process.env.GIST_TOKEN, id=process.env.GIST_ID;
-            const init={ v:"coinex-hedge-7.0",
+            const init={ v:"bybit-hedge-7.0",
               run_counter: 0,
               cooldown:{}, cooldown_side:{}, pending:[], equity:[], closed:[],
               mr_lockout:{}, sym_stats:{}, sym_stats_real:{}, calibCoeffs:{}, lastReconcileTs:0,
@@ -1520,7 +1516,7 @@ jobs:
               log("🗑️  RUN 6: WIPE GIST AND RESTART FRESH");
               await saveState(persist, { run_counter: 0 }, {}, 2, true);
               
-              state.v = "coinex-hedge-7.0";
+              state.v = "bybit-hedge-7.0";
               state.run_counter = 1;
               state.cooldown = {};
               state.cooldown_side = {};
@@ -1551,7 +1547,7 @@ jobs:
 
             // Preserve cleaned state
             const preserved = {
-              v: state.v || "coinex-hedge-7.0",
+              v: state.v || "bybit-hedge-7.0",
               run_counter: state.run_counter || 0,
               
               cooldown: state.cooldown || {},
@@ -1581,16 +1577,16 @@ jobs:
             if(!todOK) reason="tod_gate";
 
             // ========== DYNAMIC UNIVERSE FROM BINANCE FUTURES (NO VALIDATION NEEDED) ==========
-            log("📡 Fetching CoinEx Futures universe...");
+            log("📡 Fetching Bybit Futures universe...");
             const binanceSymbols = await fetchBinanceFuturesSymbols();
             
             if (!binanceSymbols || binanceSymbols.length === 0) {
-              log("❌ No CoinEx Futures symbols found - cannot proceed");
-              reason = "no_coinex_symbols";
-              throw new Error("No CoinEx Futures symbols available");
+              log("❌ No Bybit Futures symbols found - cannot proceed");
+              reason = "no_bybit_symbols";
+              throw new Error("No Bybit Futures symbols available");
             }
             
-            log(`✅ CoinEx Futures universe: ${binanceSymbols.length} USDT perpetuals`);
+            log(`✅ Bybit Futures universe: ${binanceSymbols.length} USDT perpetuals`);
 
             // DD/throttle
             const equityStats=(eq)=>{ const day=Date.now()-24*3600*1000; let pnl24=0,cum=0,peak=0,dd=0; for(const e of eq||[]){ if(e.ts_ms>=day) pnl24+=e.pnl_bps; cum+=e.pnl_bps; if(cum>peak) peak=cum; dd=Math.min(dd,cum-peak); } return { pnl24_bps:Math.round(pnl24), peak_dd_bps:Math.round(dd) }; };
@@ -1786,40 +1782,32 @@ jobs:
                 
                 if (!chosen) continue;
                 
-                // ========== FINAL CONFIDENCE CALCULATION (CoinEx-adjusted) ==========
+                // ========== FINAL CONFIDENCE CALCULATION ==========
+                // Base from golden 4 metrics (already 0-100)
                 const baseConf = cand.hedge_confidence;
-
-                // RELAXED thresholds for CoinEx's lower liquidity
-                const spreadMult = clamp(1 - Math.max(0, (spreadBps - 15)) / 50, 0.3, 1.1);
-                const depthMult = clamp(depth1pUSD / Math.max(1, 50000), 0.2, 1.2);
-                const slipMult = clamp(1 - Math.max(0, (chosen.cost_bps - COST_BPS)) / 40, 0.4, 1.1);
-                const oiMult = clamp(cand.current_oi_usd / 5_000_000, 0.3, 1.3);
-
-                // EV multiplier (unchanged)
+                
+                // Execution quality multipliers
+                const spreadMult = clamp(1 - Math.max(0, (spreadBps - 5)) / 30, 0.5, 1.1);
+                const depthMult = clamp(depth1pUSD / Math.max(1, DEPTH_1P_MIN_USD), 0.3, 1.2);
+                const slipMult = clamp(1 - Math.max(0, (chosen.cost_bps - COST_BPS)) / 25, 0.5, 1.1);
+                const oiMult = clamp(cand.current_oi_usd / 50_000_000, 0.4, 1.3);
+                
+                // EV multiplier
                 const evMult = clamp(chosen.viab_mult || 1, 0.3, 1.3);
-
-                // Direction bias for BTC regime (unchanged)
+                
+                // Direction bias for BTC regime
                 const btcMult = (chosen.side === "long" && !btcUp1h) ? 0.85 : 1.0;
-
-                // Funding alignment bonus (unchanged)
+                
+                // Funding alignment bonus
                 const fundingAlignBonus = (
                   (chosen.side === "short" && cand.funding_rate_raw > 0) ||
                   (chosen.side === "long" && cand.funding_rate_raw < 0)
                 ) ? 1.1 : 1.0;
-
+                
                 // Final confidence
                 const finalConf = Math.round(
                   baseConf * spreadMult * depthMult * slipMult * oiMult * evMult * btcMult * fundingAlignBonus
                 );
-
-                // ADD THIS DEBUG (for first 5 symbols):
-                if (refined.length < 5) {
-                  log(`CONF DEBUG ${cand.symbol} ${chosen.side}:`);
-                  log(`  base=${baseConf} spread=${spreadMult.toFixed(2)} depth=${depthMult.toFixed(2)} slip=${slipMult.toFixed(2)}`);
-                  log(`  oi=${oiMult.toFixed(2)} ev=${evMult.toFixed(2)} btc=${btcMult.toFixed(2)} fund=${fundingAlignBonus.toFixed(2)}`);
-                  log(`  spreadBps=${spreadBps} depth1p=$${Math.round(depth1pUSD/1000)}k cost=${chosen.cost_bps}`);
-                  log(`  → FINAL=${finalConf}`);
-                }
                 
                 // Build reasons
                 const reasons = reasonBuilder({
@@ -1884,18 +1872,13 @@ jobs:
             
             log(`🔍 Refined ${refined.length} candidates with execution quality analysis`);
 
-            // FILTER OUT LOW CONFIDENCE
-            const MIN_FINAL_CONF = 15;
-            const viableRefined = refined.filter(r => r.confidence >= MIN_FINAL_CONF);
-            log(`🎯 ${viableRefined.length} viable after conf>=${MIN_FINAL_CONF} filter`);
-
             // ========== FINAL SELECTION ==========
-            viableRefined.sort((a, b) => b.confidence - a.confidence);
-
+            refined.sort((a, b) => b.confidence - a.confidence);
+            
             const TARGET_TOP_N = Math.max(1, TOP_N || 3);
             
             const selected = [];
-            for (const cand of viableRefined) {
+            for (const cand of refined) {
               if (selected.length >= TARGET_TOP_N) break;
               
               // Simple diversity: don't pick same base twice
@@ -1908,7 +1891,7 @@ jobs:
             // Fill remaining slots if needed
             if (selected.length < TARGET_TOP_N) {
               const haveSyms = new Set(selected.map(s => s.symbol));
-              for (const c of viableRefined) {
+              for (const c of refined) {
                 if (selected.length >= TARGET_TOP_N) break;
                 if (!haveSyms.has(c.symbol)) {
                   selected.push(c);
@@ -2146,7 +2129,7 @@ jobs:
                   regime: p.regime,
 
                   decision_context: {
-                    source: "coinex_perpetual",
+                    source: "bybit_perpetual",
                     golden_metrics: p.hedge_metrics
                   },
 
@@ -2199,15 +2182,15 @@ jobs:
             const meta = {
               origin: "github_actions",
               reason,
-              exchange: "coinex_perpetual",
-              execution_exchange: "coinex_perpetual",
+              exchange: "bybit_perpetual",
+              execution_exchange: "bybit_perpetual",
               strategy: STRATEGY_NAME,
               model_version: MODEL_VERSION,
               schema_version: SCHEMA_VERSION,
               git_sha: GIT_SHA,
               config_hash: CONFIG_HASH,
               counts: {
-                coinex_universe: binanceSymbols.length,
+                bybit_universe: binanceSymbols.length,
                 metrics_fetched: allMetrics.length,
                 refined: refined.length,
                 selected: picks.length
@@ -2232,7 +2215,7 @@ jobs:
               },
               extras: {
                 v2_ideas: picksV2,
-                features_requested: ["maker_join", "post_only", "futures", "hedge_trading", "coinex_perpetual"]
+                features_requested: ["maker_join", "post_only", "futures", "hedge_trading", "bybit_perpetual"]
               }
             };
 
@@ -2266,11 +2249,11 @@ jobs:
                 mode: "normal",
                 source: "external_pusher",
                 meta: {
-                  origin: "github_actions_v2_coinex",
-                  strategy: "coinex-hedge-ultimate",
-                  data_source: "coinex_perpetual",
+                  origin: "github_actions_v2_bybit",
+                  strategy: "bybit-hedge-ultimate",
+                  data_source: "bybit_perpetual",
                   golden_metrics: true,
-                  execution: "coinex_perpetual"
+                  execution: "bybit_perpetual"
                 },
                 top_n: picksV2.length,
                 ideas: picksV2
@@ -2300,7 +2283,7 @@ jobs:
                 origin: "github_actions",
                 reason,
                 error: (e?.message || String(e)).slice(0, 220),
-                exchange: "coinex_perpetual"
+                exchange: "bybit_perpetual"
               },
               top_n: 0,
               ideas: []
@@ -2343,7 +2326,7 @@ jobs:
 
             # 2) Minimal POST with 0 ideas
             now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-            payload='{"ts":"'"${now}"'","mode":"normal","source":"external_pusher","meta":{"origin":"github_actions","reason":"fallback_node_error","exchange":"coinex_perpetual"},"top_n":0,"ideas":[]}'
+            payload='{"ts":"'"${now}"'","mode":"normal","source":"external_pusher","meta":{"origin":"github_actions","reason":"fallback_node_error","exchange":"bybit_perpetual"},"top_n":0,"ideas":[]}'
             echo "[gha] pushing 0 ideas to ${raw_push_url}"
             mkdir -p /tmp
             : > /tmp/push_resp.txt
