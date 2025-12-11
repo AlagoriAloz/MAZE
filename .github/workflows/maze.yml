@@ -459,24 +459,19 @@ jobs:
           log("🏁 FAKE FLUSH complete. Starting REAL processing...");
           // ========== FAKE FLUSH END ==========
 
-          // ---------- MEXC Adapter (REMOVED - NOT NEEDED FOR OKX) ----------
-          // Kept minimal for compatibility if needed later
-          async function pickMexcBase(){ return "https://api.mexc.com"; }
-          const BASE=await pickMexcBase();
-          const api=(path,params={})=>{ const u=new URL(path,BASE); for(const [k,v] of Object.entries(params)){ if(v!==undefined&&v!==null) u.searchParams.set(k,String(v)); } return u.toString(); };
-          async function mexcSignedRequest() { return null; }  // Stub
-          async function fetchMyTrades() { return null; }      // Stub
-          async function fetchOpenOrders() { return null; }    // Stub
-          async function fetchK() { return null; }             // Stub
-          async function fetchDepth() { return null; }         // Stub
-          async function fetchAll24hr() { return []; }         // Stub
-          async function fetchBookTicker() { return null; }    // Stub
-          async function getKCached() { return null; }         // Stub
-          async function getDepthCached() { return null; }     // Stub
-          async function getBookTickerCached() { return null; } // Stub
-          async function getKMultiTF() { return {}; }          // Stub
-          const tfInd=()=>null;                               // Stub
-          async function getConversionRate() { return 1; }    // Stub
+          // ---------- Exchange Adapter (stubs for unused methods) ----------
+          async function fetchMyTrades() { return null; }
+          async function fetchOpenOrders() { return null; }
+          async function fetchK() { return null; }
+          async function fetchDepth() { return null; }
+          async function fetchAll24hr() { return []; }
+          async function fetchBookTicker() { return null; }
+          async function getKCached() { return null; }
+          async function getDepthCached() { return null; }
+          async function getBookTickerCached() { return null; }
+          async function getKMultiTF() { return {}; }
+          const tfInd=()=>null;
+          async function getConversionRate() { return 1; }
 
           // ---------- OKX Swap API Functions (Public, No Auth) ----------
           
@@ -626,12 +621,14 @@ jobs:
             if (cached) return cached;
             
             try {
-              // Try rubik endpoint for OI history
               const url = `${OKX_API_BASE}/api/v5/rubik/stat/contracts/open-interest-history?instId=${encodeURIComponent(instId)}&period=1H`;
               const data = await getOKXJSON(url, 10000, 2);
               
-              if (!Array.isArray(data) || data.length < 2) {
-                // Fallback: just get current OI and estimate delta as 0
+              // Get mark price for USD conversion
+              const funding = await fetchOKXFundingRate(instId);
+              const markPrice = funding?.markPrice || 0;
+              
+              if (!Array.isArray(data) || data.length < 2 || !markPrice) {
                 const currentOI = await fetchOKXOI(instId);
                 if (!currentOI) return null;
                 
@@ -647,13 +644,12 @@ jobs:
                 };
               }
               
-              // OKX returns data with ts and oi fields
-              // Sort by timestamp descending (newest first)
               data.sort((a, b) => (+b.ts || 0) - (+a.ts || 0));
               
-              const current = +data[0]?.oi || 0;
-              const prev1h = +data[1]?.oi || current;
-              const prev2h = data[2] ? +data[2]?.oi : prev1h;
+              // Convert contracts to USD using mark price
+              const current = (+data[0]?.oi || 0) * markPrice;
+              const prev1h = (+data[1]?.oi || 0) * markPrice || current;
+              const prev2h = data[2] ? (+data[2]?.oi || 0) * markPrice : prev1h;
               
               const oiDelta1h = prev1h > 0 ? ((current - prev1h) / prev1h) : 0;
               const oiDelta2h = prev2h > 0 ? ((current - prev2h) / prev2h) : 0;
@@ -827,7 +823,6 @@ jobs:
           }
 
           // ---------- Heartbeat & Zombie detection ----------
-          // CHANGED: Disabled for OKX version (no signed API needed for reads)
           async function heartbeatCheck(state){
             const res={ mismatches:0, zombies:0, details:[] };
             // OKX version doesn't check open orders (would require API keys)
@@ -1536,7 +1531,6 @@ jobs:
             return { closedAudit, disagreements, tradesCsv };
           }
 
-          // CHANGED: Stub for candle sim (not needed for OKX-only)
           async function candleSimForIdea(p){
             return { status:"sim_disabled", closed:false };
           }
@@ -1973,7 +1967,7 @@ jobs:
               }
 
               const idea_id = uuidv4();
-              const client_order_id = mkClientOrderId("okh");  // ← CHANGED prefix for OKX Hedge
+              const client_order_id = mkClientOrderId("okh");
 
               const ttl = clamp(Math.round((x.hold_sec || 3600) + i * 12), TTL_MIN, TTL_MAX);
               const size_bps = (Number(process.env.FORCE_SIZE_BPS || "0") > 0)
@@ -1991,7 +1985,7 @@ jobs:
                 rank: i + 1,
 
                 // v2/futures intent
-                target_exchange: TARGET_EXCHANGE,  // "okx_swap"
+                target_exchange: TARGET_EXCHANGE,
                 market_type: MARKET_TYPE,
                 margin_mode: MARGIN_MODE,
                 leverage: LEVERAGE,
