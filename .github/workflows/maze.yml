@@ -1,4 +1,4 @@
-name: Ideas Pusher (MEXC Ultimate 7.7.7)
+name: Ideas Pusher (Bybit Ultimate 7.7.7)
 
 on:
   schedule:
@@ -26,26 +26,26 @@ jobs:
       WORKER_PUSH_URL_V2: ${{ secrets.WORKER_PUSH_URL_V2 }}
 
       # Required for trade reconciliation
-      MEXC_API_KEY: ${{ secrets.MEXC_API_KEY }}
-      MEXC_SECRET_KEY: ${{ secrets.MEXC_SECRET_KEY }}
+      BYBIT_API_KEY: ${{ secrets.BYBIT_API_KEY }}
+      BYBIT_SECRET_KEY: ${{ secrets.BYBIT_SECRET_KEY }}
 
       # Optional (safe defaults inside the script)
       GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
       GIST_ID: ${{ secrets.GIST_ID }}
 
       # Exchange + tuning knobs (via Repo/Org Variables)
-      EXCHANGE: mexc
+      EXCHANGE: bybit
       MIN_QV_USD: ${{ vars.MIN_QV_USD }}
       TOP_N: ${{ vars.TOP_N }}
       MAX_SPREAD_BPS: ${{ vars.MAX_SPREAD_BPS }}
       EXP_LCB_MIN_BPS: ${{ vars.EXP_LCB_MIN_BPS }}
       FEES_BPS: ${{ vars.FEES_BPS }}
       NOTIONAL_USD: ${{ vars.NOTIONAL_USD }}
-      MEXC_DEPTH_LIMIT: ${{ vars.MEXC_DEPTH_LIMIT }}
+      BYBIT_DEPTH_LIMIT: ${{ vars.BYBIT_DEPTH_LIMIT }}
       OBI_TOPN: ${{ vars.OBI_TOPN }}
       ACTIVE_UTC_START: ${{ vars.ACTIVE_UTC_START }}
       ACTIVE_UTC_END: ${{ vars.ACTIVE_UTC_END }}
-      MEXC_BASE: ${{ vars.MEXC_BASE }}
+      BYBIT_BASE: ${{ vars.BYBIT_BASE }}
       FORCE_SIZE_BPS: ${{ vars.FORCE_SIZE_BPS }}
 
       # New Confidence Model Knobs
@@ -226,26 +226,24 @@ jobs:
           // ---------- HTTP + Concurrency ----------
           async function fetchWithTimeout(url,opts={},ms=12000){ const ac=new AbortController(); const t=setTimeout(()=>ac.abort(),ms); try{ return await fetch(url,{...opts,signal:ac.signal,headers:{"User-Agent":UA,...(opts?.headers||{})}});} finally{ clearTimeout(t);} }
           async function getJSON(url,ms=12000,tries=2){ for(let a=0;a<tries;a++){ try{ const r=await fetchWithTimeout(url,{},ms); if(r?.ok){ return await r.json(); } }catch{} await sleep(jitter(220)); } return null; }
-          const cache={ k:new Map(), depth:new Map(), bt:new Map(), conv:new Map(), binance:new Map() };
-          const TTL={ k: 60_000, depth: 8_000, bt: 5_000, conv: 60_000, binance: 30_000 };
+          const cache={ k:new Map(), depth:new Map(), bt:new Map(), conv:new Map(), bybit:new Map() };
+          const TTL={ k: 60_000, depth: 8_000, bt: 5_000, conv: 60_000, bybit: 30_000 };
 
           const getCached=(map,key,ttl)=>{ const e=map.get(key); return e && (Date.now()-e.ts<ttl)? e.v : null; };
           const setCached=(map,key,v)=>map.set(key,{ v, ts: Date.now() });
 
           // ---------- Config / ENV ----------
-          const TARGET_EXCHANGE = "bybit_perpetual";
-          const MARKET_TYPE     = "futures";
+          const TARGET_EXCHANGE = "bybit_linear";  // ← CHANGED for Bybit
+          const MARKET_TYPE     = "linear";    // Bybit calls USDT perps "linear"
           const MARGIN_MODE     = "isolated";
           const LEVERAGE        = 1;
           
-          // We keep MEXC env vars for now (unused in this version)
-          const EXCHANGE=(process.env.EXCHANGE||"binance").toLowerCase();
-          const MEXC_API_KEY = process.env.MEXC_API_KEY || "";
-          const MEXC_SECRET_KEY = process.env.MEXC_SECRET_KEY || "";
-          const MEXC_BASES=[process.env.MEXC_BASE,"https://api.mexc.com","https://www.mexc.com"].filter(Boolean);
+          const EXCHANGE=(process.env.EXCHANGE||"bybit").toLowerCase();
+          const BYBIT_API_KEY = process.env.BYBIT_API_KEY || "";
+          const BYBIT_SECRET_KEY = process.env.BYBIT_SECRET_KEY || "";
           
-          const BINANCE_FAPI = "https://api.bybit.com";
-          const BINANCE_SPOT = "https://api.bybit.com";
+          // Bybit Futures endpoints (public, no API key needed)
+          const BYBIT_API = process.env.BYBIT_BASE || "https://api.bybit.com";
           
           const MIN_TF_ALIGN=(Number(process.env.MIN_TF_ALIGN||"0.60"));
           let TF_WEIGHTS={}; try{ TF_WEIGHTS=JSON.parse(process.env.TF_WEIGHTS||"{}"); }catch{ TF_WEIGHTS={}; }
@@ -280,7 +278,7 @@ jobs:
           const EXP_LCB_MIN_BPS_BASE=Number(process.env.EXP_LCB_MIN_BPS||"12");
           const EMA_FAST=21, EMA_SLOW=50, ADX_P=14, ATR_P=14, K1M=240, K5M=300, K15M=300, K1H=300, K4H=300;
           const VWAP_5M_WIN=36, COST_BPS=Number(process.env.FEES_BPS||"10"), NOTIONAL=Number(process.env.NOTIONAL_USD||"300");
-          const DEPTH_LIMIT=Number(process.env.BINANCE_DEPTH_LIMIT||"20");
+          const DEPTH_LIMIT=Number(process.env.BYBIT_DEPTH_LIMIT||"50");  // ← CHANGED
           const OBI_TOPN=Number(process.env.OBI_TOPN||"12");
           const COOLDOWN_MS=3*60*60*1000, FLIP_GUARD_MS=30*60*1000;
           const DD_24H_LIMIT_BPS=-150, DD_PEAK_LIMIT_BPS=-300;
@@ -418,7 +416,7 @@ jobs:
               meta: {
                 origin: "github_actions_FAKE_FLUSH",
                 reason: "fake_flush",
-                exchange: "bybit_perpetual",
+                exchange: "bybit",
                 strategy: "fake-flush",
                 model_version: "0.0.0",
                 schema_version: "1",
@@ -449,7 +447,7 @@ jobs:
           log("🏁 FAKE FLUSH complete. Starting REAL processing...");
           // ========== FAKE FLUSH END ==========
 
-          // ---------- MEXC Adapter (REMOVED - NOT NEEDED FOR BINANCE) ----------
+          // ---------- MEXC Adapter (REMOVED - NOT NEEDED FOR BYBIT) ----------
           // Kept minimal for compatibility if needed later
           async function pickMexcBase(){ return "https://api.mexc.com"; }
           const BASE=await pickMexcBase();
@@ -468,173 +466,188 @@ jobs:
           const tfInd=()=>null;                               // Stub
           async function getConversionRate() { return 1; }    // Stub
 
-          // ---------- Binance Futures API Functions (Public, No Auth) ----------
+          // ---------- Bybit Futures API Functions (Public, No Auth) ----------
           
-          async function fetchBinanceFuturesSymbols() {
-            const cacheKey = "bybit_perp_symbols";
-            const cached = getCached(cache.binance, cacheKey, 300_000);
+          async function fetchBybitFuturesSymbols() {
+            const cacheKey = "bybit_futures_symbols";
+            const cached = getCached(cache.bybit, cacheKey, 300_000);
             if (cached) return cached;
-          
+            
             try {
-              const url = `${BINANCE_FAPI}/v5/market/instruments-info?category=linear`;
-              log("Fetching Bybit perpetual list from:", url);
-          
+              const url = `${BYBIT_API}/v5/market/instruments-info?category=linear&limit=1000`;
+              log("Fetching Bybit instruments-info from:", url);
+              
               const response = await fetchWithTimeout(url, {}, 20000);
               if (!response.ok) {
                 log(`Bybit instruments-info failed: ${response.status}`);
                 return [];
               }
-          
+              
               const data = await response.json();
-              if (!data || data.retCode !== 0 || !data.result?.list) {
-                log("Bybit instruments: unexpected response", JSON.stringify(data || {}).slice(0, 200));
+              if (data.retCode !== 0 || !data?.result?.list) {
+                log("Bybit instruments-info error:", data.retMsg || "no list");
                 return [];
               }
-          
+              
               const symbols = data.result.list
-                .filter(s =>
+                .filter(s => 
+                  s.contractType === "LinearPerpetual" && 
                   s.quoteCoin === "USDT" &&
-                  s.status === "Trading" &&
-                  s.contractType === "LinearPerpetual"
+                  s.status === "Trading"
                 )
                 .map(s => ({
-                  symbol: s.symbol,
-                  base: s.baseCoin,
-                  quote: s.quoteCoin,
-                  pricePrecision: s.priceScale || 2,
-                  quantityPrecision: s.qtyStep ? String(s.qtyStep).split('.')[1]?.length || 0 : 2
+                  symbol: s.symbol,           // e.g., "BTCUSDT"
+                  base: s.baseCoin,           // e.g., "BTC"
+                  quote: s.quoteCoin,         // "USDT"
+                  pricePrecision: parseInt(s.priceScale) || 2,
+                  quantityPrecision: parseInt(s.lotSizeFilter?.qtyStep?.split('.')[1]?.length) || 3
                 }));
-          
-              setCached(cache.binance, cacheKey, symbols);
-              log(`📊 Bybit Perp: ${symbols.length} USDT perpetuals found`);
+              
+              setCached(cache.bybit, cacheKey, symbols);
+              log(`📊 Bybit Futures: ${symbols.length} USDT perpetuals found`);
               return symbols;
             } catch (e) {
-              log("fetchBinanceFuturesSymbols (Bybit) error:", e?.message || e);
+              log("fetchBybitFuturesSymbols error:", e?.message || e);
               return [];
             }
           }
 
-          // Fetch 1h kline for price change % and volume
-          async function fetchBinance1hKline(symbol) {
+          async function fetchBybit1hKline(symbol) {
             const cacheKey = `bybit_1h_${symbol}`;
-            const cached = getCached(cache.binance, cacheKey, TTL.binance);
+            const cached = getCached(cache.bybit, cacheKey, TTL.bybit);
             if (cached) return cached;
-          
+            
             try {
-              const endTime = Date.now();
-              const startTime = endTime - 2 * 60 * 60 * 1000;
-              const url = `${BINANCE_FAPI}/v5/market/kline?category=linear&symbol=${symbol}&interval=60&start=${startTime}&end=${endTime}`;
+              // Bybit uses interval in minutes: 60 = 1 hour
+              const url = `${BYBIT_API}/v5/market/kline?category=linear&symbol=${symbol}&interval=60&limit=2`;
+              const response = await getJSON(url, 10000, 2);
               
-              const data = await getJSON(url, 10000, 2);
-              if (!data || data.retCode !== 0 || !data.result?.list || data.result.list.length < 2) {
-                return null;
-              }
-          
-              const curr = data.result.list[0];
-              const prev = data.result.list[1];
-          
-              const currClose = +curr[4];
+              if (!response || response.retCode !== 0 || !response?.result?.list?.length) return null;
+              
+              // IMPORTANT: Bybit returns klines in REVERSE order (newest first)
+              const list = response.result.list;
+              if (list.length < 2) return null;
+              
+              // list[0] = current candle, list[1] = previous candle
+              const curr = list[0];  // [startTime, open, high, low, close, volume, turnover]
+              const prev = list[1];
+              
               const prevClose = +prev[4];
+              const currClose = +curr[4];
               const currHigh = +curr[2];
               const currLow = +curr[3];
-              const volumeQuote = +curr[6];
-          
-              const priceChange1h = prevClose > 0 ? (currClose - prevClose) / prevClose : 0;
+              const currVolume = +curr[6];  // turnover = quote volume (USDT)
+              
+              const priceChange1h = prevClose > 0 ? ((currClose - prevClose) / prevClose) : 0;
               const vol1hPct = Math.abs(priceChange1h) * 100;
-          
+              
               const result = {
                 symbol,
                 prevClose,
                 currClose,
                 currHigh,
                 currLow,
-                volume1hUSD: volumeQuote,
+                volume1hUSD: currVolume,
                 priceChange1h,
                 vol1hPct,
                 ts: Date.now()
               };
-          
-              setCached(cache.binance, cacheKey, result);
+              
+              setCached(cache.bybit, cacheKey, result);
               return result;
             } catch (e) {
               return null;
             }
           }
 
-          // Fetch current funding rate
-          async function fetchBinanceFundingRate(symbol) {
+          async function fetchBybitFundingRate(symbol) {
             const cacheKey = `bybit_funding_${symbol}`;
-            const cached = getCached(cache.binance, cacheKey, TTL.binance);
+            const cached = getCached(cache.bybit, cacheKey, TTL.bybit);
             if (cached) return cached;
-          
+            
             try {
-              const url = `${BINANCE_FAPI}/v5/market/tickers?category=linear&symbol=${symbol}`;
-              const data = await getJSON(url, 10000, 2);
-              if (!data || data.retCode !== 0 || !data.result?.list?.[0]) return null;
-          
-              const t = data.result.list[0];
-          
+              // Bybit tickers endpoint includes funding rate
+              const url = `${BYBIT_API}/v5/market/tickers?category=linear&symbol=${symbol}`;
+              const response = await getJSON(url, 10000, 2);
+              
+              if (!response || response.retCode !== 0 || !response?.result?.list?.[0]) return null;
+              
+              const data = response.result.list[0];
+              
               const result = {
                 symbol,
-                markPrice: +t.markPrice || +t.lastPrice || 0,
-                indexPrice: +t.indexPrice || +t.lastPrice || 0,
-                lastFundingRate: +t.fundingRate || 0,
-                nextFundingTime: +t.nextFundingTime || 0,
+                markPrice: +data.markPrice || 0,
+                indexPrice: +data.indexPrice || 0,
+                lastFundingRate: +data.fundingRate || 0,  // Note: different field name
+                nextFundingTime: +data.nextFundingTime || 0,
                 ts: Date.now()
               };
-          
-              setCached(cache.binance, cacheKey, result);
+              
+              setCached(cache.bybit, cacheKey, result);
               return result;
             } catch (e) {
               return null;
             }
           }
-
-          // Fetch current Open Interest
-          async function fetchBinanceOI(symbol) {
+          
+          async function fetchBybitOI(symbol) {
             const cacheKey = `bybit_oi_${symbol}`;
-            const cached = getCached(cache.binance, cacheKey, TTL.binance);
+            const cached = getCached(cache.bybit, cacheKey, TTL.bybit);
             if (cached) return cached;
-          
+            
             try {
-              const url = `${BINANCE_FAPI}/v5/market/open-interest?category=linear&symbol=${symbol}&intervalTime=1h&limit=1`;
-              const data = await getJSON(url, 10000, 2);
-              if (!data || data.retCode !== 0 || !data.result?.list?.[0]) return null;
-          
+              const url = `${BYBIT_API}/v5/market/open-interest?category=linear&symbol=${symbol}&intervalTime=5min&limit=1`;
+              const response = await getJSON(url, 10000, 2);
+              
+              if (!response || response.retCode !== 0 || !response?.result?.list?.[0]) return null;
+              
+              const data = response.result.list[0];
+              
               const result = {
                 symbol,
-                openInterest: +data.result.list[0].openInterest || 0,
+                openInterest: +data.openInterest || 0,
                 ts: Date.now()
               };
-          
-              setCached(cache.binance, cacheKey, result);
+              
+              setCached(cache.bybit, cacheKey, result);
               return result;
             } catch (e) {
               return null;
             }
           }
-
-          // Fetch OI history for ΔOI calculation
-          async function fetchBinanceOIHist(symbol) {
+          
+          async function fetchBybitOIHist(symbol) {
             const cacheKey = `bybit_oi_hist_${symbol}`;
-            const cached = getCached(cache.binance, cacheKey, TTL.binance);
+            const cached = getCached(cache.bybit, cacheKey, TTL.bybit);
             if (cached) return cached;
-          
+            
             try {
-              const url = `${BINANCE_FAPI}/v5/market/open-interest?category=linear&symbol=${symbol}&intervalTime=1h&limit=3`;
-              const data = await getJSON(url, 10000, 2);
-              if (!data || data.retCode !== 0 || !data.result?.list || data.result.list.length < 2) return null;
-          
-              const curr = +data.result.list[0].openInterest || 0;
-              const prev1h = +data.result.list[1].openInterest || 0;
-              const prev2h = data.result.list[2] ? +data.result.list[2].openInterest : prev1h;
-          
-              const oiDelta1h = prev1h > 0 ? ((curr - prev1h) / prev1h) : 0;
-              const oiDelta2h = prev2h > 0 ? ((curr - prev2h) / prev2h) : 0;
-          
+              // Bybit: intervalTime=1h, limit=3 to get current + 2 previous hours
+              const url = `${BYBIT_API}/v5/market/open-interest?category=linear&symbol=${symbol}&intervalTime=1h&limit=3`;
+              const response = await getJSON(url, 10000, 2);
+              
+              if (!response || response.retCode !== 0 || !response?.result?.list?.length) return null;
+              
+              const list = response.result.list;
+              if (list.length < 2) return null;
+              
+              // Bybit returns newest first
+              // We need to get mark price to convert OI (in coins) to USD
+              const tickerUrl = `${BYBIT_API}/v5/market/tickers?category=linear&symbol=${symbol}`;
+              const tickerResp = await getJSON(tickerUrl, 8000, 1);
+              const markPrice = +tickerResp?.result?.list?.[0]?.markPrice || 1;
+              
+              // Convert OI from coins to USD value
+              const current = (+list[0]?.openInterest || 0) * markPrice;
+              const prev1h = (+list[1]?.openInterest || 0) * markPrice;
+              const prev2h = list[2] ? (+list[2]?.openInterest || 0) * markPrice : prev1h;
+              
+              const oiDelta1h = prev1h > 0 ? ((current - prev1h) / prev1h) : 0;
+              const oiDelta2h = prev2h > 0 ? ((current - prev2h) / prev2h) : 0;
+              
               const result = {
                 symbol,
-                currentOI_USD: curr,
+                currentOI_USD: current,
                 prev1hOI_USD: prev1h,
                 prev2hOI_USD: prev2h,
                 oiDelta1hPct: Math.abs(oiDelta1h) * 100,
@@ -642,73 +655,92 @@ jobs:
                 oiDelta1hRaw: oiDelta1h,
                 ts: Date.now()
               };
-          
-              setCached(cache.binance, cacheKey, result);
+              
+              setCached(cache.bybit, cacheKey, result);
               return result;
             } catch (e) {
               return null;
             }
           }
-
-          // Fetch spot price for basis calculation
-          async function fetchBinanceSpotPrice(symbol) {
-            const funding = await fetchBinanceFundingRate(symbol);
-            if (!funding) return null;
           
-            return {
-              symbol,
-              spotPrice: funding.indexPrice || funding.markPrice || 0,
-              ts: Date.now()
-            };
-          }
-
-          // NEW: Fetch Binance Futures orderbook
-          async function fetchBinanceFuturesDepth(symbol) {
-            const cacheKey = `bybit_depth_${symbol}`;
-            const cached = getCached(cache.binance, cacheKey, 5000);
+          async function fetchBybitSpotPrice(symbol) {
+            const cacheKey = `bybit_spot_${symbol}`;
+            const cached = getCached(cache.bybit, cacheKey, TTL.bybit);
             if (cached) return cached;
-          
+            
             try {
-              const url = `${BINANCE_FAPI}/v5/market/orderbook?category=linear&symbol=${symbol}&limit=${DEPTH_LIMIT}`;
-              const data = await getJSON(url, 8000, 2);
-              if (!data || data.retCode !== 0 || !data.result) return null;
-          
-              const result = {
-                bids: data.result.b,
-                asks: data.result.a,
-                ts: data.result.ts
-              };
-          
-              setCached(cache.binance, cacheKey, result);
-              return result;
-            } catch (e) {
-              return null;
-            }
-          }
-
-          // NEW: Fetch Binance Futures ticker (bid/ask)
-          async function fetchBinanceFuturesTicker(symbol) {
-            const cacheKey = `bybit_ticker_${symbol}`;
-            const cached = getCached(cache.binance, cacheKey, 5000);
-            if (cached) return cached;
-          
-            try {
-              const url = `${BINANCE_FAPI}/v5/market/tickers?category=linear&symbol=${symbol}`;
-              const data = await getJSON(url, 8000, 2);
-              if (!data || data.retCode !== 0 || !data.result?.list?.[0]) return null;
-          
-              const t = data.result.list[0];
-          
+              // Bybit spot ticker
+              const url = `${BYBIT_API}/v5/market/tickers?category=spot&symbol=${symbol}`;
+              const response = await getJSON(url, 8000, 2);
+              
+              if (!response || response.retCode !== 0 || !response?.result?.list?.[0]) return null;
+              
+              const data = response.result.list[0];
+              
               const result = {
                 symbol,
-                bid: +t.bid1Price || 0,
-                ask: +t.ask1Price || 0,
-                bidQty: +t.bid1Size || 0,
-                askQty: +t.ask1Size || 0,
+                spotPrice: +data.lastPrice || 0,
                 ts: Date.now()
               };
+              
+              setCached(cache.bybit, cacheKey, result);
+              return result;
+            } catch (e) {
+              return null;
+            }
+          }
           
-              setCached(cache.binance, cacheKey, result);
+          async function fetchBybitFuturesDepth(symbol) {
+            const cacheKey = `bybit_depth_${symbol}`;
+            const cached = getCached(cache.bybit, cacheKey, 5000);
+            if (cached) return cached;
+            
+            try {
+              const url = `${BYBIT_API}/v5/market/orderbook?category=linear&symbol=${symbol}&limit=${DEPTH_LIMIT}`;
+              const response = await getJSON(url, 8000, 2);
+              
+              if (!response || response.retCode !== 0 || !response?.result) return null;
+              
+              const result = response.result;
+              
+              // IMPORTANT: Bybit uses 'b' for bids, 'a' for asks - normalize to standard format
+              const normalized = {
+                bids: result.b || [],  // [[price, qty], ...]
+                asks: result.a || [],  // [[price, qty], ...]
+                ts: +result.ts || Date.now()
+              };
+              
+              setCached(cache.bybit, cacheKey, normalized);
+              return normalized;
+            } catch (e) {
+              return null;
+            }
+          }
+          
+          async function fetchBybitFuturesTicker(symbol) {
+            const cacheKey = `bybit_ticker_${symbol}`;
+            const cached = getCached(cache.bybit, cacheKey, 5000);
+            if (cached) return cached;
+            
+            try {
+              // Bybit tickers include bid/ask prices
+              const url = `${BYBIT_API}/v5/market/tickers?category=linear&symbol=${symbol}`;
+              const response = await getJSON(url, 8000, 2);
+              
+              if (!response || response.retCode !== 0 || !response?.result?.list?.[0]) return null;
+              
+              const data = response.result.list[0];
+              
+              const result = {
+                symbol,
+                bid: +data.bid1Price || 0,
+                ask: +data.ask1Price || 0,
+                bidQty: +data.bid1Size || 0,
+                askQty: +data.ask1Size || 0,
+                ts: Date.now()
+              };
+              
+              setCached(cache.bybit, cacheKey, result);
               return result;
             } catch (e) {
               return null;
@@ -729,10 +761,10 @@ jobs:
           async function fetchGoldenMetrics(symbol) {
             try {
               const [kline, funding, oiHist, spot] = await Promise.all([
-                fetchBinance1hKline(symbol),
-                fetchBinanceFundingRate(symbol),
-                fetchBinanceOIHist(symbol),
-                fetchBinanceSpotPrice(symbol)
+                fetchBybit1hKline(symbol),
+                fetchBybitFundingRate(symbol),
+                fetchBybitOIHist(symbol),
+                fetchBybitSpotPrice(symbol)
               ]);
               
               if (!kline) return null;
@@ -788,10 +820,10 @@ jobs:
           }
 
           // ---------- Heartbeat & Zombie detection ----------
-          // CHANGED: Disabled for Binance version (no signed API needed for reads)
+          // CHANGED: Disabled for Bybit version (no signed API needed for reads)
           async function heartbeatCheck(state){
             const res={ mismatches:0, zombies:0, details:[] };
-            // Binance version doesn't check open orders (would require API keys)
+            // Bybit version doesn't check open orders (would require API keys)
             return res;
           }
 
@@ -799,7 +831,7 @@ jobs:
           // ⚠️ THIS SECTION IS 100% UNCHANGED FROM ORIGINAL
           async function loadState(){
             const token=process.env.GIST_TOKEN, id=process.env.GIST_ID;
-            const init={ v:"bybit-hedge-7.0",
+            const init={ v:"bybit-hedge-7.0",  // ← CHANGED version string
               run_counter: 0,
               cooldown:{}, cooldown_side:{}, pending:[], equity:[], closed:[],
               mr_lockout:{}, sym_stats:{}, sym_stats_real:{}, calibCoeffs:{}, lastReconcileTs:0,
@@ -1497,7 +1529,7 @@ jobs:
             return { closedAudit, disagreements, tradesCsv };
           }
 
-          // CHANGED: Stub for candle sim (not needed for Binance-only)
+          // CHANGED: Stub for candle sim (not needed for Bybit-only)
           async function candleSimForIdea(p){
             return { status:"sim_disabled", closed:false };
           }
@@ -1576,32 +1608,32 @@ jobs:
             
             if(!todOK) reason="tod_gate";
 
-            // ========== DYNAMIC UNIVERSE FROM BINANCE FUTURES (NO VALIDATION NEEDED) ==========
+            // ========== DYNAMIC UNIVERSE FROM BYBIT FUTURES (NO VALIDATION NEEDED) ==========
             log("📡 Fetching Bybit Futures universe...");
-            const binanceSymbols = await fetchBinanceFuturesSymbols();
+            const bybitSymbols = await fetchBybitFuturesSymbols();
             
-            if (!binanceSymbols || binanceSymbols.length === 0) {
+            if (!bybitSymbols || bybitSymbols.length === 0) {
               log("❌ No Bybit Futures symbols found - cannot proceed");
               reason = "no_bybit_symbols";
               throw new Error("No Bybit Futures symbols available");
             }
             
-            log(`✅ Bybit Futures universe: ${binanceSymbols.length} USDT perpetuals`);
+            log(`✅ Bybit Futures universe: ${bybitSymbols.length} USDT perpetuals`);
 
             // DD/throttle
             const equityStats=(eq)=>{ const day=Date.now()-24*3600*1000; let pnl24=0,cum=0,peak=0,dd=0; for(const e of eq||[]){ if(e.ts_ms>=day) pnl24+=e.pnl_bps; cum+=e.pnl_bps; if(cum>peak) peak=cum; dd=Math.min(dd,cum-peak); } return { pnl24_bps:Math.round(pnl24), peak_dd_bps:Math.round(dd) }; };
             const { pnl24_bps, peak_dd_bps } = equityStats(state.equity);
             const throttle=(pnl24_bps<=DD_24H_LIMIT_BPS) || (peak_dd_bps<=DD_PEAK_LIMIT_BPS);
 
-            // ========== FETCH GOLDEN METRICS FOR ALL BINANCE SYMBOLS ==========
+            // ========== FETCH GOLDEN METRICS FOR ALL BYBIT SYMBOLS ==========
             log("📊 Fetching golden metrics for all symbols...");
             
-            const BATCH_SIZE = 15;
-            const BATCH_DELAY = 300;
+            const BATCH_SIZE = 10;
+            const BATCH_DELAY = 400;
             const allMetrics = [];
             
-            for (let i = 0; i < binanceSymbols.length; i += BATCH_SIZE) {
-              const batch = binanceSymbols.slice(i, i + BATCH_SIZE);
+            for (let i = 0; i < bybitSymbols.length; i += BATCH_SIZE) {
+              const batch = bybitSymbols.slice(i, i + BATCH_SIZE);
               
               const batchResults = await Promise.all(
                 batch.map(async (sym) => {
@@ -1633,12 +1665,12 @@ jobs:
               }
               
               // Rate limit pause between batches
-              if (i + BATCH_SIZE < binanceSymbols.length) {
+              if (i + BATCH_SIZE < bybitSymbols.length) {
                 await sleep(BATCH_DELAY);
               }
             }
             
-            log(`📈 Fetched metrics for ${allMetrics.length}/${binanceSymbols.length} symbols`);
+            log(`📈 Fetched metrics for ${allMetrics.length}/${bybitSymbols.length} symbols`);
 
             // ========== RANK BY HEDGE CONFIDENCE ==========
             // Sort by hedge confidence (highest first)
@@ -1655,18 +1687,18 @@ jobs:
             const MAX_DETAILED = 30;
             const topCandidates = allMetrics.slice(0, MAX_DETAILED);
             
-            // BTC regime detection (using Binance data)
+            // BTC regime detection (using Bybit data)
             const btcMetrics = allMetrics.find(m => m.symbol === "BTCUSDT");
             const btcUp1h = btcMetrics ? (btcMetrics.price_change_1h > 0) : true;
             
-            // ========== DETAILED REFINEMENT WITH BINANCE DATA ==========
+            // ========== DETAILED REFINEMENT WITH BYBIT DATA ==========
             const refined = [];
             
             for (const cand of topCandidates) {
               try {
-                // Fetch BINANCE execution quality data (depth, spread)
-                const ticker = await fetchBinanceFuturesTicker(cand.symbol);
-                const depth = await fetchBinanceFuturesDepth(cand.symbol);
+                // Fetch BYBIT execution quality data (depth, spread)
+                const ticker = await fetchBybitFuturesTicker(cand.symbol);
+                const depth = await fetchBybitFuturesDepth(cand.symbol);
                 
                 let spreadBps = 5; // Default
                 let mid = cand.mark_price;
@@ -1678,7 +1710,7 @@ jobs:
                   spreadBps = Math.round(((ask - bid) / mid) * 10000);
                 }
                 
-                // Calculate OBI and slip estimation using Binance depth
+                // Calculate OBI and slip estimation using Bybit depth
                 const obi = computeOBI(depth, OBI_TOPN);
                 
                 const sideSlipL = slipFromDepth(depth, mid, "long", NOTIONAL);
@@ -1934,7 +1966,7 @@ jobs:
               }
 
               const idea_id = uuidv4();
-              const client_order_id = mkClientOrderId("bnh");
+              const client_order_id = mkClientOrderId("byh");  // ← CHANGED prefix for Bybit Hedge
 
               const ttl = clamp(Math.round((x.hold_sec || 3600) + i * 12), TTL_MIN, TTL_MAX);
               const size_bps = (Number(process.env.FORCE_SIZE_BPS || "0") > 0)
@@ -1952,7 +1984,7 @@ jobs:
                 rank: i + 1,
 
                 // v2/futures intent
-                target_exchange: TARGET_EXCHANGE,
+                target_exchange: TARGET_EXCHANGE,  // "bybit_linear"
                 market_type: MARKET_TYPE,
                 margin_mode: MARGIN_MODE,
                 leverage: LEVERAGE,
@@ -2129,7 +2161,7 @@ jobs:
                   regime: p.regime,
 
                   decision_context: {
-                    source: "bybit_perpetual",
+                    source: "bybit_linear",
                     golden_metrics: p.hedge_metrics
                   },
 
@@ -2182,15 +2214,15 @@ jobs:
             const meta = {
               origin: "github_actions",
               reason,
-              exchange: "bybit_perpetual",
-              execution_exchange: "bybit_perpetual",
+              exchange: "bybit_linear",  // ← CHANGED
+              execution_exchange: "bybit_linear",  // ← CHANGED
               strategy: STRATEGY_NAME,
               model_version: MODEL_VERSION,
               schema_version: SCHEMA_VERSION,
               git_sha: GIT_SHA,
               config_hash: CONFIG_HASH,
               counts: {
-                bybit_universe: binanceSymbols.length,
+                bybit_universe: bybitSymbols.length,
                 metrics_fetched: allMetrics.length,
                 refined: refined.length,
                 selected: picks.length
@@ -2215,7 +2247,7 @@ jobs:
               },
               extras: {
                 v2_ideas: picksV2,
-                features_requested: ["maker_join", "post_only", "futures", "hedge_trading", "bybit_perpetual"]
+                features_requested: ["maker_join", "post_only", "futures", "hedge_trading", "bybit_execution"]
               }
             };
 
@@ -2251,9 +2283,9 @@ jobs:
                 meta: {
                   origin: "github_actions_v2_bybit",
                   strategy: "bybit-hedge-ultimate",
-                  data_source: "bybit_perpetual",
+                  data_source: "bybit_linear",
                   golden_metrics: true,
-                  execution: "bybit_perpetual"
+                  execution: "bybit_linear"
                 },
                 top_n: picksV2.length,
                 ideas: picksV2
@@ -2283,7 +2315,7 @@ jobs:
                 origin: "github_actions",
                 reason,
                 error: (e?.message || String(e)).slice(0, 220),
-                exchange: "bybit_perpetual"
+                exchange: "bybit_linear"  // ← CHANGED
               },
               top_n: 0,
               ideas: []
@@ -2326,7 +2358,7 @@ jobs:
 
             # 2) Minimal POST with 0 ideas
             now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-            payload='{"ts":"'"${now}"'","mode":"normal","source":"external_pusher","meta":{"origin":"github_actions","reason":"fallback_node_error","exchange":"bybit_perpetual"},"top_n":0,"ideas":[]}'
+            payload='{"ts":"'"${now}"'","mode":"normal","source":"external_pusher","meta":{"origin":"github_actions","reason":"fallback_node_error","exchange":"bybit_linear"},"top_n":0,"ideas":[]}'
             echo "[gha] pushing 0 ideas to ${raw_push_url}"
             mkdir -p /tmp
             : > /tmp/push_resp.txt
