@@ -300,7 +300,7 @@ jobs:
           const MR_ADX_MAX_DEFAULT=20, MR_BREAKOUT_DC_N=Number(process.env.MR_BREAKOUT_DC_N||"120");
           const MR_BREAKOUT_RET15_ATR=Number(process.env.MR_BREAKOUT_RET15_ATR||"1.5"), MR_LOCKOUT_SEC=Number(process.env.MR_LOCKOUT_SEC||"1800");
           const MAX_COST_BPS_HARD=Number(process.env.MAX_COST_BPS_HARD||"15");
-          const MIN_VOL_1H_USD=Number(process.env.MIN_VOL_1H_USD||"5000000"), DEPTH_1P_MIN_USD=Number(process.env.DEPTH_1P_MIN_USD||"200000");
+          const MIN_VOL_1H_USD=Number(process.env.MIN_VOL_1H_USD||"5000000"), DEPTH_1P_MIN_USD=Number(process.env.DEPTH_1P_MIN_USD||"50000");
           const NO_LONG_DOWN_ENABLE=(process.env.NO_LONG_DOWN_ENABLE||"true").toLowerCase()==="true";
           const LONG_DOWN_RSI_CUTOFF=Number(process.env.LONG_DOWN_RSI_CUTOFF||"40");
           const LONG_MR_DIVERGENCE_REQ=(process.env.LONG_MR_DIVERGENCE_REQ||"true").toLowerCase()==="true";
