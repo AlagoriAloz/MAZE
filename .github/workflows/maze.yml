@@ -1606,13 +1606,30 @@ jobs:
                       return null; // Skip cooldown symbols
                     }
                     
-                    const metrics = await fetchGoldenMetrics(sym.symbol);
+                    const [metrics, ticker] = await Promise.all([
+                      fetchGoldenMetrics(sym.symbol),
+                      fetchBinanceFuturesTicker(sym.symbol)
+                    ]);
                     if (!metrics) return null;
+                    
+                    // Calculate spread
+                    let spread_bps = 999;
+                    if (ticker?.bid && ticker?.ask && ticker.bid > 0) {
+                      const mid = (ticker.bid + ticker.ask) / 2;
+                      spread_bps = Math.round(((ticker.ask - ticker.bid) / mid) * 10000);
+                    }
+                    
+                    const hedge_confidence = calculateHedgeConfidence(metrics);
+                    
+                    // Rank score: prioritize high vol1h, penalize high spread
+                    const rank_score = (metrics.vol_1h_pct || 0) * Math.max(0.1, 1 - spread_bps / 50);
                     
                     return {
                       ...sym,
                       ...metrics,
-                      hedge_confidence: calculateHedgeConfidence(metrics)
+                      spread_bps,
+                      hedge_confidence,
+                      rank_score
                     };
                   } catch (e) {
                     return null;
@@ -1636,13 +1653,13 @@ jobs:
 
             // ========== RANK BY HEDGE CONFIDENCE ==========
             // Sort by hedge confidence (highest first)
-            allMetrics.sort((a, b) => b.hedge_confidence - a.hedge_confidence);
+            allMetrics.sort((a, b) => b.rank_score - a.rank_score);
             
             // Log top 10 for debugging
-            log("🏆 Top 10 by hedge confidence:");
+            log("🏆 Top 10 by rank (vol1h + spread):");
             for (let i = 0; i < Math.min(10, allMetrics.length); i++) {
               const m = allMetrics[i];
-              log(`   ${i+1}. ${m.symbol} conf=${m.hedge_confidence} vol1h=${m.vol_1h_pct.toFixed(2)}% fund=${(m.funding_rate*100).toFixed(4)}% oi_delta=${m.oi_delta_pct.toFixed(1)}% vol=$${Math.round(m.volume_1h_usd/1e6)}M`);
+              log(`   ${i+1}. ${m.symbol} score=${m.rank_score.toFixed(2)} vol1h=${m.vol_1h_pct.toFixed(2)}% spread=${m.spread_bps}bps fund=${(m.funding_rate*100).toFixed(4)}%`);
             }
 
             // ========== SELECT TOP CANDIDATES FOR DETAILED ANALYSIS ==========
@@ -1662,7 +1679,7 @@ jobs:
                 const ticker = await fetchBinanceFuturesTicker(cand.symbol);
                 const depth = await fetchBinanceFuturesDepth(cand.symbol);
                 
-                let spreadBps = 5; // Default
+                let spreadBps = cand.spread_bps || 5; // Use pre-fetched spread
                 let mid = cand.mark_price;
                 
                 if (ticker?.bid && ticker?.ask) {
