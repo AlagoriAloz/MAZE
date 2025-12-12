@@ -243,7 +243,7 @@ jobs:
           const BYBIT_SECRET_KEY = process.env.BYBIT_SECRET_KEY || "";
           
           // Bybit Futures endpoints (public, no API key needed)
-          const BYBIT_API = process.env.BYBIT_BASE || "https://api.bybit.com";
+          const BYBIT_API = process.env.BYBIT_BASE || "https://amesterdam.onrender.com/bybit";
           
           const MIN_TF_ALIGN=(Number(process.env.MIN_TF_ALIGN||"0.60"));
           let TF_WEIGHTS={}; try{ TF_WEIGHTS=JSON.parse(process.env.TF_WEIGHTS||"{}"); }catch{ TF_WEIGHTS={}; }
