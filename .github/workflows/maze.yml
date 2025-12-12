@@ -313,6 +313,8 @@ jobs:
           const IDEAL_FUNDING_RATE = 0.0004;  // |funding| >= 0.04%
           const IDEAL_OI_DELTA_PCT = 10.0;    // |ΔOI 1-2h| >= 10%
           const IDEAL_VOLUME_1H_USD = 60_000_000; // 1h volume >= $60M
+          // Minimum volume to qualify for analysis
+          const MIN_VOLUME_QUALIFY_USD = 1_000_000; // $1M minimum
 
           // Confidence weights for hedge trading (sum = 1.0)
           const WEIGHT_VOL_1H = 0.40;      // 1h volatility - HIGHEST priority
@@ -1638,29 +1640,38 @@ jobs:
             
             log(`📈 Fetched metrics for ${allMetrics.length}/${binanceSymbols.length} symbols`);
 
-            // ========== FILTER MINIMUM VOLUME & RANK BY HEDGE CONFIDENCE ==========
-            const MIN_VOL_1H_DISPLAY = 1_000_000; // $1M minimum
+            // ========== FILTER BY MINIMUM VOLUME ==========
+            const qualified = allMetrics.filter(m => m.volume_1h_usd >= MIN_VOLUME_QUALIFY_USD);
+            log(`🎯 Volume filter: ${qualified.length}/${allMetrics.length} symbols have volume >= $${MIN_VOLUME_QUALIFY_USD / 1_000_000}M`);
 
-            const beforeFilter = allMetrics.length;
-            const qualified = allMetrics.filter(m => (m.volume_1h_usd || 0) >= MIN_VOL_1H_DISPLAY);
-            log(`📊 Volume gate: ${qualified.length}/${beforeFilter} symbols have 1h vol >= $1M`);
-
-            allMetrics.length = 0;
-            allMetrics.push(...qualified);
-
-            // Sort by hedge confidence (highest first)
-            allMetrics.sort((a, b) => b.hedge_confidence - a.hedge_confidence);
+            // ========== RANK BY HEDGE CONFIDENCE ==========
+            // Sort qualified symbols by hedge confidence (highest first)
+            qualified.sort((a, b) => b.hedge_confidence - a.hedge_confidence);
 
             // Log top 30 for debugging
-            log("🏆 Top 30 by hedge confidence (vol >= $1M):");
-            for (let i = 0; i < Math.min(30, allMetrics.length); i++) {
-              const m = allMetrics[i];
-              log(`   ${i+1}. ${m.symbol} conf=${m.hedge_confidence} vol1h=${m.vol_1h_pct.toFixed(2)}% fund=${(m.funding_rate*100).toFixed(4)}% oi_delta=${m.oi_delta_pct.toFixed(1)}% vol=$${Math.round(m.volume_1h_usd/1e6)}M`);
+            log("🏆 Top 30 Candidates by Hedge Confidence:");
+            log("───────────────────────────────────────────────────────────────");
+            for (let i = 0; i < Math.min(30, qualified.length); i++) {
+              const m = qualified[i];
+              log(`   ${String(i+1).padStart(2)}. ${m.symbol.padEnd(12)} conf=${String(m.hedge_confidence).padStart(3)} | vol1h=${m.vol_1h_pct.toFixed(2).padStart(5)}% | fund=${(m.funding_rate*100).toFixed(4).padStart(7)}% | oi_Δ=${m.oi_delta_pct.toFixed(1).padStart(5)}% | vol=$${Math.round(m.volume_1h_usd/1e6)}M`);
             }
+            log("───────────────────────────────────────────────────────────────");
 
             // ========== SELECT TOP CANDIDATES FOR DETAILED ANALYSIS ==========
             const MAX_DETAILED = 30;
-            const topCandidates = allMetrics.slice(0, MAX_DETAILED);
+            const topCandidates = qualified.slice(0, MAX_DETAILED);
+
+            // Track escape reasons
+            const escapeReasons = {
+              spread: [],
+              depth: [],
+              cooldown: [],
+              negative_ev: [],
+              slip: [],
+              no_side: [],
+              error: []
+            };
+            const analysisLog = []; // Detailed log for each candidate
             
             // BTC regime detection (using Binance data)
             const btcMetrics = allMetrics.find(m => m.symbol === "BTCUSDT");
@@ -1668,12 +1679,41 @@ jobs:
             
             // ========== DETAILED REFINEMENT WITH BINANCE DATA ==========
             const refined = [];
-            let refineIdx = 0;
+            
+            log("📊 DETAILED ANALYSIS OF TOP 30:");
+            log("═══════════════════════════════════════════════════════════════");
 
-            for (const cand of topCandidates) {
-              refineIdx++;
+            for (let idx = 0; idx < topCandidates.length; idx++) {
+              const cand = topCandidates[idx];
+              const rank = idx + 1;
+              
+              // Initialize analysis entry
+              const analysis = {
+                rank,
+                symbol: cand.symbol,
+                hedge_confidence: cand.hedge_confidence,
+                vol_1h_pct: cand.vol_1h_pct,
+                funding_rate: cand.funding_rate,
+                oi_delta_pct: cand.oi_delta_pct,
+                volume_1h_usd: cand.volume_1h_usd,
+                status: "pending",
+                escape_reason: null,
+                selection_reason: null,
+                details: {}
+              };
+              
               try {
-                log(`\n[${refineIdx}/${topCandidates.length}] 🔍 Analyzing ${cand.symbol}...`);
+                // Check cooldown first
+                const lastTs = state.cooldown?.[cand.base] || 0;
+                if (lastTs && (Date.now() - lastTs) < COOLDOWN_MS) {
+                  const remainingMin = Math.round((COOLDOWN_MS - (Date.now() - lastTs)) / 60000);
+                  analysis.status = "escaped";
+                  analysis.escape_reason = `Cooldown active (${remainingMin}min remaining)`;
+                  escapeReasons.cooldown.push(cand.symbol);
+                  analysisLog.push(analysis);
+                  log(`❌ #${rank} ${cand.symbol.padEnd(12)} ESCAPED → Cooldown (${remainingMin}min left)`);
+                  continue;
+                }
                 
                 // Fetch BINANCE execution quality data (depth, spread)
                 const ticker = await fetchBinanceFuturesTicker(cand.symbol);
@@ -1688,9 +1728,17 @@ jobs:
                   mid = (bid + ask) / 2;
                   spreadBps = Math.round(((ask - bid) / mid) * 10000);
                 }
-                log(`  📊 Spread: ${spreadBps}bps | Mid: $${mid?.toFixed(4)}`);
+                
+                analysis.details.spread_bps = spreadBps;
+                analysis.details.mid = mid;
+                
+                // Check spread limit
                 if (spreadBps > MAX_SPREAD_BPS) {
-                  log(`  ❌ SKIP: Spread ${spreadBps}bps > max ${MAX_SPREAD_BPS}bps`);
+                  analysis.status = "escaped";
+                  analysis.escape_reason = `Spread too wide (${spreadBps}bps > ${MAX_SPREAD_BPS}bps max)`;
+                  escapeReasons.spread.push(cand.symbol);
+                  analysisLog.push(analysis);
+                  log(`❌ #${rank} ${cand.symbol.padEnd(12)} ESCAPED → Spread ${spreadBps}bps > ${MAX_SPREAD_BPS}bps limit`);
                   continue;
                 }
                 
@@ -1704,18 +1752,34 @@ jobs:
                 
                 const costLong = COST_BPS + slipL;
                 const costShort = COST_BPS + slipS;
-                log(`  💰 Cost: Long=${costLong}bps Short=${costShort}bps | Max=${MAX_COST_BPS_HARD}bps`);
-                if (costLong > MAX_COST_BPS_HARD && costShort > MAX_COST_BPS_HARD) {
-                  log(`  ❌ SKIP: Both sides exceed max cost`);
-                  continue;
-                }
                 
                 // Depth quality
                 const d1 = depthWithinPctUSD(depth, mid, 0.01);
                 const depth1pUSD = (d1.asksUSD || 0) + (d1.bidsUSD || 0);
-                log(`  📚 Depth @1%: $${Math.round(depth1pUSD/1000)}k | Min: $${Math.round(DEPTH_1P_MIN_USD/1000)}k`);
+                
+                analysis.details.depth1p_usd = depth1pUSD;
+                analysis.details.obi = obi;
+                analysis.details.slip_long = slipL;
+                analysis.details.slip_short = slipS;
+                
+                // Check depth limit
                 if (depth1pUSD < DEPTH_1P_MIN_USD) {
-                  log(`  ❌ SKIP: Insufficient depth`);
+                  analysis.status = "escaped";
+                  analysis.escape_reason = `Depth too low ($${Math.round(depth1pUSD/1000)}K < $${DEPTH_1P_MIN_USD/1000}K min)`;
+                  escapeReasons.depth.push(cand.symbol);
+                  analysisLog.push(analysis);
+                  log(`❌ #${rank} ${cand.symbol.padEnd(12)} ESCAPED → Depth $${Math.round(depth1pUSD/1000)}K < $${DEPTH_1P_MIN_USD/1000}K min`);
+                  continue;
+                }
+                
+                // Check slip limit
+                const minSlip = Math.min(slipL, slipS);
+                if (minSlip > MAX_COST_BPS_HARD) {
+                  analysis.status = "escaped";
+                  analysis.escape_reason = `Slip too high (${minSlip}bps > ${MAX_COST_BPS_HARD}bps max)`;
+                  escapeReasons.slip.push(cand.symbol);
+                  analysisLog.push(analysis);
+                  log(`❌ #${rank} ${cand.symbol.padEnd(12)} ESCAPED → Slip ${minSlip}bps > ${MAX_COST_BPS_HARD}bps max`);
                   continue;
                 }
                 
@@ -1805,13 +1869,36 @@ jobs:
                 const chosen = candLong && candShort
                   ? (candLong.exp_lcb_bps >= candShort.exp_lcb_bps ? candLong : candShort)
                   : (candLong || candShort || null);
-
+                
                 if (!chosen) {
-                  log(`  ❌ SKIP: No viable side (both failed filters)`);
+                  analysis.status = "escaped";
+                  analysis.escape_reason = "No valid side (direction restricted)";
+                  escapeReasons.no_side.push(cand.symbol);
+                  analysisLog.push(analysis);
+                  log(`❌ #${rank} ${cand.symbol.padEnd(12)} ESCAPED → No valid side available`);
                   continue;
                 }
-
-                log(`  ✅ Side: ${chosen.side.toUpperCase()} | EV: ${chosen.exp_lcb_bps}bps | TP/SL: ${chosen.tp_bps}/${chosen.sl_bps}bps`);
+                
+                analysis.details.chosen_side = chosen.side;
+                analysis.details.ev_bps = chosen.ev_bps;
+                
+                // Check for negative EV
+                if (chosen.ev_bps < 0) {
+                  analysis.status = "escaped";
+                  analysis.escape_reason = `Negative EV (${chosen.ev_bps}bps after costs)`;
+                  escapeReasons.negative_ev.push(cand.symbol);
+                  analysisLog.push(analysis);
+                  log(`❌ #${rank} ${cand.symbol.padEnd(12)} ESCAPED → Negative EV: ${chosen.ev_bps}bps (${chosen.side})`);
+                  continue;
+                }
+                
+                // ========== PASSED ALL FILTERS - CANDIDATE QUALIFIES ==========
+                analysis.status = "qualified";
+                analysis.details.spread_bps = spreadBps;
+                analysis.details.depth1p_usd = depth1pUSD;
+                analysisLog.push(analysis);
+                
+                log(`✅ #${rank} ${cand.symbol.padEnd(12)} QUALIFIED → ${chosen.side.toUpperCase()} | EV=${chosen.ev_bps}bps | spread=${spreadBps}bps | depth=$${Math.round(depth1pUSD/1000)}K`);
                 
                 // ========== FINAL CONFIDENCE CALCULATION ==========
                 // Base from golden 4 metrics (already 0-100)
@@ -1893,57 +1980,141 @@ jobs:
                   hedge_confidence: cand.hedge_confidence,
                   reasons,
                   
+                  // Analysis tracking
+                  analysis_rank: rank,
+                  
                   ret5: [] // Simplified
                 });
-                log(`  ✅ ACCEPTED | Final confidence: ${clamp(finalConf, 0, 100)} | Regime: ${chosen.regime}`);
                 
               } catch (e) {
-                log(`  ⚠️  ERROR: ${e?.message || e}`);
+                analysis.status = "escaped";
+                analysis.escape_reason = `Error: ${e?.message || e}`;
+                escapeReasons.error.push(cand.symbol);
+                analysisLog.push(analysis);
+                log(`❌ #${rank} ${cand.symbol.padEnd(12)} ESCAPED → Error: ${(e?.message || e).slice(0, 50)}`);
               }
             }
+
+            log("═══════════════════════════════════════════════════════════════");
+            log(`📊 Analysis Complete: ${refined.length} qualified / ${topCandidates.length} analyzed`);
             
-            log(`🔍 Refined ${refined.length} candidates with execution quality analysis`);
+            log(`🔍 Qualified ${refined.length} candidates from ${topCandidates.length} analyzed`);
 
             // ========== FINAL SELECTION ==========
             refined.sort((a, b) => b.confidence - a.confidence);
-            
+
             const TARGET_TOP_N = Math.max(1, TOP_N || 3);
-            
+
             const selected = [];
+            const selectionReasons = [];
+            const diversitySkipped = [];
+
+            log("");
+            log("🎯 FINAL SELECTION PROCESS:");
+            log("───────────────────────────────────────────────────────────────");
+
             for (const cand of refined) {
-              if (selected.length >= TARGET_TOP_N) break;
+              if (selected.length >= TARGET_TOP_N) {
+                // Log why remaining qualified candidates weren't selected
+                diversitySkipped.push({
+                  symbol: cand.symbol,
+                  reason: "Quota filled (already have " + TARGET_TOP_N + " ideas)"
+                });
+                continue;
+              }
               
               // Simple diversity: don't pick same base twice
               const alreadyHaveBase = selected.some(s => s.base === cand.base);
-              if (!alreadyHaveBase) {
-                selected.push(cand);
+              if (alreadyHaveBase) {
+                diversitySkipped.push({
+                  symbol: cand.symbol,
+                  reason: `Diversity skip (${cand.base} already selected)`
+                });
+                log(`   ⏭️  ${cand.symbol.padEnd(12)} SKIPPED → ${cand.base} already in selection`);
+                continue;
               }
+              
+              // Determine selection reason
+              let selectionReason = "";
+              if (selected.length === 0) {
+                selectionReason = "Highest confidence score";
+              } else if (selected.length === 1) {
+                selectionReason = "Second best confidence + diversity";
+              } else {
+                selectionReason = `#${selected.length + 1} best confidence + diversity`;
+              }
+              
+              selected.push(cand);
+              selectionReasons.push({ symbol: cand.symbol, reason: selectionReason });
+              
+              log(`   ✅ ${cand.symbol.padEnd(12)} SELECTED → ${selectionReason}`);
+              log(`      conf=${cand.confidence} | ${cand.side.toUpperCase()} | EV=${cand.exp_lcb_bps}bps | spread=${cand.spread_bps}bps | depth=$${Math.round(cand.depth1p_usd/1000)}K`);
             }
-            
-            // Fill remaining slots if needed
-            if (selected.length < TARGET_TOP_N) {
+
+            // Fill remaining slots if needed (relaxed diversity)
+            if (selected.length < TARGET_TOP_N && refined.length > selected.length) {
+              log("");
+              log("   📌 Filling remaining slots (relaxed diversity):");
               const haveSyms = new Set(selected.map(s => s.symbol));
               for (const c of refined) {
                 if (selected.length >= TARGET_TOP_N) break;
                 if (!haveSyms.has(c.symbol)) {
                   selected.push(c);
                   haveSyms.add(c.symbol);
+                  selectionReasons.push({ symbol: c.symbol, reason: "Fill slot (relaxed diversity)" });
+                  log(`   ✅ ${c.symbol.padEnd(12)} SELECTED → Fill slot (relaxed diversity)`);
                 }
               }
             }
-            
+
+            log("───────────────────────────────────────────────────────────────");
             log(`✅ Selected ${selected.length} ideas for pushing`);
 
+            // ========== ESCAPE SUMMARY ==========
+            log("");
+            log("📈 PIPELINE SUMMARY:");
+            log("═══════════════════════════════════════════════════════════════");
+            log(`   Universe:     ${binanceSymbols.length} Binance Futures symbols`);
+            log(`   Metrics OK:   ${allMetrics.length} symbols with valid data`);
+            log(`   Volume ≥$1M:  ${qualified.length} symbols qualified`);
+            log(`   Analyzed:     ${topCandidates.length} top candidates`);
+            log(`   Qualified:    ${refined.length} passed all filters`);
+            log(`   Selected:     ${selected.length} final picks`);
+            log(`   + Flipped:    ${selected.length} (total ${selected.length * 2} ideas)`);
+            log("");
+            log("   ESCAPE REASONS:");
+            log(`      Cooldown:     ${escapeReasons.cooldown.length} symbols`);
+            log(`      Spread:       ${escapeReasons.spread.length} symbols`);
+            log(`      Depth:        ${escapeReasons.depth.length} symbols`);
+            log(`      Slip:         ${escapeReasons.slip.length} symbols`);
+            log(`      Negative EV:  ${escapeReasons.negative_ev.length} symbols`);
+            log(`      No Side:      ${escapeReasons.no_side.length} symbols`);
+            log(`      Error:        ${escapeReasons.error.length} symbols`);
+            log(`      Diversity:    ${diversitySkipped.length} symbols (qualified but not picked)`);
+            log("═══════════════════════════════════════════════════════════════");
+            log("");
+
             // ========== GENERATE FLIPPED IDEAS ==========
-            const flipped = selected.map(orig => ({
-              ...orig,
-              side: orig.side === "long" ? "short" : "long",
-              flipped: true,
-              original_idea_id: orig.symbol + "_" + orig.side
-            }));
-            
+            log("🔄 GENERATING FLIPPED IDEAS:");
+            log("───────────────────────────────────────────────────────────────");
+
+            const flipped = selected.map(orig => {
+              const flippedSide = orig.side === "long" ? "short" : "long";
+              log(`   ${orig.symbol}: ${orig.side.toUpperCase()} → ${flippedSide.toUpperCase()} (flipped)`);
+              return {
+                ...orig,
+                side: flippedSide,
+                flipped: true,
+                original_idea_id: orig.symbol + "_" + orig.side
+              };
+            });
+
             const selectedWithFlipped = [...selected, ...flipped];
 
+            log("───────────────────────────────────────────────────────────────");
+            log(`📦 Final Ideas: ${selected.length} original + ${flipped.length} flipped = ${selectedWithFlipped.length} total`);
+            log("");
+            
             // Risk weights via softmax of EV
             const wEv = softmax(selectedWithFlipped.map(x => x.exp_lcb_bps), 20);
             // Build full v2 ideas
@@ -2363,7 +2534,7 @@ jobs:
             mkdir -p /tmp
             : > /tmp/push_resp.txt
             http_code=$(curl -g -sS -o /tmp/push_resp.txt -w "%{http_code}" -X POST \
-              -H "Content-Type: application/json" \
+              -H "Content-Type": "application/json" \
               -H "Authorization: Bearer ${PUSH_TOKEN}" \
               --data-raw "${payload}" \
               --max-time 12 \
