@@ -245,8 +245,8 @@ jobs:
           const MEXC_BASES=[process.env.MEXC_BASE,"https://api.mexc.com","https://www.mexc.com"].filter(Boolean);
           
           // Binance Futures endpoints (public, no API key needed)
-          const BINANCE_FAPI = " https://amesterdam-1.onrender.com/binance";
-          const BINANCE_SPOT = " https://amesterdam-1.onrender.com/binance";
+          const BINANCE_FAPI = "https://amesterdam-1.onrender.com/binance";
+          const BINANCE_SPOT = "https://amesterdam-1.onrender.com/binance";
           
           const MIN_TF_ALIGN=(Number(process.env.MIN_TF_ALIGN||"0.60"));
           let TF_WEIGHTS={}; try{ TF_WEIGHTS=JSON.parse(process.env.TF_WEIGHTS||"{}"); }catch{ TF_WEIGHTS={}; }
