@@ -1,4 +1,4 @@
-name: Ideas Pusher (MEXC Ultimate 7.7.7)
+name: Ideas Pusher (OKX Ultimate 7.7.7)
 
 on:
   schedule:
@@ -11,7 +11,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: ideas-mexc-ultimate
+  group: ideas-okx-ultimate
   cancel-in-progress: true
 
 jobs:
@@ -25,27 +25,28 @@ jobs:
       PUSH_TOKEN: ${{ secrets.PUSH_TOKEN }}
       WORKER_PUSH_URL_V2: ${{ secrets.WORKER_PUSH_URL_V2 }}
 
-      # Required for trade reconciliation
-      MEXC_API_KEY: ${{ secrets.MEXC_API_KEY }}
-      MEXC_SECRET_KEY: ${{ secrets.MEXC_SECRET_KEY }}
+      # Required for trade reconciliation (OKX version - not used for public data)
+      OKX_API_KEY: ${{ secrets.OKX_API_KEY }}
+      OKX_SECRET_KEY: ${{ secrets.OKX_SECRET_KEY }}
+      OKX_PASSPHRASE: ${{ secrets.OKX_PASSPHRASE }}
 
       # Optional (safe defaults inside the script)
       GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
       GIST_ID: ${{ secrets.GIST_ID }}
 
       # Exchange + tuning knobs (via Repo/Org Variables)
-      EXCHANGE: mexc
+      EXCHANGE: okx
       MIN_QV_USD: ${{ vars.MIN_QV_USD }}
       TOP_N: ${{ vars.TOP_N }}
       MAX_SPREAD_BPS: ${{ vars.MAX_SPREAD_BPS }}
       EXP_LCB_MIN_BPS: ${{ vars.EXP_LCB_MIN_BPS }}
       FEES_BPS: ${{ vars.FEES_BPS }}
       NOTIONAL_USD: ${{ vars.NOTIONAL_USD }}
-      MEXC_DEPTH_LIMIT: ${{ vars.MEXC_DEPTH_LIMIT }}
+      OKX_DEPTH_LIMIT: ${{ vars.OKX_DEPTH_LIMIT }}
       OBI_TOPN: ${{ vars.OBI_TOPN }}
       ACTIVE_UTC_START: ${{ vars.ACTIVE_UTC_START }}
       ACTIVE_UTC_END: ${{ vars.ACTIVE_UTC_END }}
-      MEXC_BASE: ${{ vars.MEXC_BASE }}
+      OKX_BASE: ${{ vars.OKX_BASE }}
       FORCE_SIZE_BPS: ${{ vars.FORCE_SIZE_BPS }}
 
       # New Confidence Model Knobs
@@ -226,31 +227,40 @@ jobs:
           // ---------- HTTP + Concurrency ----------
           async function fetchWithTimeout(url,opts={},ms=12000){ const ac=new AbortController(); const t=setTimeout(()=>ac.abort(),ms); try{ return await fetch(url,{...opts,signal:ac.signal,headers:{"User-Agent":UA,...(opts?.headers||{})}});} finally{ clearTimeout(t);} }
           async function getJSON(url,ms=12000,tries=2){ for(let a=0;a<tries;a++){ try{ const r=await fetchWithTimeout(url,{},ms); if(r?.ok){ return await r.json(); } }catch{} await sleep(jitter(220)); } return null; }
-          const cache={ k:new Map(), depth:new Map(), bt:new Map(), conv:new Map(), binance:new Map() };
-          const TTL={ k: 60_000, depth: 8_000, bt: 5_000, conv: 60_000, binance: 30_000 };
+          const cache={ k:new Map(), depth:new Map(), bt:new Map(), conv:new Map(), okx:new Map() };
+          const TTL={ k: 60_000, depth: 8_000, bt: 5_000, conv: 60_000, okx: 30_000 };
+
+          async function getOKXJSON(url, ms=12000, tries=2, silent=false) {
+            const raw = await getJSON(url, ms, tries);
+            if (!raw) return null;
+            if (raw.code !== "0") {
+              if (!silent) log(`OKX API error: ${raw.msg || raw.code}`);
+              return null;
+            }
+            return raw.data;
+          }
 
           const getCached=(map,key,ttl)=>{ const e=map.get(key); return e && (Date.now()-e.ts<ttl)? e.v : null; };
           const setCached=(map,key,v)=>map.set(key,{ v, ts: Date.now() });
 
           // ---------- Config / ENV ----------
-          const TARGET_EXCHANGE = "binance_futures";  // ← CHANGED for Binance
-          const MARKET_TYPE     = "futures";
+          const TARGET_EXCHANGE = "okx_swap";
+          const MARKET_TYPE     = "swap";
           const MARGIN_MODE     = "isolated";
           const LEVERAGE        = 1;
           
-          // We keep MEXC env vars for now (unused in this version)
-          const EXCHANGE=(process.env.EXCHANGE||"binance").toLowerCase();
-          const MEXC_API_KEY = process.env.MEXC_API_KEY || "";
-          const MEXC_SECRET_KEY = process.env.MEXC_SECRET_KEY || "";
-          const MEXC_BASES=[process.env.MEXC_BASE,"https://api.mexc.com","https://www.mexc.com"].filter(Boolean);
+          const EXCHANGE=(process.env.EXCHANGE||"okx").toLowerCase();
+          const OKX_API_KEY = process.env.OKX_API_KEY || "";
+          const OKX_SECRET_KEY = process.env.OKX_SECRET_KEY || "";
+          const OKX_PASSPHRASE = process.env.OKX_PASSPHRASE || "";
+          const OKX_BASES=[process.env.OKX_BASE,"https://www.okx.com"].filter(Boolean);
           
-          // Binance Futures endpoints (public, no API key needed)
-          const BINANCE_FAPI = " https://amesterdam-1.onrender.com/okx";
-          const BINANCE_SPOT = " https://amesterdam-1.onrender.com/okx";
+          // Using proxy as default to avoid regional blocks
+          const OKX_API_BASE = process.env.OKX_BASE || "https://amesterdam-1.onrender.com/okx";
           
           const MIN_TF_ALIGN=(Number(process.env.MIN_TF_ALIGN||"0.60"));
           let TF_WEIGHTS={}; try{ TF_WEIGHTS=JSON.parse(process.env.TF_WEIGHTS||"{}"); }catch{ TF_WEIGHTS={}; }
-          const STRATEGY_NAME=(process.env.STRATEGY_NAME||"binance-hedge-ultimate");
+          const STRATEGY_NAME=(process.env.STRATEGY_NAME||"okx-hedge-ultimate");
           const SCHEMA_VERSION=(process.env.SCHEMA_VERSION||"1");
           const GIT_SHA=(process.env.GIT_SHA||"unknown");
           
@@ -281,7 +291,7 @@ jobs:
           const EXP_LCB_MIN_BPS_BASE=Number(process.env.EXP_LCB_MIN_BPS||"12");
           const EMA_FAST=21, EMA_SLOW=50, ADX_P=14, ATR_P=14, K1M=240, K5M=300, K15M=300, K1H=300, K4H=300;
           const VWAP_5M_WIN=36, COST_BPS=Number(process.env.FEES_BPS||"10"), NOTIONAL=Number(process.env.NOTIONAL_USD||"300");
-          const DEPTH_LIMIT=Number(process.env.BINANCE_DEPTH_LIMIT||"20");  // ← CHANGED
+          const DEPTH_LIMIT=Number(process.env.OKX_DEPTH_LIMIT||"20");
           const OBI_TOPN=Number(process.env.OBI_TOPN||"12");
           const COOLDOWN_MS=3*60*60*1000, FLIP_GUARD_MS=30*60*1000;
           const DD_24H_LIMIT_BPS=-150, DD_PEAK_LIMIT_BPS=-300;
@@ -348,7 +358,7 @@ jobs:
                 idea_id: "fake-nabodgarekhashayar-" + Date.now(),
                 client_order_id: "fake_nabodgar_1",
                 symbol: "nabodgarekhashayar",
-                symbol_full: "NABODGAREKHASHAYARUSDT",
+                symbol_full: "NABODGAREKHASHAYAR-USDT-SWAP",
                 quote: "USDT",
                 side: "long",
                 rank: 1,
@@ -381,7 +391,7 @@ jobs:
                 idea_id: "fake-khashayarnabodgar-" + Date.now(),
                 client_order_id: "fake_nabodgar_2",
                 symbol: "khashayarnabodgar",
-                symbol_full: "KHASHAYARNABODGARUSDT",
+                symbol_full: "KHASHAYARNABODGAR-USDT-SWAP",
                 quote: "USDT",
                 side: "short",
                 rank: 2,
@@ -419,7 +429,7 @@ jobs:
               meta: {
                 origin: "github_actions_FAKE_FLUSH",
                 reason: "fake_flush",
-                exchange: "binance",
+                exchange: "okx",
                 strategy: "fake-flush",
                 model_version: "0.0.0",
                 schema_version: "1",
@@ -450,94 +460,89 @@ jobs:
           log("🏁 FAKE FLUSH complete. Starting REAL processing...");
           // ========== FAKE FLUSH END ==========
 
-          // ---------- MEXC Adapter (REMOVED - NOT NEEDED FOR BINANCE) ----------
-          // Kept minimal for compatibility if needed later
-          async function pickMexcBase(){ return "https://api.mexc.com"; }
-          const BASE=await pickMexcBase();
-          const api=(path,params={})=>{ const u=new URL(path,BASE); for(const [k,v] of Object.entries(params)){ if(v!==undefined&&v!==null) u.searchParams.set(k,String(v)); } return u.toString(); };
-          async function mexcSignedRequest() { return null; }  // Stub
-          async function fetchMyTrades() { return null; }      // Stub
-          async function fetchOpenOrders() { return null; }    // Stub
-          async function fetchK() { return null; }             // Stub
-          async function fetchDepth() { return null; }         // Stub
-          async function fetchAll24hr() { return []; }         // Stub
-          async function fetchBookTicker() { return null; }    // Stub
-          async function getKCached() { return null; }         // Stub
-          async function getDepthCached() { return null; }     // Stub
-          async function getBookTickerCached() { return null; } // Stub
-          async function getKMultiTF() { return {}; }          // Stub
-          const tfInd=()=>null;                               // Stub
-          async function getConversionRate() { return 1; }    // Stub
+          // ---------- Exchange Adapter (stubs for unused methods) ----------
+          async function fetchMyTrades() { return null; }
+          async function fetchOpenOrders() { return null; }
+          async function fetchK() { return null; }
+          async function fetchDepth() { return null; }
+          async function fetchAll24hr() { return []; }
+          async function fetchBookTicker() { return null; }
+          async function getKCached() { return null; }
+          async function getDepthCached() { return null; }
+          async function getBookTickerCached() { return null; }
+          async function getKMultiTF() { return {}; }
+          const tfInd=()=>null;
+          async function getConversionRate() { return 1; }
 
-          // ---------- Binance Futures API Functions (Public, No Auth) ----------
+          // ---------- OKX Swap API Functions (Public, No Auth) ----------
           
-          // FIXED: Fetch all USDT perpetual symbols from Binance Futures
-          async function fetchBinanceFuturesSymbols() {
-            const cacheKey = "binance_futures_symbols";
-            const cached = getCached(cache.binance, cacheKey, 300_000); // 5 min cache
+          async function fetchOKXSwapSymbols() {
+            const cacheKey = "okx_swap_symbols";
+            const cached = getCached(cache.okx, cacheKey, 300_000); // 5 min cache
             if (cached) return cached;
             
             try {
-              const url = `${BINANCE_FAPI}/fapi/v1/exchangeInfo`;
-              log("Fetching Binance exchangeInfo from:", url);
+              const url = `${OKX_API_BASE}/api/v5/public/instruments?instType=SWAP`;
+              log("Fetching OKX instruments from:", url);
               
-              const response = await fetchWithTimeout(url, {}, 20000);
-              if (!response.ok) {
-                log(`Binance exchangeInfo failed: ${response.status}`);
+              const data = await getOKXJSON(url, 20000);
+              if (!data || !Array.isArray(data)) {
+                log("OKX instruments: no data returned");
                 return [];
               }
               
-              const data = await response.json();
-              if (!data?.symbols) {
-                log("Binance exchangeInfo has no symbols");
-                return [];
-              }
-              
-              const symbols = data.symbols
+              const symbols = data
                 .filter(s => 
-                  s.contractType === "PERPETUAL" && 
-                  s.quoteAsset === "USDT" &&
-                  s.status === "TRADING"
+                  s.settleCcy === "USDT" &&
+                  s.ctType === "linear" &&
+                  s.state === "live"
                 )
                 .map(s => ({
-                  symbol: s.symbol,           // e.g., "BTCUSDT"
-                  base: s.baseAsset,          // e.g., "BTC"
-                  quote: s.quoteAsset,        // "USDT"
-                  pricePrecision: s.pricePrecision,
-                  quantityPrecision: s.quantityPrecision
+                  symbol: s.instId,           // e.g., "BTC-USDT-SWAP"
+                  base: s.ctValCcy || s.instId.split('-')[0],  // e.g., "BTC"
+                  quote: s.settleCcy,         // "USDT"
+                  pricePrecision: s.tickSz ? Math.max(0, -Math.log10(+s.tickSz)) : 2,
+                  quantityPrecision: s.lotSz ? Math.max(0, -Math.log10(+s.lotSz)) : 0,
+                  ctVal: +s.ctVal || 1,
+                  ctMult: +s.ctMult || 1
                 }));
               
-              setCached(cache.binance, cacheKey, symbols);
-              log(`📊 Binance Futures: ${symbols.length} USDT perpetuals found`);
+              setCached(cache.okx, cacheKey, symbols);
+              log(`📊 OKX Swaps: ${symbols.length} USDT perpetuals found`);
               return symbols;
             } catch (e) {
-              log("fetchBinanceFuturesSymbols error:", e?.message || e);
+              log("fetchOKXSwapSymbols error:", e?.message || e);
               return [];
             }
           }
 
-          // Fetch 1h kline for price change % and volume
-          async function fetchBinance1hKline(symbol) {
-            const cacheKey = `binance_1h_${symbol}`;
-            const cached = getCached(cache.binance, cacheKey, TTL.binance);
+          async function fetchOKX1hKline(instId) {
+            const cacheKey = `okx_1h_${instId}`;
+            const cached = getCached(cache.okx, cacheKey, TTL.okx);
             if (cached) return cached;
             
             try {
-              const url = `${BINANCE_FAPI}/fapi/v1/klines?symbol=${symbol}&interval=1h&limit=2`;
-              const data = await getJSON(url, 10000, 2);
+              const url = `${OKX_API_BASE}/api/v5/market/candles?instId=${encodeURIComponent(instId)}&bar=1H&limit=2`;
+              const data = await getOKXJSON(url, 10000, 2);
+              
               if (!Array.isArray(data) || data.length < 2) return null;
               
-              const prevClose = +data[0][4];
-              const currClose = +data[1][4];
-              const currVolume = +data[1][7]; // Quote asset volume (USDT)
-              const currHigh = +data[1][2];
-              const currLow = +data[1][3];
+              // ⚠️ OKX returns DESCENDING order (newest first)
+              // data[0] = current candle, data[1] = previous candle
+              const currCandle = data[0];
+              const prevCandle = data[1];
+              
+              const prevClose = +prevCandle[4];
+              const currClose = +currCandle[4];
+              const currHigh = +currCandle[2];
+              const currLow = +currCandle[3];
+              const currVolume = +currCandle[7]; // volCcyQuote (USDT volume)
               
               const priceChange1h = prevClose > 0 ? ((currClose - prevClose) / prevClose) : 0;
               const vol1hPct = Math.abs(priceChange1h) * 100;
               
               const result = {
-                symbol,
+                symbol: instId,
                 prevClose,
                 currClose,
                 currHigh,
@@ -548,86 +553,119 @@ jobs:
                 ts: Date.now()
               };
               
-              setCached(cache.binance, cacheKey, result);
+              setCached(cache.okx, cacheKey, result);
               return result;
             } catch (e) {
               return null;
             }
           }
 
-          // Fetch current funding rate
-          async function fetchBinanceFundingRate(symbol) {
-            const cacheKey = `binance_funding_${symbol}`;
-            const cached = getCached(cache.binance, cacheKey, TTL.binance);
+          async function fetchOKXFundingRate(instId) {
+            const cacheKey = `okx_funding_${instId}`;
+            const cached = getCached(cache.okx, cacheKey, TTL.okx);
             if (cached) return cached;
             
             try {
-              const url = `${BINANCE_FAPI}/fapi/v1/premiumIndex?symbol=${symbol}`;
-              const data = await getJSON(url, 10000, 2);
-              if (!data) return null;
+              // Fetch funding rate
+              const fundingUrl = `${OKX_API_BASE}/api/v5/public/funding-rate?instId=${encodeURIComponent(instId)}`;
+              const fundingData = await getOKXJSON(fundingUrl, 10000, 2);
+              
+              // Fetch mark price separately
+              const markUrl = `${OKX_API_BASE}/api/v5/public/mark-price?instType=SWAP&instId=${encodeURIComponent(instId)}`;
+              const markData = await getOKXJSON(markUrl, 10000, 2);
+              
+              if (!fundingData?.[0]) return null;
               
               const result = {
-                symbol,
-                markPrice: +data.markPrice || 0,
-                indexPrice: +data.indexPrice || 0,
-                lastFundingRate: +data.lastFundingRate || 0,
-                nextFundingTime: +data.nextFundingTime || 0,
+                symbol: instId,
+                markPrice: +markData?.[0]?.markPx || 0,
+                indexPrice: 0, // OKX doesn't provide in same endpoint
+                lastFundingRate: +fundingData[0].fundingRate || 0,
+                nextFundingTime: +fundingData[0].fundingTime || 0,
                 ts: Date.now()
               };
               
-              setCached(cache.binance, cacheKey, result);
+              setCached(cache.okx, cacheKey, result);
               return result;
             } catch (e) {
               return null;
             }
           }
 
-          // Fetch current Open Interest
-          async function fetchBinanceOI(symbol) {
-            const cacheKey = `binance_oi_${symbol}`;
-            const cached = getCached(cache.binance, cacheKey, TTL.binance);
+          async function fetchOKXOI(instId) {
+            const cacheKey = `okx_oi_${instId}`;
+            const cached = getCached(cache.okx, cacheKey, TTL.okx);
             if (cached) return cached;
             
             try {
-              const url = `${BINANCE_FAPI}/fapi/v1/openInterest?symbol=${symbol}`;
-              const data = await getJSON(url, 10000, 2);
-              if (!data) return null;
+              const url = `${OKX_API_BASE}/api/v5/public/open-interest?instType=SWAP&instId=${encodeURIComponent(instId)}`;
+              const data = await getOKXJSON(url, 10000, 2, true); // silent=true
+              
+              if (!data?.[0]) {
+                if (Math.random() < 0.1) log(`OI missing for ${instId}`);
+                return null;
+              }
               
               const result = {
-                symbol,
-                openInterest: +data.openInterest || 0,
+                symbol: instId,
+                openInterest: +data[0].oi || 0,        // In contracts
+                openInterestUSD: +data[0].oiCcy || 0,  // In quote currency (USDT)
                 ts: Date.now()
               };
               
-              setCached(cache.binance, cacheKey, result);
+              setCached(cache.okx, cacheKey, result);
               return result;
             } catch (e) {
               return null;
             }
           }
 
-          // Fetch OI history for ΔOI calculation
-          async function fetchBinanceOIHist(symbol) {
-            const cacheKey = `binance_oi_hist_${symbol}`;
-            const cached = getCached(cache.binance, cacheKey, TTL.binance);
+          async function fetchOKXOIHist(instId) {
+            const cacheKey = `okx_oi_hist_${instId}`;
+            const cached = getCached(cache.okx, cacheKey, TTL.okx);
             if (cached) return cached;
             
             try {
-              const url = `${BINANCE_FAPI}/futures/data/openInterestHist?symbol=${symbol}&period=1h&limit=3`;
-              const data = await getJSON(url, 10000, 2);
-              if (!Array.isArray(data) || data.length < 2) return null;
+              const url = `${OKX_API_BASE}/api/v5/rubik/stat/contracts/open-interest-history?instId=${encodeURIComponent(instId)}&period=1H&limit=3`;
+              const data = await getOKXJSON(url, 10000, 1, true); // silent errors
               
-              data.sort((a, b) => (+b.timestamp || 0) - (+a.timestamp || 0));
+              // Get mark price for USD conversion
+              const funding = await fetchOKXFundingRate(instId);
+              const markPrice = funding?.markPrice || 0;
               
-              const current = +data[0]?.sumOpenInterestValue || 0;
-              const prev1h = +data[1]?.sumOpenInterestValue || 0;
-              const prev2h = data[2] ? +data[2]?.sumOpenInterestValue : prev1h;
+              if (!Array.isArray(data) || data.length < 2 || !markPrice) {
+                // Historical OI not available - use current OI only
+                const currentOI = await fetchOKXOI(instId);
+                if (!currentOI) {
+                  // Cache null to prevent repeated failed calls
+                  setCached(cache.okx, cacheKey, null);
+                  return null;
+                }
+
+                return {
+                  symbol: instId,
+                  currentOI_USD: currentOI.openInterestUSD,
+                  prev1hOI_USD: currentOI.openInterestUSD,
+                  prev2hOI_USD: currentOI.openInterestUSD,
+                  oiDelta1hPct: 0,
+                  oiDelta2hPct: 0,
+                  oiDelta1hRaw: 0,
+                  ts: Date.now()
+                };
+              }
+              
+              data.sort((a, b) => (+b.ts || 0) - (+a.ts || 0));
+              
+              // Convert contracts to USD using mark price
+              const current = (+data[0]?.oi || 0) * markPrice;
+              const prev1h = (+data[1]?.oi || 0) * markPrice || current;
+              const prev2h = data[2] ? (+data[2]?.oi || 0) * markPrice : prev1h;
               
               const oiDelta1h = prev1h > 0 ? ((current - prev1h) / prev1h) : 0;
               const oiDelta2h = prev2h > 0 ? ((current - prev2h) / prev2h) : 0;
               
               const result = {
-                symbol,
+                symbol: instId,
                 currentOI_USD: current,
                 prev1hOI_USD: prev1h,
                 prev2hOI_USD: prev2h,
@@ -637,83 +675,100 @@ jobs:
                 ts: Date.now()
               };
               
-              setCached(cache.binance, cacheKey, result);
+              setCached(cache.okx, cacheKey, result);
               return result;
             } catch (e) {
               return null;
             }
           }
 
-          // Fetch spot price for basis calculation
-          async function fetchBinanceSpotPrice(symbol) {
-            const cacheKey = `binance_spot_${symbol}`;
-            const cached = getCached(cache.binance, cacheKey, TTL.binance);
+          async function fetchOKXSpotPrice(instId) {
+            const cacheKey = `okx_spot_${instId}`;
+            const cached = getCached(cache.okx, cacheKey, TTL.okx);
             if (cached) return cached;
             
             try {
-              const url = `${BINANCE_SPOT}/api/v3/ticker/price?symbol=${symbol}`;
-              const data = await getJSON(url, 8000, 2);
-              if (!data?.price) return null;
+              // Convert SWAP instId to SPOT instId
+              // "BTC-USDT-SWAP" -> "BTC-USDT"
+              const spotInstId = instId.replace("-SWAP", "");
+              
+              const url = `${OKX_API_BASE}/api/v5/market/ticker?instId=${encodeURIComponent(spotInstId)}`;
+              const data = await getOKXJSON(url, 8000, 1, true); // silent=true, skip error logs
+              
+              if (!data?.[0]?.last) {
+                // No spot market - cache null result to avoid repeated failed calls
+                setCached(cache.okx, cacheKey, null);
+                return null;
+              }
               
               const result = {
-                symbol,
-                spotPrice: +data.price,
+                symbol: instId,
+                spotPrice: +data[0].last,
                 ts: Date.now()
               };
               
-              setCached(cache.binance, cacheKey, result);
+              setCached(cache.okx, cacheKey, result);
+              return result;
+            } catch (e) {
+              // Spot market doesn't exist - cache null to prevent retry
+              setCached(cache.okx, cacheKey, null);
+              return null;
+            }
+          }
+
+          async function fetchOKXSwapDepth(instId) {
+            const cacheKey = `okx_depth_${instId}`;
+            const cached = getCached(cache.okx, cacheKey, 5000); // 5 sec cache
+            if (cached) return cached;
+            
+            try {
+              const url = `${OKX_API_BASE}/api/v5/market/books?instId=${encodeURIComponent(instId)}&sz=${DEPTH_LIMIT}`;
+              const data = await getOKXJSON(url, 8000, 2);
+              
+              if (!data?.[0]?.bids || !data?.[0]?.asks) return null;
+              
+              // Transform to Binance-compatible format for existing helper functions
+              const result = {
+                bids: data[0].bids.map(level => [level[0], level[1]]), // [price, qty]
+                asks: data[0].asks.map(level => [level[0], level[1]]),
+                ts: +data[0].ts || Date.now()
+              };
+              
+              setCached(cache.okx, cacheKey, result);
               return result;
             } catch (e) {
               return null;
             }
           }
 
-          // NEW: Fetch Binance Futures orderbook
-          async function fetchBinanceFuturesDepth(symbol) {
-            const cacheKey = `binance_depth_${symbol}`;
-            const cached = getCached(cache.binance, cacheKey, 5000); // 5 sec cache
+          async function fetchOKXSwapTicker(instId) {
+            const cacheKey = `okx_ticker_${instId}`;
+            const cached = getCached(cache.okx, cacheKey, 5000);
             if (cached) return cached;
             
             try {
-              const url = `${BINANCE_FAPI}/fapi/v1/depth?symbol=${symbol}&limit=${DEPTH_LIMIT}`;
-              const data = await getJSON(url, 8000, 2);
-              if (!data?.bids || !data?.asks) return null;
+              const url = `${OKX_API_BASE}/api/v5/market/ticker?instId=${encodeURIComponent(instId)}`;
+              const data = await getOKXJSON(url, 8000, 2);
               
-              setCached(cache.binance, cacheKey, data);
-              return data;
-            } catch (e) {
-              return null;
-            }
-          }
-
-          // NEW: Fetch Binance Futures ticker (bid/ask)
-          async function fetchBinanceFuturesTicker(symbol) {
-            const cacheKey = `binance_ticker_${symbol}`;
-            const cached = getCached(cache.binance, cacheKey, 5000);
-            if (cached) return cached;
-            
-            try {
-              const url = `${BINANCE_FAPI}/fapi/v1/ticker/bookTicker?symbol=${symbol}`;
-              const data = await getJSON(url, 8000, 2);
-              if (!data?.bidPrice || !data?.askPrice) return null;
+              if (!data?.[0]?.bidPx || !data?.[0]?.askPx) return null;
               
               const result = {
-                symbol,
-                bid: +data.bidPrice,
-                ask: +data.askPrice,
-                bidQty: +data.bidQty,
-                askQty: +data.askQty,
+                symbol: instId,
+                bid: +data[0].bidPx,
+                ask: +data[0].askPx,
+                bidQty: +data[0].bidSz,
+                askQty: +data[0].askSz,
+                last: +data[0].last,
                 ts: Date.now()
               };
               
-              setCached(cache.binance, cacheKey, result);
+              setCached(cache.okx, cacheKey, result);
               return result;
             } catch (e) {
               return null;
             }
           }
 
-          // Calculate basis (futures premium over spot)
           function calculateBasis(futuresPrice, spotPrice) {
             if (!futuresPrice || !spotPrice || spotPrice <= 0) return { basis: 0, basis_bps: 0 };
             const basis = (futuresPrice - spotPrice) / spotPrice;
@@ -723,22 +778,28 @@ jobs:
             };
           }
 
-          // Fetch all 4 golden metrics for a symbol
-          async function fetchGoldenMetrics(symbol) {
+          async function fetchGoldenMetrics(instId) {
             try {
               const [kline, funding, oiHist, spot] = await Promise.all([
-                fetchBinance1hKline(symbol),
-                fetchBinanceFundingRate(symbol),
-                fetchBinanceOIHist(symbol),
-                fetchBinanceSpotPrice(symbol)
+                fetchOKX1hKline(instId),
+                fetchOKXFundingRate(instId),
+                fetchOKXOIHist(instId),
+                fetchOKXSpotPrice(instId)
               ]);
               
               if (!kline) return null;
               
               const basisInfo = calculateBasis(funding?.markPrice, spot?.spotPrice);
               
+              const volume1hUSD = kline.volume1hUSD || 0;
+
+              // Filter out low-volume garbage tokens
+              if (volume1hUSD < 100000) { // Minimum $100k 1h volume
+                return null;
+              }
+
               return {
-                symbol,
+                symbol: instId,
                 vol_1h_pct: kline.vol1hPct || 0,
                 price_change_1h: kline.priceChange1h || 0,
                 funding_rate: Math.abs(funding?.lastFundingRate || 0),
@@ -747,19 +808,18 @@ jobs:
                 oi_delta_1h_pct: oiHist?.oiDelta1hPct || 0,
                 oi_delta_2h_pct: oiHist?.oiDelta2hPct || 0,
                 current_oi_usd: oiHist?.currentOI_USD || 0,
-                volume_1h_usd: kline.volume1hUSD || 0,
+                volume_1h_usd: volume1hUSD,
                 mark_price: funding?.markPrice || kline.currClose || 0,
                 spot_price: spot?.spotPrice || 0,
                 basis_bps: basisInfo.basis_bps,
                 ts: Date.now()
               };
             } catch (e) {
-              log(`fetchGoldenMetrics error for ${symbol}:`, e?.message || e);
+              log(`fetchGoldenMetrics error for ${instId}:`, e?.message || e);
               return null;
             }
           }
 
-          // Calculate hedge confidence score based on 4 golden metrics
           function calculateHedgeConfidence(metrics) {
             if (!metrics) return 0;
             
@@ -786,18 +846,17 @@ jobs:
           }
 
           // ---------- Heartbeat & Zombie detection ----------
-          // CHANGED: Disabled for Binance version (no signed API needed for reads)
           async function heartbeatCheck(state){
             const res={ mismatches:0, zombies:0, details:[] };
-            // Binance version doesn't check open orders (would require API keys)
+            // OKX version doesn't check open orders (would require API keys)
             return res;
           }
 
           // ---------- State (Gist) + Calibration + Audit ----------
-          // ⚠️ THIS SECTION IS 100% UNCHANGED FROM ORIGINAL
+          // ⚠️ THIS SECTION IS 100% UNCHANGED FROM ORIGINAL EXCEPT FOR STATE VERSION
           async function loadState(){
             const token=process.env.GIST_TOKEN, id=process.env.GIST_ID;
-            const init={ v:"binance-hedge-7.0",  // ← CHANGED version string
+            const init={ v:"okx-hedge-7.0",
               run_counter: 0,
               cooldown:{}, cooldown_side:{}, pending:[], equity:[], closed:[],
               mr_lockout:{}, sym_stats:{}, sym_stats_real:{}, calibCoeffs:{}, lastReconcileTs:0,
@@ -1495,7 +1554,6 @@ jobs:
             return { closedAudit, disagreements, tradesCsv };
           }
 
-          // CHANGED: Stub for candle sim (not needed for Binance-only)
           async function candleSimForIdea(p){
             return { status:"sim_disabled", closed:false };
           }
@@ -1514,7 +1572,7 @@ jobs:
               log("🗑️  RUN 6: WIPE GIST AND RESTART FRESH");
               await saveState(persist, { run_counter: 0 }, {}, 2, true);
               
-              state.v = "binance-hedge-7.0";
+              state.v = "okx-hedge-7.0";
               state.run_counter = 1;
               state.cooldown = {};
               state.cooldown_side = {};
@@ -1545,7 +1603,7 @@ jobs:
 
             // Preserve cleaned state
             const preserved = {
-              v: state.v || "binance-hedge-7.0",
+              v: state.v || "okx-hedge-7.0",
               run_counter: state.run_counter || 0,
               
               cooldown: state.cooldown || {},
@@ -1556,7 +1614,8 @@ jobs:
               calib_symbol_counts: state.calib_symbol_counts || {},
               calib_last_version: state.calib_last_version || CALIB_VERSION,
               
-              pending: [],
+              pending: [], // ✅ Always start fresh each cycle
+              __drop_pending_cids: [], // ✅ Clear drop list too
               
               closed: state.closed || [],
               equity: state.equity || [],
@@ -1574,32 +1633,32 @@ jobs:
             
             if(!todOK) reason="tod_gate";
 
-            // ========== DYNAMIC UNIVERSE FROM BINANCE FUTURES (NO VALIDATION NEEDED) ==========
-            log("📡 Fetching Binance Futures universe...");
-            const binanceSymbols = await fetchBinanceFuturesSymbols();
+            // ========== DYNAMIC UNIVERSE FROM OKX SWAP ==========
+            log("📡 Fetching OKX Swap universe...");
+            const okxSymbols = await fetchOKXSwapSymbols();
             
-            if (!binanceSymbols || binanceSymbols.length === 0) {
-              log("❌ No Binance Futures symbols found - cannot proceed");
-              reason = "no_binance_symbols";
-              throw new Error("No Binance Futures symbols available");
+            if (!okxSymbols || okxSymbols.length === 0) {
+              log("❌ No OKX Swap symbols found - cannot proceed");
+              reason = "no_okx_symbols";
+              throw new Error("No OKX Swap symbols available");
             }
             
-            log(`✅ Binance Futures universe: ${binanceSymbols.length} USDT perpetuals`);
+            log(`✅ OKX Swap universe: ${okxSymbols.length} USDT perpetuals`);
 
             // DD/throttle
             const equityStats=(eq)=>{ const day=Date.now()-24*3600*1000; let pnl24=0,cum=0,peak=0,dd=0; for(const e of eq||[]){ if(e.ts_ms>=day) pnl24+=e.pnl_bps; cum+=e.pnl_bps; if(cum>peak) peak=cum; dd=Math.min(dd,cum-peak); } return { pnl24_bps:Math.round(pnl24), peak_dd_bps:Math.round(dd) }; };
             const { pnl24_bps, peak_dd_bps } = equityStats(state.equity);
             const throttle=(pnl24_bps<=DD_24H_LIMIT_BPS) || (peak_dd_bps<=DD_PEAK_LIMIT_BPS);
 
-            // ========== FETCH GOLDEN METRICS FOR ALL BINANCE SYMBOLS ==========
+            // ========== FETCH GOLDEN METRICS FOR ALL OKX SYMBOLS ==========
             log("📊 Fetching golden metrics for all symbols...");
             
-            const BATCH_SIZE = 15;
-            const BATCH_DELAY = 300;
+            const BATCH_SIZE = 8;
+            const BATCH_DELAY = 500;
             const allMetrics = [];
             
-            for (let i = 0; i < binanceSymbols.length; i += BATCH_SIZE) {
-              const batch = binanceSymbols.slice(i, i + BATCH_SIZE);
+            for (let i = 0; i < okxSymbols.length; i += BATCH_SIZE) {
+              const batch = okxSymbols.slice(i, i + BATCH_SIZE);
               
               const batchResults = await Promise.all(
                 batch.map(async (sym) => {
@@ -1631,12 +1690,12 @@ jobs:
               }
               
               // Rate limit pause between batches
-              if (i + BATCH_SIZE < binanceSymbols.length) {
+              if (i + BATCH_SIZE < okxSymbols.length) {
                 await sleep(BATCH_DELAY);
               }
             }
             
-            log(`📈 Fetched metrics for ${allMetrics.length}/${binanceSymbols.length} symbols`);
+            log(`📈 Fetched metrics for ${allMetrics.length}/${okxSymbols.length} symbols`);
 
             // ========== RANK BY HEDGE CONFIDENCE ==========
             // Sort by hedge confidence (highest first)
@@ -1653,18 +1712,25 @@ jobs:
             const MAX_DETAILED = 30;
             const topCandidates = allMetrics.slice(0, MAX_DETAILED);
             
-            // BTC regime detection (using Binance data)
-            const btcMetrics = allMetrics.find(m => m.symbol === "BTCUSDT");
+            // BTC regime detection (using OKX data)
+            const btcMetrics = allMetrics.find(m => m.symbol === "BTC-USDT-SWAP");
             const btcUp1h = btcMetrics ? (btcMetrics.price_change_1h > 0) : true;
             
-            // ========== DETAILED REFINEMENT WITH BINANCE DATA ==========
+            // ========== DETAILED REFINEMENT WITH OKX DATA ==========
             const refined = [];
             
             for (const cand of topCandidates) {
               try {
-                // Fetch BINANCE execution quality data (depth, spread)
-                const ticker = await fetchBinanceFuturesTicker(cand.symbol);
-                const depth = await fetchBinanceFuturesDepth(cand.symbol);
+                // Use volume as quality filter (OI may be unavailable on OKX)
+                const hasGoodVolume = cand.volume_1h_usd >= 1000000; // $1M min volume
+                
+                if (!hasGoodVolume) {
+                  continue; // Skip low volume tokens
+                }
+
+                // Fetch OKX execution quality data (depth, spread)
+                const ticker = await fetchOKXSwapTicker(cand.symbol);
+                const depth = await fetchOKXSwapDepth(cand.symbol);
                 
                 let spreadBps = 5; // Default
                 let mid = cand.mark_price;
@@ -1676,7 +1742,7 @@ jobs:
                   spreadBps = Math.round(((ask - bid) / mid) * 10000);
                 }
                 
-                // Calculate OBI and slip estimation using Binance depth
+                // Calculate OBI and slip estimation using OKX depth
                 const obi = computeOBI(depth, OBI_TOPN);
                 
                 const sideSlipL = slipFromDepth(depth, mid, "long", NOTIONAL);
@@ -1784,11 +1850,11 @@ jobs:
                 // Base from golden 4 metrics (already 0-100)
                 const baseConf = cand.hedge_confidence;
                 
-                // Execution quality multipliers
-                const spreadMult = clamp(1 - Math.max(0, (spreadBps - 5)) / 30, 0.5, 1.1);
-                const depthMult = clamp(depth1pUSD / Math.max(1, DEPTH_1P_MIN_USD), 0.3, 1.2);
-                const slipMult = clamp(1 - Math.max(0, (chosen.cost_bps - COST_BPS)) / 25, 0.5, 1.1);
-                const oiMult = clamp(cand.current_oi_usd / 50_000_000, 0.4, 1.3);
+                // Execution quality multipliers (more lenient for OKX)
+                const spreadMult = clamp(1 - Math.max(0, (spreadBps - 5)) / 30, 0.7, 1.1);
+                const depthMult = clamp(depth1pUSD / Math.max(1, DEPTH_1P_MIN_USD), 0.5, 1.2);
+                const slipMult = clamp(1 - Math.max(0, (chosen.cost_bps - COST_BPS)) / 25, 0.7, 1.1);
+                const oiMult = clamp(cand.current_oi_usd / 10_000_000, 0.6, 1.3); // Lower OI threshold
                 
                 // EV multiplier
                 const evMult = clamp(chosen.viab_mult || 1, 0.3, 1.3);
@@ -1932,7 +1998,7 @@ jobs:
               }
 
               const idea_id = uuidv4();
-              const client_order_id = mkClientOrderId("bnh");  // ← CHANGED prefix for Binance Hedge
+              const client_order_id = mkClientOrderId("okh");
 
               const ttl = clamp(Math.round((x.hold_sec || 3600) + i * 12), TTL_MIN, TTL_MAX);
               const size_bps = (Number(process.env.FORCE_SIZE_BPS || "0") > 0)
@@ -1950,7 +2016,7 @@ jobs:
                 rank: i + 1,
 
                 // v2/futures intent
-                target_exchange: TARGET_EXCHANGE,  // "binance_futures"
+                target_exchange: TARGET_EXCHANGE,
                 market_type: MARKET_TYPE,
                 margin_mode: MARGIN_MODE,
                 leverage: LEVERAGE,
@@ -2127,7 +2193,7 @@ jobs:
                   regime: p.regime,
 
                   decision_context: {
-                    source: "binance_futures",
+                    source: "okx_swap",
                     golden_metrics: p.hedge_metrics
                   },
 
@@ -2180,15 +2246,15 @@ jobs:
             const meta = {
               origin: "github_actions",
               reason,
-              exchange: "binance_futures",  // ← CHANGED
-              execution_exchange: "binance_futures",  // ← CHANGED
+              exchange: "okx_swap",
+              execution_exchange: "okx_swap",
               strategy: STRATEGY_NAME,
               model_version: MODEL_VERSION,
               schema_version: SCHEMA_VERSION,
               git_sha: GIT_SHA,
               config_hash: CONFIG_HASH,
               counts: {
-                binance_universe: binanceSymbols.length,
+                okx_universe: okxSymbols.length,
                 metrics_fetched: allMetrics.length,
                 refined: refined.length,
                 selected: picks.length
@@ -2213,7 +2279,7 @@ jobs:
               },
               extras: {
                 v2_ideas: picksV2,
-                features_requested: ["maker_join", "post_only", "futures", "hedge_trading", "binance_execution"]
+                features_requested: ["maker_join", "post_only", "swap", "hedge_trading", "okx_execution"]
               }
             };
 
@@ -2247,11 +2313,11 @@ jobs:
                 mode: "normal",
                 source: "external_pusher",
                 meta: {
-                  origin: "github_actions_v2_binance",
-                  strategy: "binance-hedge-ultimate",
-                  data_source: "binance_futures",
+                  origin: "github_actions_v2_okx",
+                  strategy: "okx-hedge-ultimate",
+                  data_source: "okx_swap",
                   golden_metrics: true,
-                  execution: "binance_futures"
+                  execution: "okx_swap"
                 },
                 top_n: picksV2.length,
                 ideas: picksV2
@@ -2281,7 +2347,7 @@ jobs:
                 origin: "github_actions",
                 reason,
                 error: (e?.message || String(e)).slice(0, 220),
-                exchange: "binance_futures"  // ← CHANGED
+                exchange: "okx_swap"
               },
               top_n: 0,
               ideas: []
@@ -2324,12 +2390,12 @@ jobs:
 
             # 2) Minimal POST with 0 ideas
             now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-            payload='{"ts":"'"${now}"'","mode":"normal","source":"external_pusher","meta":{"origin":"github_actions","reason":"fallback_node_error","exchange":"binance_futures"},"top_n":0,"ideas":[]}'
+            payload='{"ts":"'"${now}"'","mode":"normal","source":"external_pusher","meta":{"origin":"github_actions","reason":"fallback_node_error","exchange":"okx_swap"},"top_n":0,"ideas":[]}'
             echo "[gha] pushing 0 ideas to ${raw_push_url}"
             mkdir -p /tmp
             : > /tmp/push_resp.txt
             http_code=$(curl -g -sS -o /tmp/push_resp.txt -w "%{http_code}" -X POST \
-              -H "Content-Type: application/json" \
+              -H "Content-Type": "application/json" \
               -H "Authorization: Bearer ${PUSH_TOKEN}" \
               --data-raw "${payload}" \
               --max-time 12 \
