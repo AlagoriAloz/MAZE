@@ -1666,6 +1666,11 @@ jobs:
                 const ticker = await fetchBinanceFuturesTicker(cand.symbol);
                 const depth = await fetchBinanceFuturesDepth(cand.symbol);
                 
+                if (!ticker || !depth) {
+                  log(`⚠️ Skipping ${cand.symbol}: ticker=${!!ticker} depth=${!!depth}`);
+                  continue;
+                }
+                
                 let spreadBps = 5; // Default
                 let mid = cand.mark_price;
                 
