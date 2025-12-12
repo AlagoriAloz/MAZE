@@ -245,8 +245,8 @@ jobs:
           const MEXC_BASES=[process.env.MEXC_BASE,"https://api.mexc.com","https://www.mexc.com"].filter(Boolean);
           
           // Binance Futures endpoints (public, no API key needed)
-          const BINANCE_FAPI = "https://amesterdam-1.onrender.com/binance";
-          const BINANCE_SPOT = "https://amesterdam-1.onrender.com/binance";
+          const BINANCE_FAPI = " https://amesterdam-1.onrender.com/binance";
+          const BINANCE_SPOT = " https://amesterdam-1.onrender.com/binance";
           
           const MIN_TF_ALIGN=(Number(process.env.MIN_TF_ALIGN||"0.60"));
           let TF_WEIGHTS={}; try{ TF_WEIGHTS=JSON.parse(process.env.TF_WEIGHTS||"{}"); }catch{ TF_WEIGHTS={}; }
@@ -1638,13 +1638,22 @@ jobs:
             
             log(`📈 Fetched metrics for ${allMetrics.length}/${binanceSymbols.length} symbols`);
 
-            // ========== RANK BY HEDGE CONFIDENCE ==========
+            // ========== FILTER MINIMUM VOLUME & RANK BY HEDGE CONFIDENCE ==========
+            const MIN_VOL_1H_DISPLAY = 1_000_000; // $1M minimum
+
+            const beforeFilter = allMetrics.length;
+            const qualified = allMetrics.filter(m => (m.volume_1h_usd || 0) >= MIN_VOL_1H_DISPLAY);
+            log(`📊 Volume gate: ${qualified.length}/${beforeFilter} symbols have 1h vol >= $1M`);
+
+            allMetrics.length = 0;
+            allMetrics.push(...qualified);
+
             // Sort by hedge confidence (highest first)
             allMetrics.sort((a, b) => b.hedge_confidence - a.hedge_confidence);
-            
-            // Log top 10 for debugging
-            log("🏆 Top 10 by hedge confidence:");
-            for (let i = 0; i < Math.min(10, allMetrics.length); i++) {
+
+            // Log top 30 for debugging
+            log("🏆 Top 30 by hedge confidence (vol >= $1M):");
+            for (let i = 0; i < Math.min(30, allMetrics.length); i++) {
               const m = allMetrics[i];
               log(`   ${i+1}. ${m.symbol} conf=${m.hedge_confidence} vol1h=${m.vol_1h_pct.toFixed(2)}% fund=${(m.funding_rate*100).toFixed(4)}% oi_delta=${m.oi_delta_pct.toFixed(1)}% vol=$${Math.round(m.volume_1h_usd/1e6)}M`);
             }
@@ -1659,17 +1668,16 @@ jobs:
             
             // ========== DETAILED REFINEMENT WITH BINANCE DATA ==========
             const refined = [];
-            
+            let refineIdx = 0;
+
             for (const cand of topCandidates) {
+              refineIdx++;
               try {
+                log(`\n[${refineIdx}/${topCandidates.length}] 🔍 Analyzing ${cand.symbol}...`);
+                
                 // Fetch BINANCE execution quality data (depth, spread)
                 const ticker = await fetchBinanceFuturesTicker(cand.symbol);
                 const depth = await fetchBinanceFuturesDepth(cand.symbol);
-                
-                if (!ticker || !depth) {
-                  log(`⚠️ Skipping ${cand.symbol}: ticker=${!!ticker} depth=${!!depth}`);
-                  continue;
-                }
                 
                 let spreadBps = 5; // Default
                 let mid = cand.mark_price;
@@ -1679,6 +1687,11 @@ jobs:
                   const ask = ticker.ask;
                   mid = (bid + ask) / 2;
                   spreadBps = Math.round(((ask - bid) / mid) * 10000);
+                }
+                log(`  📊 Spread: ${spreadBps}bps | Mid: $${mid?.toFixed(4)}`);
+                if (spreadBps > MAX_SPREAD_BPS) {
+                  log(`  ❌ SKIP: Spread ${spreadBps}bps > max ${MAX_SPREAD_BPS}bps`);
+                  continue;
                 }
                 
                 // Calculate OBI and slip estimation using Binance depth
@@ -1691,10 +1704,20 @@ jobs:
                 
                 const costLong = COST_BPS + slipL;
                 const costShort = COST_BPS + slipS;
+                log(`  💰 Cost: Long=${costLong}bps Short=${costShort}bps | Max=${MAX_COST_BPS_HARD}bps`);
+                if (costLong > MAX_COST_BPS_HARD && costShort > MAX_COST_BPS_HARD) {
+                  log(`  ❌ SKIP: Both sides exceed max cost`);
+                  continue;
+                }
                 
                 // Depth quality
                 const d1 = depthWithinPctUSD(depth, mid, 0.01);
                 const depth1pUSD = (d1.asksUSD || 0) + (d1.bidsUSD || 0);
+                log(`  📚 Depth @1%: $${Math.round(depth1pUSD/1000)}k | Min: $${Math.round(DEPTH_1P_MIN_USD/1000)}k`);
+                if (depth1pUSD < DEPTH_1P_MIN_USD) {
+                  log(`  ❌ SKIP: Insufficient depth`);
+                  continue;
+                }
                 
                 // Determine regime based on volatility and funding
                 const regime = (cand.vol_1h_pct >= 1.5 && Math.abs(cand.funding_rate) >= 0.0003) ? "trend" : "meanrevert";
@@ -1782,8 +1805,13 @@ jobs:
                 const chosen = candLong && candShort
                   ? (candLong.exp_lcb_bps >= candShort.exp_lcb_bps ? candLong : candShort)
                   : (candLong || candShort || null);
-                
-                if (!chosen) continue;
+
+                if (!chosen) {
+                  log(`  ❌ SKIP: No viable side (both failed filters)`);
+                  continue;
+                }
+
+                log(`  ✅ Side: ${chosen.side.toUpperCase()} | EV: ${chosen.exp_lcb_bps}bps | TP/SL: ${chosen.tp_bps}/${chosen.sl_bps}bps`);
                 
                 // ========== FINAL CONFIDENCE CALCULATION ==========
                 // Base from golden 4 metrics (already 0-100)
@@ -1867,9 +1895,10 @@ jobs:
                   
                   ret5: [] // Simplified
                 });
+                log(`  ✅ ACCEPTED | Final confidence: ${clamp(finalConf, 0, 100)} | Regime: ${chosen.regime}`);
                 
               } catch (e) {
-                log(`Refine error for ${cand.symbol}:`, e?.message || e);
+                log(`  ⚠️  ERROR: ${e?.message || e}`);
               }
             }
             
