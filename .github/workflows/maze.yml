@@ -245,8 +245,8 @@ jobs:
           const MEXC_BASES=[process.env.MEXC_BASE,"https://api.mexc.com","https://www.mexc.com"].filter(Boolean);
           
           // Binance Futures endpoints (public, no API key needed)
-          const BINANCE_FAPI = " https://railway-2z9h.onrender.com";
-          const BINANCE_SPOT = " https://railway-2z9h.onrender.com";
+          const BINANCE_FAPI = "https://amesterdam-2.onrender.com/mainnet";
+          const BINANCE_SPOT = "https://amesterdam-2.onrender.com/mainnet";
           
           const MIN_TF_ALIGN=(Number(process.env.MIN_TF_ALIGN||"0.60"));
           let TF_WEIGHTS={}; try{ TF_WEIGHTS=JSON.parse(process.env.TF_WEIGHTS||"{}"); }catch{ TF_WEIGHTS={}; }
@@ -339,6 +339,18 @@ jobs:
           const HEALTH_URL=(()=>{ try{ const u=new URL(PUSH_URL); return `${u.origin}${u.pathname.replace(/\/signals\/push(\?.*)?$/,"/health")}`;}catch{return PUSH_URL.replace(/\/signals\/push(\?.*)?$/,"/health");}})();
           log("health GET", HEALTH_URL);
           try{ const r=await fetchWithTimeout(HEALTH_URL,{ headers:{ "Authorization":`Bearer ${PUSH_TOKEN}`,"User-Agent":UA }},5000); let t=""; try{ t=await r.text(); }catch{} log("health status", r?.status||"ERR", (t||"").slice(0,160)); }catch(e){ log("health error", e?.message||e); }
+
+          // Pre-warm Render proxy to handle cold starts
+          log("🔥 Pre-warming Render proxy...");
+          try { 
+            const warmResp = await fetchWithTimeout(`${BINANCE_FAPI}/fapi/v1/time`, {}, 45000); 
+            let warmText = "";
+            try { warmText = await warmResp.text(); } catch {}
+            log("✅ Pre-warm status:", warmResp?.status || "timeout", warmText.slice(0, 100));
+          } catch (e) { 
+            log("⚠️  Pre-warm timeout (may indicate cold start):", e?.message || e); 
+          }
+          await sleep(2000); // Give Render time to fully wake up
 
           // ========== FAKE FLUSH START ==========
           log("🚀 FAKE FLUSH: Sending 2 fake ideas immediately...");
@@ -471,49 +483,67 @@ jobs:
 
           // ---------- Binance Futures API Functions (Public, No Auth) ----------
           
-          // FIXED: Fetch all USDT perpetual symbols from Binance Futures
+          // FIXED: Fetch all USDT perpetual symbols from Binance Futures (with retry + long timeout)
           async function fetchBinanceFuturesSymbols() {
             const cacheKey = "binance_futures_symbols";
             const cached = getCached(cache.binance, cacheKey, 300_000); // 5 min cache
             if (cached) return cached;
             
-            try {
-              const url = `${BINANCE_FAPI}/fapi/v1/exchangeInfo`;
-              log("Fetching Binance exchangeInfo from:", url);
-              
-              const response = await fetchWithTimeout(url, {}, 20000);
-              if (!response.ok) {
-                log(`Binance exchangeInfo failed: ${response.status}`);
-                return [];
+            const url = `${BINANCE_FAPI}/fapi/v1/exchangeInfo`;
+            
+            // Retry loop to handle GitHub Actions network variance + Render cold starts
+            for (let attempt = 0; attempt < 3; attempt++) {
+              try {
+                const timeout = 60000; // 60s to handle slow GitHub runners
+                log(`📡 Fetching Binance exchangeInfo (attempt ${attempt + 1}/3, timeout ${timeout/1000}s) from: ${url}`);
+                
+                const response = await fetchWithTimeout(url, {}, timeout);
+                
+                if (!response.ok) {
+                  log(`⚠️  Binance exchangeInfo HTTP ${response.status}`);
+                  if (attempt < 2) { 
+                    await sleep(2000 + attempt * 1000); 
+                    continue; 
+                  }
+                  return [];
+                }
+                
+                const data = await response.json();
+                if (!data?.symbols) {
+                  log("⚠️  Binance exchangeInfo has no symbols array");
+                  return [];
+                }
+                
+                const symbols = data.symbols
+                  .filter(s => 
+                    s.contractType === "PERPETUAL" && 
+                    s.quoteAsset === "USDT" &&
+                    s.status === "TRADING"
+                  )
+                  .map(s => ({
+                    symbol: s.symbol,           // e.g., "BTCUSDT"
+                    base: s.baseAsset,          // e.g., "BTC"
+                    quote: s.quoteAsset,        // "USDT"
+                    pricePrecision: s.pricePrecision,
+                    quantityPrecision: s.quantityPrecision
+                  }));
+                
+                setCached(cache.binance, cacheKey, symbols);
+                log(`✅ Binance Futures: ${symbols.length} USDT perpetuals found`);
+                return symbols;
+                
+              } catch (e) {
+                log(`❌ Attempt ${attempt + 1}/3 failed:`, e?.message || e);
+                if (attempt < 2) {
+                  const backoff = 3000 + attempt * 2000; // 3s, 5s
+                  log(`⏳ Retrying in ${backoff/1000}s...`);
+                  await sleep(backoff);
+                }
               }
-              
-              const data = await response.json();
-              if (!data?.symbols) {
-                log("Binance exchangeInfo has no symbols");
-                return [];
-              }
-              
-              const symbols = data.symbols
-                .filter(s => 
-                  s.contractType === "PERPETUAL" && 
-                  s.quoteAsset === "USDT" &&
-                  s.status === "TRADING"
-                )
-                .map(s => ({
-                  symbol: s.symbol,           // e.g., "BTCUSDT"
-                  base: s.baseAsset,          // e.g., "BTC"
-                  quote: s.quoteAsset,        // "USDT"
-                  pricePrecision: s.pricePrecision,
-                  quantityPrecision: s.quantityPrecision
-                }));
-              
-              setCached(cache.binance, cacheKey, symbols);
-              log(`📊 Binance Futures: ${symbols.length} USDT perpetuals found`);
-              return symbols;
-            } catch (e) {
-              log("fetchBinanceFuturesSymbols error:", e?.message || e);
-              return [];
             }
+            
+            log("💥 All 3 attempts exhausted for Binance exchangeInfo");
+            return [];
           }
 
           // Fetch 1h kline for price change % and volume
