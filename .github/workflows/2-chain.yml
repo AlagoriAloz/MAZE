@@ -1,0 +1,43 @@
+name: "2 — Chain Middle"
+
+on:
+  repository_dispatch:
+    types: [run_2]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: chain-2
+  cancel-in-progress: true
+
+jobs:
+  work:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+
+    steps:
+      - name: Setup Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Do work (placeholder ~10 min)
+        shell: bash
+        run: |
+          echo "[2] Starting work..."
+          # ── PUT YOUR REAL LOGIC HERE ──
+          sleep 600
+          echo "[2] Work complete."
+
+      - name: Trigger Workflow 3
+        if: always()
+        shell: bash
+        run: |
+          echo "[2] Dispatching run_3 ..."
+          curl -sS -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${{ secrets.PAT_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/dispatches" \
+            -d '{"event_type":"run_3"}'
+          echo "[2] Dispatched."
