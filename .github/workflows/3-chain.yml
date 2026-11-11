@@ -1,55 +1,33 @@
-name: "3 — Chain End (triggers X + 1)"
+name: 3 — Chain End
 
 on:
   repository_dispatch:
     types: [run_3]
 
-permissions:
-  contents: read
-
-concurrency:
-  group: chain-3
-  cancel-in-progress: true
-
 jobs:
-  work:
+  run:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
-
+    timeout-minutes: 5
     steps:
-      - name: Setup Node 20
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
-
-      - name: Do work (~20 min)
-        shell: bash
+      - name: Log trigger source
         run: |
-          echo "[3] Starting work..."
-          # ── PUT YOUR REAL LOGIC HERE ──
-          sleep 1200
-          echo "[3] Work complete."
+          echo "Triggered by: ${{ github.event.client_payload.source || 'chain_2' }}"
 
-      - name: Trigger Workflow X
-        if: always()
-        shell: bash
+      - name: Sleep 1 minute
+        run: sleep 60
+
+      - name: Trigger X + restart Chain 1
+        env:
+          PAT: ${{ secrets.PAT_TOKEN }}
         run: |
-          echo "[3] Dispatching run_X ..."
-          curl -sS -X POST \
+          curl -s -X POST \
+            -H "Authorization: token $PAT" \
             -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer ${{ secrets.PAT_TOKEN }}" \
-            "https://api.github.com/repos/${{ github.repository }}/dispatches" \
+            https://api.github.com/repos/${{ github.repository }}/dispatches \
             -d '{"event_type":"run_X"}'
-          echo "[3] X dispatched."
 
-      - name: Trigger Workflow 1 (restart loop)
-        if: always()
-        shell: bash
-        run: |
-          echo "[3] Dispatching run_1 (loop restart) ..."
-          curl -sS -X POST \
+          curl -s -X POST \
+            -H "Authorization: token $PAT" \
             -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer ${{ secrets.PAT_TOKEN }}" \
-            "https://api.github.com/repos/${{ github.repository }}/dispatches" \
-            -d '{"event_type":"run_1"}'
-          echo "[3] 1 dispatched. Cycle restarts."
+            https://api.github.com/repos/${{ github.repository }}/dispatches \
+            -d '{"event_type":"run_1","client_payload":{"source":"chain_3_loop"}}'
