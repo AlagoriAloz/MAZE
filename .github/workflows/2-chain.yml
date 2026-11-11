@@ -14,7 +14,7 @@ concurrency:
 jobs:
   work:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 25
 
     steps:
       - name: Setup Node 20
@@ -22,7 +22,7 @@ jobs:
         with:
           node-version: 20
 
-      - name: Do work (placeholder ~10 min)
+      - name: Do work (~20 min)
         shell: bash
         run: |
           echo "[2] Starting work..."
