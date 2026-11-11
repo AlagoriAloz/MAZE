@@ -1,0 +1,55 @@
+name: "3 — Chain End (triggers X + 1)"
+
+on:
+  repository_dispatch:
+    types: [run_3]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: chain-3
+  cancel-in-progress: true
+
+jobs:
+  work:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+
+    steps:
+      - name: Setup Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Do work (placeholder ~10 min)
+        shell: bash
+        run: |
+          echo "[3] Starting work..."
+          # ── PUT YOUR REAL LOGIC HERE ──
+          sleep 600
+          echo "[3] Work complete."
+
+      - name: Trigger Workflow X
+        if: always()
+        shell: bash
+        run: |
+          echo "[3] Dispatching run_X ..."
+          curl -sS -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${{ secrets.PAT_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/dispatches" \
+            -d '{"event_type":"run_X"}'
+          echo "[3] X dispatched."
+
+      - name: Trigger Workflow 1 (restart loop)
+        if: always()
+        shell: bash
+        run: |
+          echo "[3] Dispatching run_1 (loop restart) ..."
+          curl -sS -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${{ secrets.PAT_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/dispatches" \
+            -d '{"event_type":"run_1"}'
+          echo "[3] 1 dispatched. Cycle restarts."
