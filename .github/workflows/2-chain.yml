@@ -27,7 +27,7 @@ jobs:
         run: |
           echo "[2] Starting work..."
           # ── PUT YOUR REAL LOGIC HERE ──
-          sleep 600
+          sleep 1200
           echo "[2] Work complete."
 
       - name: Trigger Workflow 3
