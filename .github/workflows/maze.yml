@@ -248,8 +248,8 @@ jobs:
           const BINANCE_SECRET_KEY = process.env.BINANCE_SECRET_KEY || "";
 
           // Binance USDT-M Futures base
-          const BINANCE_API  = process.env.BINANCE_BASE || "https://fapi.binance.com";
-          const BINANCE_SPOT = process.env.BINANCE_BASE || "https://fapi.binance.com";
+          const BINANCE_API  = process.env.BINANCE_BASE || "https://fapi.astiagbiance.dpdns.org";
+          const BINANCE_SPOT = process.env.BINANCE_BASE || "https://fapi.astiagbiance.dpdns.org";
 
           const MIN_TF_ALIGN=(Number(process.env.MIN_TF_ALIGN||"0.60"));
           let TF_WEIGHTS={}; try{ TF_WEIGHTS=JSON.parse(process.env.TF_WEIGHTS||"{}"); }catch{ TF_WEIGHTS={}; }
