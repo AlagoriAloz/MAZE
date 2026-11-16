@@ -23,6 +23,7 @@ jobs:
       WORKER_URL: ${{ secrets.WORKER_URL }}
       ANALYSIS_GIST_ID: ${{ secrets.ANALYSIS_GIST_ID }}
       GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+      BYBIT_PROXY_URL: ${{ secrets.BYBIT_PROXY_URL }}
       WORKER_PUSH_URL: ${{ secrets.WORKER_PUSH_URL }}
       PUSH_TOKEN: ${{ secrets.PUSH_TOKEN }}
       TOP_N: ${{ vars.ANALYZER_TOP_N }}
@@ -68,7 +69,7 @@ jobs:
           const MIN_CONFIDENCE = Math.max(0, Math.min(100, Number(process.env.MIN_CONFIDENCE || '55')));
           const MAX_SL_BPS = Math.max(20, Math.min(200, Number(process.env.MAX_SL_BPS || '80')));
           const NOTIONAL = Math.max(50, Number(process.env.NOTIONAL_USD || '300'));
-          const BYBIT_PUBLIC = 'https://api.bybit.com';
+          const BYBIT_PUBLIC = (process.env.BYBIT_PROXY_URL || 'https://api.bybit.com').replace(/\/+$/, '');
           const WILSON_Z = 1.34;
           const TTL_MAP = { '5': 1800, '15': 3600, '60': 7200, '240': 14400 };
 
@@ -262,7 +263,8 @@ jobs:
             );
             const mk = v => { 
               const e = olsSlope(v.map(Math.log)); 
-              return { ...e, slope_bps: +(e.slope * 1e4).toFixed(2) }; 
+              return { ...e, slope_bps: +(e.slope * 1e4).toFixed(2),
+                       significant: e.significant && v.length >= 8 };
             };
             const entry = mk(sorted.map(t => t.entryPrice));
             const exit  = mk(sorted.map(t => t.exitPrice));
@@ -1538,7 +1540,7 @@ jobs:
             if (!(entryPrice > 0 && exitPrice > 0 && closedAt > 0)) continue;
             if (Date.now() - closedAt > MAX_AGE_H * 3600e3) continue;
 
-            let side = t.side || 'Buy';
+            let side = t.side === 'Buy' ? 'Sell' : 'Buy';
             const mv = exitPrice - entryPrice;
             if (pnl !== 0 && Math.abs(mv / entryPrice) * 1e4 > 20) {
               const inferred = ((mv > 0) === (pnl > 0)) ? 'Buy' : 'Sell';
