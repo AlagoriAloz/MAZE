@@ -1,9 +1,11 @@
 name: Trend Analyzer (Trade Archaeology v1.0)
 
 on:
-  repository_dispatch:
-    types: [run_X]
+  schedule:
+    - cron: '*/15 * * * *'
   workflow_dispatch: {}
+  repository_dispatch:
+    types: [run_analyzer]
 
 permissions:
   contents: read
