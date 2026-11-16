@@ -1,5 +1,4 @@
-M
-name: Ideas Pusher (MEXC Ultimate 7.7.7)
+name: Trend Analyzer (Trade Archaeology v1.0)
 
 on:
   repository_dispatch:
@@ -10,67 +9,24 @@ permissions:
   contents: read
 
 concurrency:
-  group: ideas-mexc-ultimate
+  group: trend-analyzer
   cancel-in-progress: true
 
 jobs:
-  push:
+  analyze:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 10
 
     env:
-      # Required secrets
+      WORKER_URL: ${{ secrets.WORKER_URL }}
+      ANALYSIS_GIST_ID: ${{ secrets.ANALYSIS_GIST_ID }}
+      GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
       WORKER_PUSH_URL: ${{ secrets.WORKER_PUSH_URL }}
       PUSH_TOKEN: ${{ secrets.PUSH_TOKEN }}
-      WORKER_PUSH_URL_V2: ${{ secrets.WORKER_PUSH_URL_V2 }}
-
-      # Required for trade reconciliation
-      MEXC_API_KEY: ${{ secrets.MEXC_API_KEY }}
-      MEXC_SECRET_KEY: ${{ secrets.MEXC_SECRET_KEY }}
-
-      # Optional (safe defaults inside the script)
-      GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
-      GIST_ID: ${{ secrets.GIST_ID }}
-
-      # Exchange + tuning knobs (via Repo/Org Variables)
-      EXCHANGE: mexc
-      MIN_QV_USD: ${{ vars.MIN_QV_USD }}
-      TOP_N: ${{ vars.TOP_N }}
-      MAX_SPREAD_BPS: ${{ vars.MAX_SPREAD_BPS }}
-      EXP_LCB_MIN_BPS: ${{ vars.EXP_LCB_MIN_BPS }}
-      FEES_BPS: ${{ vars.FEES_BPS }}
+      TOP_N: ${{ vars.ANALYZER_TOP_N }}
+      MIN_CONFIDENCE: ${{ vars.ANALYZER_MIN_CONFIDENCE }}
+      MAX_SL_BPS: ${{ vars.ANALYZER_MAX_SL_BPS }}
       NOTIONAL_USD: ${{ vars.NOTIONAL_USD }}
-      MEXC_DEPTH_LIMIT: ${{ vars.MEXC_DEPTH_LIMIT }}
-      OBI_TOPN: ${{ vars.OBI_TOPN }}
-      ACTIVE_UTC_START: ${{ vars.ACTIVE_UTC_START }}
-      ACTIVE_UTC_END: ${{ vars.ACTIVE_UTC_END }}
-      MEXC_BASE: ${{ vars.MEXC_BASE }}
-      FORCE_SIZE_BPS: ${{ vars.FORCE_SIZE_BPS }}
-
-      # New Confidence Model Knobs
-      DIRECTION: ${{ vars.DIRECTION }}
-      MR_SLOPE_MAX_ATR50: ${{ vars.MR_SLOPE_MAX_ATR50 }}
-      MR_BREAKOUT_DC_N: ${{ vars.MR_BREAKOUT_DC_N }}
-      MR_BREAKOUT_RET15_ATR: ${{ vars.MR_BREAKOUT_RET15_ATR }}
-      MR_LOCKOUT_SEC: ${{ vars.MR_LOCKOUT_SEC }}
-      MAX_COST_BPS_HARD: ${{ vars.MAX_COST_BPS_HARD }}
-      MIN_VOL_1H_USD: ${{ vars.MIN_VOL_1H_USD }}
-      DEPTH_1P_MIN_USD: ${{ vars.DEPTH_1P_MIN_USD }}
-      NO_LONG_DOWN_ENABLE: ${{ vars.NO_LONG_DOWN_ENABLE }}
-      LONG_DOWN_RSI_CUTOFF: ${{ vars.LONG_DOWN_RSI_CUTOFF }}
-      LONG_MR_DIVERGENCE_REQ: ${{ vars.LONG_MR_DIVERGENCE_REQ }}
-      LONG_EDGE_MULT_MIN: ${{ vars.LONG_EDGE_MULT_MIN }}
-      LONG_BOUNCE_SL_ATR: ${{ vars.LONG_BOUNCE_SL_ATR }}
-      LONG_BOUNCE_TP_ATR: ${{ vars.LONG_BOUNCE_TP_ATR }}
-      LONG_SIMILARITY_RHO: ${{ vars.LONG_SIMILARITY_RHO }}
-
-      # New (MTF + Provenance + Align)
-      MIN_TF_ALIGN: ${{ vars.MIN_TF_ALIGN }}
-      TF_WEIGHTS: ${{ vars.TF_WEIGHTS }}
-      STRATEGY_NAME: ${{ vars.STRATEGY_NAME }}
-      MODEL_VERSION: ${{ vars.MODEL_VERSION }}
-      SCHEMA_VERSION: ${{ vars.SCHEMA_VERSION }}
-      GIT_SHA: ${{ github.sha }}
 
     steps:
       - name: Setup Node 20
@@ -78,2262 +34,1934 @@ jobs:
         with:
           node-version: 20
 
-      - name: Run pusher (always-push + clear logs)
+      - name: Run Trade Archaeology Analyzer
         shell: bash
         run: |
           set -euo pipefail
-
-          # Hard fail only on true misconfig (so setup problems aren't hidden)
-          if [[ -z "${WORKER_PUSH_URL:-}" || -z "${PUSH_TOKEN:-}" ]]; then
-            echo "[gha] Missing WORKER_PUSH_URL or PUSH_TOKEN"
-            exit 1
+          if [[ -z "${WORKER_URL:-}" ]]; then
+            echo "[analyzer] Missing WORKER_URL"; exit 1
+          fi
+          if [[ -z "${ANALYSIS_GIST_ID:-}" || -z "${GIST_TOKEN:-}" ]]; then
+            echo "[analyzer] Missing ANALYSIS_GIST_ID or GIST_TOKEN"; exit 1
           fi
 
           set +e
           node - <<'NODE'
-          (async ()=>{
+          (async () => {
           'use strict';
           const crypto = require('crypto');
-          const MODEL_VERSION=(process.env.MODEL_VERSION||"7.0.0");
-          const UA = `gh-actions-ideas-hedge/${MODEL_VERSION} (+https://github.com/)`;
+          const VERSION = '1.0.0';
+          const UA = `trend-analyzer/${VERSION}`;
+          const log = (...a) => console.log('[analyzer]', ...a);
 
-          // ---------------- Utils ----------------
-          const clamp=(x,a,b)=>Math.max(a,Math.min(b,x));
-          const tanh=(x)=>Math.tanh(x);
-          const sum=(a)=>a.reduce((x,y)=>x+y,0);
-          const mean=(a)=>a.length?sum(a)/a.length:0;
-          const std=(a)=>{ const m=mean(a); let v=0; for(const x of a) v+=(x-m)*(x-m); return a.length>1?Math.sqrt(v/(a.length-1)):0; };
-          const ema=(arr,p)=>{ if(!arr||arr.length<p) return null; const k=2/(p+1); let e=arr.slice(0,p).reduce((a,b)=>a+b,0)/p; for(let i=p;i<arr.length;i++) e=arr[i]*k+e*(1-k); return e; };
-          const rsi=(cl,p=14)=>{ if(!cl||cl.length<=p) return null; let g=0,l=0; for(let i=1;i<=p;i++){ const d=cl[i]-cl[i-1]; g+=Math.max(0,d); l+=Math.max(0,-d); } let ag=g/p, al=l/p; for(let i=p+1;i<cl.length;i++){ const d=cl[i]-cl[i-1]; ag=(ag*(p-1)+Math.max(0,d))/p; al=(al*(p-1)+Math.max(0,-d))/p; } const rs=al===0?100:ag/al; return 100-100/(1+rs); };
-          const computeADX_ATR=(h,l,c,p=14)=>{ const n=c.length; if(n<p+2) return null; const TR=[],plusDM=[],minusDM=[]; for(let i=1;i<n;i++){ const up=h[i]-h[i-1], down=l[i-1]-l[i]; plusDM.push((up>down&&up>0)?up:0); minusDM.push((down>up&&down>0)?down:0); TR.push(Math.max(h[i]-l[i], Math.abs(h[i]-c[i-1]), Math.abs(l[i]-c[i-1]))); } let trN=0,pdmN=0,ndmN=0; for(let i=0;i<p;i++){ trN+=TR[i]; pdmN+=plusDM[i]; ndmN+=minusDM[i]; } let pDI=100*(pdmN/(trN||1)), nDI=100*(ndmN/(trN||1)); let dx=100*Math.abs(pDI-nDI)/((pDI+nDI)||1), adx=dx; for(let i=p;i<TR.length;i++){ trN=trN-(trN/p)+TR[i]; pdmN=pdmN-(pdmN/p)+plusDM[i]; ndmN=ndmN-(ndmN/p)+minusDM[i]; pDI=100*(pdmN/(trN||1)); nDI=100*(ndmN/(trN||1)); dx=100*Math.abs(pDI-nDI)/((pDI+nDI)||1); adx=((adx*(p-1))+dx)/p; } const atr=trN/p; return { adx, atr, trLast: TR.at(-1) }; };
-          const vwapAnchored=(h,l,c,v,win)=>{ if(!c?.length) return null; const n=c.length,s=Math.max(0,n-win); let pv=0,vv=0; for(let i=s;i<n;i++){ const tp=(h[i]+l[i]+c[i])/3; const vol=+v[i]||0; pv+=tp*vol; vv+=vol; } return vv>0?pv/vv:c.at(-1); };
-          const corr=(a,b)=>{ const n=Math.min(a?.length||0,b?.length||0); if(n<5) return 0; const as=a.slice(-n), bs=b.slice(-n); const ma=mean(as), mb=mean(bs); let num=0,da=0,db=0; for(let i=0;i<n;i++){ const xa=as[i]-ma, xb=bs[i]-mb; num+=xa*xb; da+=xa*xa; db+=xb*xb; } const den=Math.sqrt(da*db)||1; return num/den; };
-          const wilsonLCB=(p,n,z=1.34)=>{ if(n<=0) return p; const z2=z*z; const a=p + z2/(2*n); const b=z*Math.sqrt((p*(1-p)+z2/(4*n))/n); const c=1+z2/n; return clamp((a-b)/c, 0, 1); };
-          const sleep=(ms)=>new Promise(r=>setTimeout(r,ms));
-          const jitter=(ms)=>ms + Math.floor(Math.random()*ms*0.25);
-          const log=(...a)=>console.log("[gha]",...a);
-          const softmax=(arr,t=20)=>{ const m=Math.max(...arr,0); const ex=arr.map(x=>Math.exp((x-m)/t)); const s=ex.reduce((a,b)=>a+b,0)||1; return ex.map(x=>x/s); };
-          const sigmoid=(z)=>1/(1+Math.exp(-z));
-          const logit=(p)=>{ const eps=1e-6; const pp=Math.min(1-eps,Math.max(eps,p)); return Math.log(pp/(1-pp)); };
-          let bmSpare=null;
-          const randn=()=>{ if(bmSpare!=null){ const v=bmSpare; bmSpare=null; return v; } let u=0,v=0; while(u===0) u=Math.random(); while(v===0) v=Math.random(); const r=Math.sqrt(-2*Math.log(u)); const th=2*Math.PI*v; bmSpare=r*Math.sin(th); return r*Math.cos(th); };
-          const randt=(df)=>{ if(df<=2) df=2.01; const z=randn(); let x2=0; for(let i=0;i<Math.floor(df);i++){ const z2=randn(); x2+=z2*z2; } const frac=df-Math.floor(df); if(frac>0){ const zf=randn(); x2+=frac*zf*zf; } const chi=x2||1e-6; return z / Math.sqrt(chi/df); };
-          const kalman1D=(obs,{q=1e-5,r=1e-3,x0=null,p0=1e-2}={})=>{ if(!obs?.length) return []; let x=(x0==null?obs[0]:x0), p=p0; const out=[]; for(const z of obs){ p+=q; const K=p/(p+r); x=x+K*(z-x); p=(1-K)*p; out.push(x); } return out; };
-          const pathEVHeavy=({entry,tp_bps,sl_bps,side,retSeries,mu,sigma,steps,N=192,cost_bps=10,t_df=5,boot_block=3})=>{ const up=(side==="long"), tpF=tp_bps/10000, slF=sl_bps/10000; let ev=0, wins=0; const rets=retSeries||[]; const boot1=()=>{ if(rets.length<8) return Array(steps).fill(0).map(()=> sigma*Math.sqrt(1/steps)*randn()); const out=[]; while(out.length<steps){ const start=Math.floor(Math.random()*(rets.length-boot_block)); for(let k=0;k<boot_block && out.length<steps;k++) out.push(rets[start+k]||0); } return out.slice(0,steps); }; for(let n=0;n<N;n++){ const mode=(n%2===0)?"t":"boot"; let S=entry, tp=up? entry*(1+tpF):entry*(1-tpF), sl=up? entry*(1-slF):entry*(1+slF); let pnl_bps=0,win=0; const rs=(mode==="t")? Array(steps).fill(0).map(()=> mu + sigma*randt(t_df)/Math.sqrt(steps)) : boot1(); for(let t=0;t<steps;t++){ S*=(1+rs[t]); if(up){ if(S>=tp){ pnl_bps=tp_bps-cost_bps; win=1; break;} if(S<=sl){ pnl_bps=-sl_bps-cost_bps; win=0; break;} } else { if(S<=tp){ pnl_bps=tp_bps-cost_bps; win=1; break;} if(S>=sl){ pnl_bps=-sl_bps-cost_bps; win=0; break;} } if(t===steps-1){ const ret=up? (S/entry-1):(entry/S-1); pnl_bps=Math.round(ret*10000)-cost_bps; win=pnl_bps>0?1:0; } } ev+=pnl_bps; wins+=win; } const p=wins/N, ev_mean=ev/N; return { p, ev_bps:Math.round(ev_mean) }; };
+          // ================================================================
+          //  CONFIGURATION
+          // ================================================================
+          const WORKER_URL = (process.env.WORKER_URL || '').replace(/\/+$/, '');
+          const ANALYSIS_GIST_ID = process.env.ANALYSIS_GIST_ID || '';
+          const GIST_TOKEN = process.env.GIST_TOKEN || '';
+          const PUSH_URL = process.env.WORKER_PUSH_URL || '';
+          const PUSH_TOKEN = process.env.PUSH_TOKEN || '';
+          const TOP_N = Math.max(1, Math.min(10, Number(process.env.TOP_N || '3')));
+          const MIN_CONFIDENCE = Math.max(0, Math.min(100, Number(process.env.MIN_CONFIDENCE || '55')));
+          const MAX_SL_BPS = Math.max(20, Math.min(200, Number(process.env.MAX_SL_BPS || '80')));
+          const NOTIONAL = Math.max(50, Number(process.env.NOTIONAL_USD || '300'));
+          const BYBIT_PUBLIC = 'https://api.bybit.com';
+          const WILSON_Z = 1.34;
+          const TTL_MAP = { '5': 1800, '15': 3600, '60': 7200, '240': 14400 };
 
-          // ---------- New Helpers ----------
-          const uuidv4=()=>{ try{ return crypto.randomUUID(); }catch{ const b=crypto.randomBytes(16); b[6]=(b[6]&0x0f)|0x40; b[8]=(b[8]&0x3f)|0x80; const h=b.toString("hex"); return [h.slice(0,8),h.slice(8,12),h.slice(12,16),h.slice(16,20),h.slice(20)].join("-"); } };
-          const mkClientOrderId = (prefix="mxu") => {
-            const raw = (crypto.randomUUID ? crypto.randomUUID() : uuidv4()).replace(/-/g, "");
-            const base = (prefix + "_" + raw).replace(/[^A-Za-z0-9_-]/g, "").slice(0, 30);
-            return base.padEnd(Math.max(24, base.length), "0");
+          // ================================================================
+          //  MATH UTILITIES
+          // ================================================================
+          const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
+          const sum = a => a.reduce((s, x) => s + x, 0);
+          const mean = a => a.length ? sum(a) / a.length : 0;
+          const std = a => {
+            if (a.length < 2) return 0;
+            const m = mean(a);
+            return Math.sqrt(a.reduce((s, x) => s + (x - m) ** 2, 0) / (a.length - 1));
           };
-          const hashObj=(o)=>{ const norm=(x)=>{ if(x&&typeof x==="object"&&!Array.isArray(x)){ const ks=Object.keys(x).sort(); const y={}; for(const k of ks) y[k]=norm(x[k]); return y; } if(Array.isArray(x)) return x.map(norm); return x; }; const s=JSON.stringify(norm(o)); return crypto.createHash("sha256").update(s).digest("hex"); };
-          const toCSVLine=(row,keys)=> keys.map(k=>{ let v=row?.[k]; if(v==null) return ""; if(typeof v==="object") v=JSON.stringify(v); const s=String(v); return s.includes(",")||s.includes("\n")||s.includes('"')? `"${s.replace(/"/g,'""')}"`: s; }).join(",");
+          const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-          const slopeBps=(arr,len=21)=>{ if(!arr?.length||arr.length<Math.max(5,len)) return 0; const s=arr.slice(-len); const n=s.length; const last=s[n-1]||1; const mx=(n-1)/2; let num=0,den=0; for(let i=0;i<n;i++){ const x=i, y=((s[i]||last)-last)/last*10000; num+=(x-mx)*y; den+=(x-mx)*(x-mx); } return den>0? num/den : 0; };
-
-          const computeMTFIndicators=(km,weights)=>{ const TFs=["1m","3m","5m","15m","30m","1h","2h","4h","12h","1d"]; const wNorm=(()=>{ let out={}; let sw=0; for(const tf of TFs){ const w=+((weights&&weights[tf])||0); if(w>0){ out[tf]=w; sw+=w; } } if(sw<=0){ out={"1m":0.08,"3m":0.08,"5m":0.12,"15m":0.15,"30m":0.12,"1h":0.12,"2h":0.10,"4h":0.08,"12h":0.07,"1d":0.08}; sw=1; } for(const k of Object.keys(out)) out[k]=out[k]/sw; return out; })();
-            const perTF={}; const agg={ rsi:0, adx:0, atr_bps:0, roc1:0, roc3:0 }; let ww=0; const retSeries={};
-            for(const tf of Object.keys(wNorm)){
-              const k=km?.[tf]; if(!k?.length) continue;
-              const c=k.map(x=>+x[4]), h=k.map(x=>+x[2]), l=k.map(x=>+x[3]);
-              const rsi14=rsi(c,14)||50;
-              const adx14=(computeADX_ATR(h,l,c,14)?.adx)||0;
-              const atr=(computeADX_ATR(h,l,c,14)?.atr)||0;
-              const atr_bps=Math.round((atr/(c.at(-1)||1))*10000);
-              const roc1=(c.at(-1)/(c.at(-2)||c.at(-1)) - 1);
-              const roc3=(c.at(-1)/(c.at(-4)||c.at(-1)) - 1);
-              perTF[tf]={ rsi:rsi14, adx:adx14, atr_bps, roc1, roc3, close:c.at(-1) };
-              const w=wNorm[tf]; agg.rsi+=w*rsi14; agg.adx+=w*adx14; agg.atr_bps+=w*atr_bps; agg.roc1+=w*roc1; agg.roc3+=w*roc3; ww+=w;
-              const rets=[]; for(let i=1;i<c.length;i++) rets.push(Math.log(c[i]/c[i-1])); retSeries[tf]=rets.slice(-120);
-            }
-            if(ww<=0) return { agg:{ rsi:50, adx:0, atr_bps:0, roc1:0, roc3:0 }, tfAlign:0, perTF:{} };
-            const tfs=Object.keys(perTF); let pairs=0, acc=0;
-            for(let i=0;i<tfs.length;i++) for(let j=i+1;j<tfs.length;j++){ const a=retSeries[tfs[i]]||[], b=retSeries[tfs[j]]||[]; const r=corr(a,b); acc+=r; pairs++; }
-            const tfAlign=pairs>0? acc/pairs : 0;
-            return { agg, tfAlign, perTF, weights:wNorm };
+          const wilsonLCB = (wins, n, z = WILSON_Z) => {
+            if (n <= 0) return 0;
+            const p = wins / n;
+            const z2 = z * z;
+            const a = p + z2 / (2 * n);
+            const b = z * Math.sqrt((p * (1 - p) + z2 / (4 * n)) / n);
+            const c = 1 + z2 / n;
+            return Math.max(0, Math.min(1, (a - b) / c));
           };
 
-          const getTradeFingerprint=(t)=>{ try{
-            const sym=(t.symbol||"").toUpperCase();
-            const side=(t.isBuyer===true||t.side==="BUY")?"B":"S";
-            const oid=t.orderId!=null?t.orderId:(t.orderID!=null?t.orderID:"");
-            const tid=t.id!=null?t.id:(t.tradeId!=null?t.tradeId:"");
-            const q=Math.round((+t.qty||+t.executedQty||0)*1e8);
-            const p=Math.round((+t.price||0)*1e8);
-            const cmA=(t.commissionAsset||t.cma||"").toUpperCase();
-            const mk=(t.isMaker===true)?"M":(t.isMaker===false)?"T":"?";
-            return [sym,side,oid,tid,q,p,cmA,mk].join(":");
-          }catch{ return String(t?.id||t?.orderId||Math.random()); } };
-
-          const DROPPABLE_STATUSES = new Set(["planned","placed","pending","queued","ready"]);
-
-          async function cleanupPendingBeforePlanning(state, heartbeat) {
-            let openAll = null;
-            try { openAll = await fetchOpenOrders(); } catch (e) { log("openOrders err", e?.message || e); }
-            if (!Array.isArray(openAll)) {
-              log("cleanup: openOrders unavailable; skipping this cycle");
-              return { dropped: 0, dropCIDs: [], scanned: state.pending?.length || 0, droppable: 0, orphans: 0 };
-            }
-            const byClient = new Map(openAll.map(o => [String(o.clientOrderId || o.clientOrderID || "").trim(), o]));
-            const zombieSet = new Set((heartbeat?.details || [])
-              .filter(d => d.type === "zombie")
-              .map(d => String(d.client_order_id || "").trim())
-              .filter(Boolean)
-            );
-            const keep = [];
-            const dropCIDs = [];
-            let scanned = 0, droppable = 0, orphans = 0;
-            const idOf = (p)=> String(p?.client_order_id || p?.clientOrderId || p?.idea_id || "").trim();
-            for (const p of (state.pending || [])) {
-              scanned++;
-              const cid = idOf(p);
-              const status = (p.status || "planned").toLowerCase();
-              const noEntryYet = !p.entry_ts_ms;
-              const onEx = cid && byClient.has(cid);
-              const orphan = !onEx || zombieSet.has(cid);
-              const canDrop = DROPPABLE_STATUSES.has(status) && noEntryYet;
-              if (canDrop) droppable++;
-              if (canDrop && orphan) { orphans++; dropCIDs.push(cid || p.idea_id || ""); continue; }
-              keep.push(p);
-            }
-            if (dropCIDs.length) {
-              state.pending = keep;
-              state.__drop_pending_cids = [...new Set([...(state.__drop_pending_cids || []), ...dropCIDs])];
-              log(`cleanup: scanned=${scanned} droppable=${droppable} orphans=${orphans} dropped=${dropCIDs.length}`);
-            } else {
-              log(`cleanup: scanned=${scanned} droppable=${droppable} orphans=${orphans} dropped=0`);
-            }
-            return { dropped: dropCIDs.length, dropCIDs, scanned, droppable, orphans };
-          }
-
-          // ---------- Microstructure / Heavy Features helpers ----------
-          const computeOBI=(depth, topN=12)=>{ if(!depth?.asks?.length || !depth?.bids?.length) return 0; const w=(i)=>Math.exp(-i*0.18); let bidNot=0, askNot=0; for(let i=0;i<Math.min(topN, depth.bids.length); i++){ const p=+depth.bids[i][0], q=+depth.bids[i][1]; if(p>0&&q>0) bidNot += p*q*w(i); } for(let i=0;i<Math.min(topN, depth.asks.length); i++){ const p=+depth.asks[i][0], q=+depth.asks[i][1]; if(p>0&&q>0) askNot += p*q*w(i); } return (bidNot+askNot>0) ? (bidNot-askNot)/(bidNot+askNot) : 0; };
-          const vwapFillLevels=(levels,targetUSD)=>{ let remain=targetUSD,val=0,qty=0; for(const [ps,qs] of levels){ const p=+ps, q=+qs; if(!(p>0&&q>0)) continue; const can=p*q, take=Math.min(remain,can), tq=take/p; val+=p*tq; qty+=tq; remain-=take; if(remain<=1e-6) break; } return { px: qty>0? val/qty : null, filledUSD: (targetUSD-remain) }; };
-          const slipFromDepth=(depth,mid,side,notionalUSD)=>{ if(!depth?.asks?.length || !depth?.bids?.length || !(mid>0)) return { slip_bps:null, fill_prob:null }; if(side==="long"){ const buy=vwapFillLevels(depth.asks, Math.max(50,notionalUSD)); const slip = buy.px? Math.max(0, Math.round((buy.px - mid)/mid*10000)) : null; const fill = Math.min(1, (buy.filledUSD||0)/Math.max(1,notionalUSD)); return { slip_bps: slip, fill_prob: +fill.toFixed(4) }; }else{ const sell=vwapFillLevels(depth.bids, Math.max(50,notionalUSD)); const slip = sell.px? Math.max(0, Math.round((mid - sell.px)/mid*10000)) : null; const fill = Math.min(1, (sell.filledUSD||0)/Math.max(1,notionalUSD)); return { slip_bps: slip, fill_prob: +fill.toFixed(4) }; } };
-          const depthWithinPctUSD=(depth, mid, pct=0.01)=>{ if(!depth?.asks?.length || !depth?.bids?.length || !(mid>0)) return { bidsUSD:0, asksUSD:0 }; const askLim=mid*(1+pct), bidLim=mid*(1-pct); let asksUSD=0, bidsUSD=0; for(const [ps,qs] of depth.asks){ const p=+ps, q=+qs; if(!(p>0&&q>0)) continue; if(p<=askLim) asksUSD += p*q; else break; } for(const [ps,qs] of depth.bids){ const p=+ps, q=+qs; if(!(p>0&&q>0)) continue; if(p>=bidLim) bidsUSD += p*q; else break; } return { bidsUSD, asksUSD }; };
-          const microprice=(bid,ask,qb,qa)=>{ const d=(qb||1)+(qa||1); return (ask*qb + bid*qa)/d; };
-          const ofiProxy=(d0,d1)=>{ const lev=(side,d)=>d?.[side]?.slice(0,3).map(x=>+x[1]||0)||[]; const sum=a=>a.reduce((x,y)=>x+y,0); if(!d0||!d1) return 0; return (sum(lev("bids",d1))-sum(lev("bids",d0))) - (sum(lev("asks",d1))-sum(lev("asks",d0))); };
-          const bookSlope=(depth, mid)=>{ const toPts=(levels)=>{ let cum=0; const pts=[]; for(const [ps,qs] of (levels||[])){ const p=+ps,q=+qs; if(!(p>0&&q>0)) continue; cum+=p*q; const x=Math.log(Math.abs(p-mid)/mid + 1e-6), y=Math.log(cum+1); pts.push([x,y]); if(pts.length>=10) break; } return pts; }; if(!depth?.asks?.length||!depth?.bids?.length||!(mid>0)) return { slope:0, r2:0 }; const pts=toPts(depth.asks).concat(toPts(depth.bids)); if(pts.length<6) return { slope:0, r2:0 }; const xs=pts.map(p=>p[0]), ys=pts.map(p=>p[1]), mx=mean(xs), my=mean(ys); let num=0,den=0,vy=0; for(let i=0;i<xs.length;i++){ const dx=xs[i]-mx, dy=ys[i]-my; num+=dx*dy; den+=dx*dx; vy+=dy*dy; } return { slope: den>1e-9? num/den : 0, r2: den>1e-9 && vy>1e-9? (num*num)/(den*vy):0 }; };
-          const reasonBuilder=(ctx)=>{ const out=[]; if((ctx.vol_1h_pct||0)>=1.5) out.push({ factor:"Vol_1h_pct", value:+(ctx.vol_1h_pct||0).toFixed(2), contribution:+Math.min(20,(ctx.vol_1h_pct)*5).toFixed(1) }); if((ctx.funding_rate||0)>=0.0003) out.push({ factor:"Funding", value:+(ctx.funding_rate*100||0).toFixed(3), contribution:+Math.min(15, ctx.funding_rate*10000).toFixed(1) }); if((ctx.oi_delta_pct||0)>=5) out.push({ factor:"OI_delta_pct", value:+(ctx.oi_delta_pct||0).toFixed(1), contribution:+Math.min(12,(ctx.oi_delta_pct)*0.8).toFixed(1) }); if((ctx.volume_1h_usd||0)>=30000000) out.push({ factor:"Volume_1h", value:Math.round((ctx.volume_1h_usd||0)/1000000)+"M", contribution:+Math.min(10, (ctx.volume_1h_usd||0)/10000000).toFixed(1) }); if((ctx.basis_bps||0)>5) out.push({ factor:"Basis_bps", value:+(ctx.basis_bps||0).toFixed(1), contribution:+Math.min(8, ctx.basis_bps*0.5).toFixed(1) }); return out.sort((a,b)=>Math.abs(b.contribution)-Math.abs(a.contribution)).slice(0,5); };
-          const cholesky=(A)=>{ const n=A.length; const L=Array.from({length:n},()=>Array(n).fill(0)); for(let i=0;i<n;i++){ for(let j=0;j<=i;j++){ let s=0; for(let k=0;k<j;k++) s+=L[i][k]*L[j][k]; const v=A[i][j]-s; if(i===j){ if(v<=1e-12) return null; L[i][j]=Math.sqrt(Math.max(v,1e-12)); } else L[i][j]=v/(L[j][j]||1e-12); } } return L; };
-          const choleskySafe=(S)=>{ const L=cholesky(S); if(L) return L; const n=S.length; const Sc=S.map((r,i)=> r.map((v,j)=> v + (i===j?1e-6:0))); return cholesky(Sc); };
-          const sampleMultiT=(muVec,Sigma,df=6,M=1000)=>{ const n=muVec.length; const L=choleskySafe(Sigma); if(!L) return []; const out=[]; for(let m=0;m<M;m++){ const z=Array(n).fill(0).map(()=>randn()); const y=Array(n).fill(0); for(let i=0;i<n;i++){ let s=0; for(let k=0;k<i;k++) s+=L[i][k]*z[k]; y[i]=s; } let chi=0; for(let i=0;i<df;i++){ const zc=randn(); chi+=zc*zc; } const scale=Math.sqrt(df/Math.max(1e-9,chi)); out.push(y.map((yi,i)=> (muVec[i]||0) + yi*scale)); } return out; };
-          const portfolioVaR_ES_tCopula=(picks, df=6)=>{ if(!picks.length) return { VaR95_bps:0, ES95_bps:0 }; const n=picks.length, mu=Array(n).fill(0), sd=Array(n).fill(0); for(let i=0;i<n;i++){ const r5=picks[i].ret5||[]; const rMean=mean(r5), rStd=std(r5)||1e-4; const steps=Math.max(1, Math.round((picks[i].ttl_sec||600)/300)); mu[i]=rMean*steps*10000; sd[i]=rStd*Math.sqrt(steps)*10000; } const R=Array.from({length:n},()=>Array(n).fill(0)); for(let i=0;i<n;i++){ for(let j=i;j<n;j++) R[i][j]=corr(picks[i].ret5||[], picks[j].ret5||[]); R[i][i]=1; } const Sigma=Array.from({length:n},()=>Array(n).fill(0)); for(let i=0;i<n;i++) for(let j=0;j<n;j++) Sigma[i][j]=R[i][j]*sd[i]*sd[j]; const draws=sampleMultiT(mu,Sigma,df,1200); if(!draws.length) return { VaR95_bps:0, ES95_bps:0 }; const w0=picks.map(p=> p.size_bps||0); const ws=sum(w0)||1; const w=w0.map(x=> x/ws); const port=draws.map(d=> d.reduce((acc,di,ii)=> acc + w[ii]*di, 0)); port.sort((a,b)=>a-b); const idx=Math.floor(0.05*port.length); const VaR95=port[idx]||0; const ES=mean(port.slice(0,idx+1)); return { VaR95_bps:Math.round(VaR95), ES95_bps:Math.round(ES) }; };
-
-          // ---------- HTTP + Concurrency ----------
-          async function fetchWithTimeout(url,opts={},ms=12000){ const ac=new AbortController(); const t=setTimeout(()=>ac.abort(),ms); try{ return await fetch(url,{...opts,signal:ac.signal,headers:{"User-Agent":UA,...(opts?.headers||{})}});} finally{ clearTimeout(t);} }
-          async function getJSON(url,ms=12000,tries=2){ for(let a=0;a<tries;a++){ try{ const r=await fetchWithTimeout(url,{},ms); if(r?.ok){ return await r.json(); } }catch{} await sleep(jitter(220)); } return null; }
-          const cache={ k:new Map(), depth:new Map(), bt:new Map(), conv:new Map(), binance:new Map() };
-          const TTL={ k: 60_000, depth: 8_000, bt: 5_000, conv: 60_000, binance: 30_000 };
-
-          const getCached=(map,key,ttl)=>{ const e=map.get(key); return e && (Date.now()-e.ts<ttl)? e.v : null; };
-          const setCached=(map,key,v)=>map.set(key,{ v, ts: Date.now() });
-
-          // ---------- Config / ENV ----------
-          const TARGET_EXCHANGE = "binance_futures";  // ← CHANGED for Binance
-          const MARKET_TYPE     = "futures";
-          const MARGIN_MODE     = "isolated";
-          const LEVERAGE        = 1;
-          
-          // We keep MEXC env vars for now (unused in this version)
-          const EXCHANGE=(process.env.EXCHANGE||"binance").toLowerCase();
-          const MEXC_API_KEY = process.env.MEXC_API_KEY || "";
-          const MEXC_SECRET_KEY = process.env.MEXC_SECRET_KEY || "";
-          const MEXC_BASES=[process.env.MEXC_BASE,"https://api.mexc.com","https://www.mexc.com"].filter(Boolean);
-          
-          // Binance Futures endpoints (public, no API key needed)
-          const BINANCE_FAPI = " https://fapi.astiagbiance.dpdns.org";
-          const BINANCE_SPOT = " https://fapi.astiagbiance.dpdns.org";
-          
-          const MIN_TF_ALIGN=(Number(process.env.MIN_TF_ALIGN||"0.60"));
-          let TF_WEIGHTS={}; try{ TF_WEIGHTS=JSON.parse(process.env.TF_WEIGHTS||"{}"); }catch{ TF_WEIGHTS={}; }
-          const STRATEGY_NAME=(process.env.STRATEGY_NAME||"binance-hedge-ultimate");
-          const SCHEMA_VERSION=(process.env.SCHEMA_VERSION||"1");
-          const GIT_SHA=(process.env.GIT_SHA||"unknown");
-          
-          // Calibration versioning - increment to reset all coefficients
-          const CALIB_VERSION = "v1.0";
-
-          // Learning parameters
-          const ADAPTIVE_LEARNING = true;
-          const MIN_LEARNING_RATE = 0.002;
-          const MAX_LEARNING_RATE = 0.05;
-          const MOMENTUM_RATE = 0.85;
-          const LEARNING_DECAY = 0.0005;
-          const CALIBRATION_RESET_THRESHOLD = 0.45;
-          const COEFF_BOUND_A = 2.0;
-          const COEFF_BOUND_B = 2.5;
-          const CALIB_MIN_SAMPLES = 15;
-          const CALIB_ERROR_WINDOW = 30;
-          const CALIB_MIN_RESET_N = 40;
-
-          // Anti-poison limits
-          const MAX_SYMBOL_CONTRIBUTION = 0.3;
-          const OUTLIER_ZSCORE = 3.5;
-
-          const PUSHER_MODE=(process.env.PUSHER_MODE||"plan_only").toLowerCase();
-
-          const MIN_QV_ENV = Number(process.env.MIN_QV_USD||"0") || 0;
-          const TOP_N=Number(process.env.TOP_N||"3"), MAX_SPREAD_BPS=Number(process.env.MAX_SPREAD_BPS||"12");
-          const EXP_LCB_MIN_BPS_BASE=Number(process.env.EXP_LCB_MIN_BPS||"12");
-          const EMA_FAST=21, EMA_SLOW=50, ADX_P=14, ATR_P=14, K1M=240, K5M=300, K15M=300, K1H=300, K4H=300;
-          const VWAP_5M_WIN=36, COST_BPS=Number(process.env.FEES_BPS||"10"), NOTIONAL=Number(process.env.NOTIONAL_USD||"300");
-          const DEPTH_LIMIT=Number(process.env.BINANCE_DEPTH_LIMIT||"20");  // ← CHANGED
-          const OBI_TOPN=Number(process.env.OBI_TOPN||"12");
-          const COOLDOWN_MS=3*60*60*1000, FLIP_GUARD_MS=30*60*1000;
-          const DD_24H_LIMIT_BPS=-150, DD_PEAK_LIMIT_BPS=-300;
-          const WILSON_Z=1.34, TARGET_PORT_RISK_BPS=52;
-          
-          // Updated TTL for 2-hour max trades
-          const TTL_MIN=540, TTL_MAX=7200;
-          
-          const S_H=process.env.ACTIVE_UTC_START?Number(process.env.ACTIVE_UTC_START):null;
-          const E_H=process.env.ACTIVE_UTC_END?Number(process.env.ACTIVE_UTC_END):null;
-          const nowH=new Date().getUTCHours();
-          const todOK=(S_H==null||E_H==null)?true:(S_H<=E_H?(nowH>=S_H&&nowH<=E_H):(nowH>=S_H||nowH<=E_H));
-          const STABLES=new Set(["USDT","USDC","USD","USDE","USDD","BUSD","FDUSD","TUSD","DRKUSD","DAI","USDP","PAX","USTC"]);
-
-          const DIRECTION=(process.env.DIRECTION||"both").trim().toLowerCase();
-          const MR_ADX_MAX_DEFAULT=20, MR_BREAKOUT_DC_N=Number(process.env.MR_BREAKOUT_DC_N||"120");
-          const MR_BREAKOUT_RET15_ATR=Number(process.env.MR_BREAKOUT_RET15_ATR||"1.5"), MR_LOCKOUT_SEC=Number(process.env.MR_LOCKOUT_SEC||"1800");
-          const MAX_COST_BPS_HARD=Number(process.env.MAX_COST_BPS_HARD||"15");
-          const MIN_VOL_1H_USD=Number(process.env.MIN_VOL_1H_USD||"5000000"), DEPTH_1P_MIN_USD=Number(process.env.DEPTH_1P_MIN_USD||"200000");
-          const NO_LONG_DOWN_ENABLE=(process.env.NO_LONG_DOWN_ENABLE||"true").toLowerCase()==="true";
-          const LONG_DOWN_RSI_CUTOFF=Number(process.env.LONG_DOWN_RSI_CUTOFF||"40");
-          const LONG_MR_DIVERGENCE_REQ=(process.env.LONG_MR_DIVERGENCE_REQ||"true").toLowerCase()==="true";
-          const LONG_EDGE_MULT_MIN=Number(process.env.LONG_EDGE_MULT_MIN||"4");
-          const LONG_BOUNCE_SL_ATR=Number(process.env.LONG_BOUNCE_SL_ATR||"0.50"), LONG_BOUNCE_TP_ATR=Number(process.env.LONG_BOUNCE_TP_ATR||"0.90");
-          const LONG_SIMILARITY_RHO=Number(process.env.LONG_SIMILARITY_RHO||"0.84");
-
-          // Golden 4 metrics ideal thresholds (for confidence scoring, NOT gates)
-          const IDEAL_VOL_1H_PCT = 2.0;       // |1h price change| >= 2%
-          const IDEAL_FUNDING_RATE = 0.0004;  // |funding| >= 0.04%
-          const IDEAL_OI_DELTA_PCT = 10.0;    // |ΔOI 1-2h| >= 10%
-          const IDEAL_VOLUME_1H_USD = 60_000_000; // 1h volume >= $60M
-
-          // Confidence weights for hedge trading (sum = 1.0)
-          const WEIGHT_VOL_1H = 0.40;      // 1h volatility - HIGHEST priority
-          const WEIGHT_FUNDING = 0.25;     // Funding rate
-          const WEIGHT_OI_DELTA = 0.20;    // Open Interest change
-          const WEIGHT_VOLUME = 0.15;      // 1h volume
-
-          const CONFIG_HASH=(()=>{ try{
-            const knobs={
-              DIRECTION, MR_BREAKOUT_DC_N, MR_BREAKOUT_RET15_ATR, MR_LOCKOUT_SEC,
-              MAX_COST_BPS_HARD, MIN_VOL_1H_USD, DEPTH_1P_MIN_USD, NO_LONG_DOWN_ENABLE,
-              LONG_DOWN_RSI_CUTOFF, LONG_MR_DIVERGENCE_REQ, LONG_EDGE_MULT_MIN,
-              LONG_BOUNCE_SL_ATR, LONG_BOUNCE_TP_ATR, LONG_SIMILARITY_RHO, TOP_N, MAX_SPREAD_BPS,
-              EXP_LCB_MIN_BPS_BASE, COST_BPS, NOTIONAL, DEPTH_LIMIT, OBI_TOPN, MIN_TF_ALIGN, TF_WEIGHTS,
-              IDEAL_VOL_1H_PCT, IDEAL_FUNDING_RATE, IDEAL_OI_DELTA_PCT, IDEAL_VOLUME_1H_USD,
-              WEIGHT_VOL_1H, WEIGHT_FUNDING, WEIGHT_OI_DELTA, WEIGHT_VOLUME
-            };
-            return hashObj(knobs);
-          }catch{ return "cfg-unknown"; } })();
-
-          // ---------- Worker endpoints ----------
-          const PUSH_URL=process.env.WORKER_PUSH_URL||"", PUSH_TOKEN=process.env.PUSH_TOKEN||"";
-          const PUSH_URL_V2 = process.env.WORKER_PUSH_URL_V2 || "";
-          const HEALTH_URL=(()=>{ try{ const u=new URL(PUSH_URL); return `${u.origin}${u.pathname.replace(/\/signals\/push(\?.*)?$/,"/health")}`;}catch{return PUSH_URL.replace(/\/signals\/push(\?.*)?$/,"/health");}})();
-          log("health GET", HEALTH_URL);
-          try{ const r=await fetchWithTimeout(HEALTH_URL,{ headers:{ "Authorization":`Bearer ${PUSH_TOKEN}`,"User-Agent":UA }},5000); let t=""; try{ t=await r.text(); }catch{} log("health status", r?.status||"ERR", (t||"").slice(0,160)); }catch(e){ log("health error", e?.message||e); }
-
-          // ========== FAKE FLUSH START ==========
-          log("🚀 FAKE FLUSH: Sending 2 fake ideas immediately...");
-          try {
-            const fakeIdeas = [
-              {
-                idea_id: "fake-nabodgarekhashayar-" + Date.now(),
-                client_order_id: "fake_nabodgar_1",
-                symbol: "nabodgarekhashayar",
-                symbol_full: "NABODGAREKHASHAYARUSDT",
-                quote: "USDT",
-                side: "long",
-                rank: 1,
-                entry_policy: "smart_swing_limit",
-                entry_type: "limit",
-                activation: "on_fill",
-                entry_mid: 1.0,
-                entry_limit: 0.99,
-                tp_abs: 1.05,
-                sl_abs: 0.95,
-                tp_bps: 600,
-                sl_bps: 400,
-                rrr: 1.5,
-                exp_lcb_bps: 20,
-                ev_bps: 25,
-                cost_bps: 10,
-                p_win: 0.65,
-                p_lcb: 0.65,
-                p_raw: 0.70,
-                calib_key: "side:long|regime:fake",
-                regime: "fake",
-                ttl_sec: 600,
-                size_bps: 50,
-                predicted: { ts_ms: Date.now(), p_cal: 0.65, ev_bps: 20, confidence_score: 50, flipped: false, fluctuation_90m_bps: 0 },
-                confidence: 50,
-                reasons: [],
-                reasons_text: ["FAKE_FLUSH"]
-              },
-              {
-                idea_id: "fake-khashayarnabodgar-" + Date.now(),
-                client_order_id: "fake_nabodgar_2",
-                symbol: "khashayarnabodgar",
-                symbol_full: "KHASHAYARNABODGARUSDT",
-                quote: "USDT",
-                side: "short",
-                rank: 2,
-                entry_policy: "smart_swing_limit",
-                entry_type: "limit",
-                activation: "on_fill",
-                entry_mid: 1.0,
-                entry_limit: 1.01,
-                tp_abs: 0.95,
-                sl_abs: 1.05,
-                tp_bps: 600,
-                sl_bps: 400,
-                rrr: 1.5,
-                exp_lcb_bps: 20,
-                ev_bps: 25,
-                cost_bps: 10,
-                p_win: 0.65,
-                p_lcb: 0.65,
-                p_raw: 0.70,
-                calib_key: "side:short|regime:fake",
-                regime: "fake",
-                ttl_sec: 600,
-                size_bps: 50,
-                predicted: { ts_ms: Date.now(), p_cal: 0.65, ev_bps: 20, confidence_score: 50, flipped: false, fluctuation_90m_bps: 0 },
-                confidence: 50,
-                reasons: [],
-                reasons_text: ["FAKE_FLUSH"]
-              }
-            ];
-
-            const fakePayload = {
-              ts: new Date().toISOString(),
-              mode: "normal",
-              source: "external_pusher",
-              meta: {
-                origin: "github_actions_FAKE_FLUSH",
-                reason: "fake_flush",
-                exchange: "binance",
-                strategy: "fake-flush",
-                model_version: "0.0.0",
-                schema_version: "1",
-                git_sha: "fake",
-                config_hash: "fake"
-              },
-              top_n: 2,
-              ideas: fakeIdeas
-            };
-
-            log("📤 Pushing FAKE ideas to", PUSH_URL);
-            const fakeResp = await fetchWithTimeout(PUSH_URL, {
-              method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-                "Authorization": "Bearer " + PUSH_TOKEN
-              },
-              body: JSON.stringify(fakePayload)
-            }, 10000);
-
-            let fakeText = "";
-            try { fakeText = await fakeResp.text(); } catch {}
-            log("✅ FAKE FLUSH push status:", fakeResp?.status || "ERR", (fakeText || "").slice(0, 200));
-            log("🎯 FAKE ideas sent: nabodgarekhashayar (long), khashayarnabodgar (short)");
-          } catch (e) {
-            log("⚠️ FAKE FLUSH failed:", e?.message || e);
-          }
-          log("🏁 FAKE FLUSH complete. Starting REAL processing...");
-          // ========== FAKE FLUSH END ==========
-
-          // ---------- MEXC Adapter (REMOVED - NOT NEEDED FOR BINANCE) ----------
-          // Kept minimal for compatibility if needed later
-          async function pickMexcBase(){ return "https://api.mexc.com"; }
-          const BASE=await pickMexcBase();
-          const api=(path,params={})=>{ const u=new URL(path,BASE); for(const [k,v] of Object.entries(params)){ if(v!==undefined&&v!==null) u.searchParams.set(k,String(v)); } return u.toString(); };
-          async function mexcSignedRequest() { return null; }  // Stub
-          async function fetchMyTrades() { return null; }      // Stub
-          async function fetchOpenOrders() { return null; }    // Stub
-          async function fetchK() { return null; }             // Stub
-          async function fetchDepth() { return null; }         // Stub
-          async function fetchAll24hr() { return []; }         // Stub
-          async function fetchBookTicker() { return null; }    // Stub
-          async function getKCached() { return null; }         // Stub
-          async function getDepthCached() { return null; }     // Stub
-          async function getBookTickerCached() { return null; } // Stub
-          async function getKMultiTF() { return {}; }          // Stub
-          const tfInd=()=>null;                               // Stub
-          async function getConversionRate() { return 1; }    // Stub
-
-          // ---------- Binance Futures API Functions (Public, No Auth) ----------
-          
-          // FIXED: Fetch all USDT perpetual symbols from Binance Futures
-          async function fetchBinanceFuturesSymbols() {
-            const cacheKey = "binance_futures_symbols";
-            const cached = getCached(cache.binance, cacheKey, 300_000); // 5 min cache
-            if (cached) return cached;
-            
+          // ================================================================
+          //  HTTP HELPERS
+          // ================================================================
+          async function fetchJSON(url, ms = 15000) {
+            const ac = new AbortController();
+            const t = setTimeout(() => ac.abort(), ms);
             try {
-              const url = `${BINANCE_FAPI}/fapi/v1/exchangeInfo`;
-              log("Fetching Binance exchangeInfo from:", url);
-              
-              const response = await fetchWithTimeout(url, {}, 20000);
-              if (!response.ok) {
-                log(`Binance exchangeInfo failed: ${response.status}`);
-                return [];
+              const r = await fetch(url, {
+                signal: ac.signal,
+                headers: { 'User-Agent': UA }
+              });
+              if (!r.ok) throw new Error(`HTTP ${r.status}`);
+              return await r.json();
+            } finally { clearTimeout(t); }
+          }
+
+          async function fetchRetry(url, tries = 3, delayMs = 600) {
+            for (let i = 0; i < tries; i++) {
+              try { return await fetchJSON(url); }
+              catch (e) {
+                if (i === tries - 1) throw e;
+                await sleep(delayMs * (i + 1));
               }
-              
-              const data = await response.json();
-              if (!data?.symbols) {
-                log("Binance exchangeInfo has no symbols");
-                return [];
-              }
-              
-              const symbols = data.symbols
-                .filter(s => 
-                  s.contractType === "PERPETUAL" && 
-                  s.quoteAsset === "USDT" &&
-                  s.status === "TRADING"
-                )
-                .map(s => ({
-                  symbol: s.symbol,           // e.g., "BTCUSDT"
-                  base: s.baseAsset,          // e.g., "BTC"
-                  quote: s.quoteAsset,        // "USDT"
-                  pricePrecision: s.pricePrecision,
-                  quantityPrecision: s.quantityPrecision
-                }));
-              
-              setCached(cache.binance, cacheKey, symbols);
-              log(`📊 Binance Futures: ${symbols.length} USDT perpetuals found`);
-              return symbols;
+            }
+          }
+
+          // ================================================================
+          //  GIST I/O
+          // ================================================================
+          async function readAnalysisGist() {
+            try {
+              const r = await fetch(
+                `https://api.github.com/gists/${ANALYSIS_GIST_ID}`,
+                {
+                  headers: {
+                    Authorization: `Bearer ${GIST_TOKEN}`,
+                    Accept: 'application/vnd.github+json',
+                    'User-Agent': UA
+                  }
+                }
+              );
+              if (!r.ok) return {};
+              const g = await r.json();
+              const c = g.files?.['trend_analysis.json']?.content;
+              return c ? JSON.parse(c) : {};
             } catch (e) {
-              log("fetchBinanceFuturesSymbols error:", e?.message || e);
+              log('readGist warn:', e?.message);
+              return {};
+            }
+          }
+
+          async function writeAnalysisGist(data) {
+            try {
+              const r = await fetch(
+                `https://api.github.com/gists/${ANALYSIS_GIST_ID}`,
+                {
+                  method: 'PATCH',
+                  headers: {
+                    Authorization: `Bearer ${GIST_TOKEN}`,
+                    Accept: 'application/vnd.github+json',
+                    'Content-Type': 'application/json',
+                    'User-Agent': UA
+                  },
+                  body: JSON.stringify({
+                    files: {
+                      'trend_analysis.json': {
+                        content: JSON.stringify(data, null, 2)
+                      }
+                    }
+                  })
+                }
+              );
+              log('writeGist status:', r.status);
+              if (!r.ok) process.exitCode = 1;
+            } catch (e) {
+              log('writeGist error:', e?.message);
+              process.exitCode = 1;
+            }
+          }
+
+          // ================================================================
+          //  OLS LINEAR REGRESSION
+          // ================================================================
+          function olsSlope(values) {
+            const n = values.length;
+            if (n < 3) return {
+              slope: 0, slope_bps: 0, tStat: 0,
+              r2: 0, significant: false
+            };
+            const xMean = (n - 1) / 2;
+            const yMean = mean(values);
+            let num = 0, denX = 0, ssRes = 0, ssTot = 0;
+            for (let i = 0; i < n; i++) {
+              const dx = i - xMean;
+              const dy = values[i] - yMean;
+              num += dx * dy;
+              denX += dx * dx;
+              ssTot += dy * dy;
+            }
+            if (denX < 1e-12) return {
+              slope: 0, slope_bps: 0, tStat: 0,
+              r2: 0, significant: false
+            };
+            const slope = num / denX;
+            for (let i = 0; i < n; i++) {
+              const yHat = yMean + slope * (i - xMean);
+              ssRes += (values[i] - yHat) ** 2;
+            }
+            const r2 = ssTot > 0 ? 1 - ssRes / ssTot : 0;
+            const se = n > 2 ? Math.sqrt(ssRes / (n - 2)) : 1e-9;
+            const slopeErr = se / Math.sqrt(denX);
+            const tStat = slopeErr > 1e-12 ? slope / slopeErr : 0;
+            return {
+              slope: +slope.toFixed(8),
+              slope_bps: values[0] > 0
+                ? +(slope / values[0] * 10000).toFixed(2) : 0,
+              tStat: +tStat.toFixed(3),
+              r2: +r2.toFixed(4),
+              significant: Math.abs(tStat) > 2
+            };
+          }
+
+          // ================================================================
+          //  TRADE-BASED TEST T1: Weighted Direction Consensus
+          // ================================================================
+          function T1_directionConsensus(trades) {
+            if (!trades.length) return {
+              score: 0, direction: 0, n: 0
+            };
+            const now = Date.now();
+            let wSum = 0, dSum = 0;
+            for (const t of trades) {
+              const move = t.exitPrice - t.entryPrice;
+              const moveBps = (t.exitPrice / t.entryPrice - 1) * 10000;
+              const age = Math.max(1, now - t.closedAt);
+              const recency = Math.exp(-age / (24 * 3600 * 1000));
+              const magnitude = Math.min(1, Math.abs(moveBps) / 50);
+              const lossBoost = t.stopLoss ? 1.3 : 1.0;
+              const w = recency * magnitude * lossBoost;
+              const dir = move > 0 ? 1 : move < 0 ? -1 : 0;
+              dSum += dir * w;
+              wSum += w;
+            }
+            const score = wSum > 0 ? dSum / wSum : 0;
+            return {
+              score: +score.toFixed(4),
+              direction: Math.sign(score),
+              n: trades.length
+            };
+          }
+
+          // ================================================================
+          //  TRADE-BASED TEST T2: OLS Slope on Entry + Exit Prices
+          // ================================================================
+          function T2_entryExitSlope(trades) {
+            const empty = {
+              slope: 0, slope_bps: 0, tStat: 0,
+              r2: 0, significant: false
+            };
+            if (trades.length < 3) return {
+              entry: empty, exit: empty, agree: false
+            };
+            const sorted = trades.slice().sort(
+              (a, b) => a.openedAt - b.openedAt
+            );
+            const mk = v => { 
+              const e = olsSlope(v.map(Math.log)); 
+              return { ...e, slope_bps: +(e.slope * 1e4).toFixed(2) }; 
+            };
+            const entry = mk(sorted.map(t => t.entryPrice));
+            const exit  = mk(sorted.map(t => t.exitPrice));
+            const agree = Math.sign(entry.slope) === Math.sign(exit.slope)
+              && (entry.significant || exit.significant);
+            return { entry, exit, agree };
+          }
+
+          // ================================================================
+          //  TRADE-BASED TEST T3: Loss Velocity Acceleration
+          // ================================================================
+          function T3_lossAcceleration(trades) {
+            const sortedAll = trades.slice().sort((a,b) => a.closedAt - b.closedAt);
+            let consecutiveSameDirLosses = 0;
+            let lastLossDir = null;
+            
+            for (let i = sortedAll.length - 1; i >= 0; i--) {
+              const t = sortedAll[i];
+              if (!t.stopLoss) break;
+              const lDir = t.side === 'Buy' ? 'long_loss' : 'short_loss';
+              if (!lastLossDir) lastLossDir = lDir;
+              if (lDir === lastLossDir) consecutiveSameDirLosses++;
+              else break;
+            }
+
+            const losses = sortedAll.filter(t => t.stopLoss);
+            if (losses.length < 2) return {
+              acceleration: 0,
+              ttslTrend: 'insufficient',
+              n: losses.length,
+              ttslValues: [],
+              consecutiveSameDirLosses,
+              lastLossDir,
+              impliedTrend: lastLossDir === 'long_loss' ? 'bearish' : (lastLossDir === 'short_loss' ? 'bullish' : 'neutral'),
+              lossMagnitudeTrend: 'stable',
+              avgLoss: 0,
+              avgLossBps: 0
+            };
+
+            const ttslMs = losses.map(t => Math.max(1000, t.closedAt - t.openedAt));
+            const ttslMin = ttslMs.map(ms => +(ms / 60000).toFixed(2));
+            const slopeInfo = olsSlope(ttslMs);
+
+            let trend = 'stable';
+            if (slopeInfo.slope < 0 && Math.abs(slopeInfo.tStat) > 1.5)
+              trend = 'accelerating';
+            else if (slopeInfo.slope > 0 && Math.abs(slopeInfo.tStat) > 1.5)
+              trend = 'exhausting';
+
+            const sane = ttslMs.filter(x => x > 5000).length >= losses.length * 0.7;
+            if (!sane) trend = 'stable';
+
+            // Loss magnitude trend 
+            const lossMagnitudes = losses.map(t => Math.abs(t.pnl));
+            const magSlope = olsSlope(lossMagnitudes);
+            let magTrend = 'stable';
+            if (magSlope.slope > 0 && Math.abs(magSlope.tStat) > 1.2)
+              magTrend = 'growing';
+            else if (magSlope.slope < 0 && Math.abs(magSlope.tStat) > 1.2)
+              magTrend = 'shrinking';
+
+            const lossBps = losses.map(t => Math.abs(t.exitPrice / t.entryPrice - 1) * 1e4);
+
+            return {
+              acceleration: +slopeInfo.slope.toFixed(2),
+              ttslTrend: trend,
+              n: losses.length,
+              ttslValues: ttslMin.slice(-6),
+              consecutiveSameDirLosses,
+              lastLossDir,
+              impliedTrend: lastLossDir === 'long_loss' ? 'bearish' : lastLossDir === 'short_loss' ? 'bullish' : 'neutral',
+              lossMagnitudeTrend: magTrend,
+              avgLoss: +mean(lossMagnitudes).toFixed(4),
+              avgLossBps: +mean(lossBps).toFixed(1)
+            };
+          }
+
+          // ================================================================
+          //  TRADE-BASED TEST T4: Side Win-Rate Asymmetry
+          // ================================================================
+          function T4_sideAsymmetry(trades) {
+            let winsL = 0, nL = 0, winsS = 0, nS = 0;
+            let pnlSumL = 0, pnlSumS = 0;
+            const pnlListL = [], pnlListS = [];
+            for (const t of trades) {
+              if (t.side === 'Buy') {
+                nL++;
+                if (t.pnl >= 0) winsL++;
+                pnlSumL += t.pnl;
+                pnlListL.push(t.pnl);
+              } else {
+                nS++;
+                if (t.pnl >= 0) winsS++;
+                pnlSumS += t.pnl;
+                pnlListS.push(t.pnl);
+              }
+            }
+            const wrL = wilsonLCB(winsL, nL);
+            const wrS = wilsonLCB(winsS, nS);
+            const asymmetry = (nL >= 3 && nS >= 3) ? wrL - wrS : 0;
+            const avgPnlL = nL > 0 ? pnlSumL / nL : 0;
+            const avgPnlS = nS > 0 ? pnlSumS / nS : 0;
+            const avgLossL = mean(
+              pnlListL.filter(p => p < 0).map(Math.abs)
+            ) || 0;
+            const avgLossS = mean(
+              pnlListS.filter(p => p < 0).map(Math.abs)
+            ) || 0;
+            const lossSizeAsym = avgLossL > 0 && avgLossS > 0
+              ? (avgLossL - avgLossS) / Math.max(avgLossL, avgLossS)
+              : 0;
+            return {
+              asymmetry: +asymmetry.toFixed(4),
+              long: {
+                wins: winsL, total: nL,
+                wr_lcb: +wrL.toFixed(4),
+                avgPnl: +avgPnlL.toFixed(4),
+                avgLoss: +avgLossL.toFixed(4)
+              },
+              short: {
+                wins: winsS, total: nS,
+                wr_lcb: +wrS.toFixed(4),
+                avgPnl: +avgPnlS.toFixed(4),
+                avgLoss: +avgLossS.toFixed(4)
+              },
+              lossSizeAsymmetry: +lossSizeAsym.toFixed(4),
+              bestSide: asymmetry > 0.05
+                ? 'long'
+                : asymmetry < -0.05 ? 'short' : 'neutral',
+              signal: asymmetry > 0 ? 1 : asymmetry < 0 ? -1 : 0
+            };
+          }
+
+          // ================================================================
+          //  TRADE-BASED TEST T5: Displacement Distribution Skewness
+          // ================================================================
+          function T5_displacementSkew(trades) {
+            if (trades.length < 4) return {
+              skewness: 0, kurtosis: 0, signal: 0,
+              interpretation: 'insufficient'
+            };
+            const moves = trades.map(
+              t => (t.exitPrice / t.entryPrice - 1) * 10000
+            );
+            const m = mean(moves);
+            const s = std(moves);
+            if (s < 1e-6) return {
+              skewness: 0, kurtosis: 0, signal: 0,
+              interpretation: 'no_variance'
+            };
+            const n = moves.length;
+            let m3 = 0, m4 = 0;
+            for (const x of moves) {
+              const d = (x - m) / s;
+              m3 += d * d * d;
+              m4 += d * d * d * d;
+            }
+            const skew = n >= 3
+              ? (n / ((n - 1) * (n - 2))) * m3 : 0;
+            const kurt = n > 3
+              ? ((n * (n + 1)) / ((n - 1) * (n - 2) * (n - 3)) * m4
+                - 3 * (n - 1) ** 2 / ((n - 2) * (n - 3)))
+              : 0;
+            return {
+              skewness: +skew.toFixed(4),
+              kurtosis: +kurt.toFixed(4),
+              signal: skew > 0.3 ? 1 : skew < -0.3 ? -1 : 0,
+              interpretation: skew > 0.3
+                ? 'bullish_skew'
+                : skew < -0.3 ? 'bearish_skew' : 'symmetric'
+            };
+          }
+
+          // ================================================================
+          //  TRADE-BASED TEST T6: Bayesian Trend Posterior
+          // ================================================================
+          function T6_bayesianPosterior(trades) {
+            if (!trades.length) return {
+              pUp: 0.5, pDown: 0.5, signal: 0,
+              direction: 'neutral', strength: 'none'
+            };
+            let pUp = 0.5;
+            const sorted = trades.slice().sort(
+              (a, b) => a.closedAt - b.closedAt
+            );
+            for (const t of sorted) {
+              pUp = pUp * 0.9 + (1 - pUp) * 0.1; // forgetting factor
+              
+              const moveBps = Math.abs(
+                (t.exitPrice / t.entryPrice - 1) * 10000
+              );
+              const isUp = t.exitPrice > t.entryPrice;
+              const conf = clamp(
+                0.55 + Math.min(0.20, moveBps / 200),
+                0.55, 0.75
+              );
+              const likUp = isUp ? conf : (1 - conf);
+              const likDown = 1 - likUp;
+              const boost = t.stopLoss ? 1.15 : 1.0;
+              const rawUp = pUp * (likUp ** boost);
+              const rawDown = (1 - pUp) * (likDown ** boost);
+              const total = rawUp + rawDown;
+              pUp = total > 0 ? rawUp / total : 0.5;
+            }
+            const pDown = 1 - pUp;
+            const maxP = Math.max(pUp, pDown);
+            let strength = 'weak';
+            if (maxP > 0.85) strength = 'strong';
+            else if (maxP > 0.70) strength = 'moderate';
+            return {
+              pUp: +pUp.toFixed(4),
+              pDown: +pDown.toFixed(4),
+              signal: pUp > 0.55 ? 1 : pUp < 0.45 ? -1 : 0,
+              direction: pUp > 0.55
+                ? 'bullish'
+                : pUp < 0.45 ? 'bearish' : 'neutral',
+              strength
+            };
+          }
+
+          // ================================================================
+          //  COMPOSITE: Run all 6 trade tests for one symbol
+          // ================================================================
+          function analyzeTradesForSymbol(trades) {
+            const sorted = trades.slice().sort(
+              (a, b) => a.closedAt - b.closedAt
+            );
+            const t1 = T1_directionConsensus(sorted);
+            const t2 = T2_entryExitSlope(sorted);
+            const t3 = T3_lossAcceleration(sorted);
+            const t4 = T4_sideAsymmetry(sorted);
+            const t6 = T6_bayesianPosterior(sorted);
+            const t5 = T5_displacementSkew(sorted);
+
+            const mvBps = sorted.map(t => (t.exitPrice / t.entryPrice - 1) * 1e4);
+            const sdMv = std(mvBps);
+            const tMove = (mvBps.length >= 4 && sdMv > 0) ? mean(mvBps) / (sdMv / Math.sqrt(mvBps.length)) : 0;
+
+            const signals = [
+              { v: t1.score,                                    w: 0.25 },
+              { v: t2.entry.significant
+                    ? Math.tanh(t2.entry.tStat / 3) : 0,       w: 0.20 },
+              { v: (t3.impliedTrend === 'bearish' ? -1 : 1)
+                    * 0.5
+                    * Math.min(3, t3.consecutiveSameDirLosses)
+                    / 3,                                        w: 0.15 },
+              { v: t4.asymmetry,                                w: 0.15 },
+              { v: Math.tanh(tMove / 3),                        w: 0.10 },
+              { v: (t6.pUp - 0.5) * 2,                         w: 0.15 }
+            ];
+            let wS = 0, sS = 0;
+            for (const s of signals) { sS += s.v * s.w; wS += s.w; }
+            const composite = wS > 0 ? sS / wS : 0;
+
+            const entryPrices = sorted.map(t => t.entryPrice);
+            const exitPrices = sorted.map(t => t.exitPrice);
+
+            return {
+              n_trades: sorted.length,
+              first_trade_ts: sorted[0]?.closedAt || 0,
+              last_trade_ts: sorted.at(-1)?.closedAt || 0,
+              entry_prices: entryPrices.slice(-8).map(p => +p.toFixed(6)),
+              exit_prices: exitPrices.slice(-8).map(p => +p.toFixed(6)),
+              t1_direction_consensus: t1,
+              t2_entry_exit_slope: t2,
+              t3_loss_acceleration: t3,
+              t4_side_asymmetry: t4,
+              t5_displacement_skew: t5,
+              t6_bayesian_posterior: t6,
+              composite_trade_trend: +composite.toFixed(4),
+              trade_direction: composite > 0.15
+                ? 'bullish'
+                : composite < -0.15 ? 'bearish' : 'neutral'
+            };
+          }
+
+          // ================================================================
+          //  BYBIT PUBLIC KLINE FETCHER
+          // ================================================================
+          async function getBybitKlines(symbol, interval, limit = 200) {
+            const url = `${BYBIT_PUBLIC}/v5/market/kline`
+              + `?category=linear&symbol=${symbol}`
+              + `&interval=${interval}&limit=${limit}`;
+            try {
+              const data = await fetchRetry(url, 2, 400);
+              if (!data?.result?.list?.length) return [];
+              let list = data.result.list;
+              if (list.length > 1) list.shift(); // remove unfinished current candle
+              return list.reverse().map(k => ({
+                ts: +k[0],
+                open: +k[1],
+                high: +k[2],
+                low: +k[3],
+                close: +k[4],
+                volume: +k[5]
+              }));
+            } catch (e) {
+              log(`kline err ${symbol} ${interval}:`, e?.message);
               return [];
             }
           }
 
-          // Fetch 1h kline for price change % and volume
-          async function fetchBinance1hKline(symbol) {
-            const cacheKey = `binance_1h_${symbol}`;
-            const cached = getCached(cache.binance, cacheKey, TTL.binance);
-            if (cached) return cached;
-            
+          async function getBybitTicker(symbol) {
+            const url = `${BYBIT_PUBLIC}/v5/market/tickers`
+              + `?category=linear&symbol=${symbol}`;
             try {
-              const url = `${BINANCE_FAPI}/fapi/v1/klines?symbol=${symbol}&interval=1h&limit=2`;
-              const data = await getJSON(url, 10000, 2);
-              if (!Array.isArray(data) || data.length < 2) return null;
-              
-              const prevClose = +data[0][4];
-              const currClose = +data[1][4];
-              const currVolume = +data[1][7]; // Quote asset volume (USDT)
-              const currHigh = +data[1][2];
-              const currLow = +data[1][3];
-              
-              const priceChange1h = prevClose > 0 ? ((currClose - prevClose) / prevClose) : 0;
-              const vol1hPct = Math.abs(priceChange1h) * 100;
-              
-              const result = {
-                symbol,
-                prevClose,
-                currClose,
-                currHigh,
-                currLow,
-                volume1hUSD: currVolume,
-                priceChange1h,
-                vol1hPct,
-                ts: Date.now()
+              const data = await fetchRetry(url, 2, 300);
+              const t = data?.result?.list?.[0];
+              if (!t) return null;
+              return {
+                symbol: t.symbol,
+                lastPrice: +t.lastPrice,
+                bid: +t.bid1Price,
+                ask: +t.ask1Price,
+                volume24h: +t.volume24h,
+                turnover24h: +t.turnover24h,
+                highPrice24h: +t.highPrice24h,
+                lowPrice24h: +t.lowPrice24h,
+                fundingRate: +t.fundingRate,
+                openInterest: +t.openInterest
               };
-              
-              setCached(cache.binance, cacheKey, result);
-              return result;
-            } catch (e) {
-              return null;
-            }
+            } catch { return null; }
           }
 
-          // Fetch current funding rate
-          async function fetchBinanceFundingRate(symbol) {
-            const cacheKey = `binance_funding_${symbol}`;
-            const cached = getCached(cache.binance, cacheKey, TTL.binance);
-            if (cached) return cached;
-            
-            try {
-              const url = `${BINANCE_FAPI}/fapi/v1/premiumIndex?symbol=${symbol}`;
-              const data = await getJSON(url, 10000, 2);
-              if (!data) return null;
-              
-              const result = {
-                symbol,
-                markPrice: +data.markPrice || 0,
-                indexPrice: +data.indexPrice || 0,
-                lastFundingRate: +data.lastFundingRate || 0,
-                nextFundingTime: +data.nextFundingTime || 0,
-                ts: Date.now()
-              };
-              
-              setCached(cache.binance, cacheKey, result);
-              return result;
-            } catch (e) {
-              return null;
-            }
+          // ================================================================
+          //  KLINE TEST K1: OLS Drift on Log Returns
+          // ================================================================
+          function K1_olsRegression(klines) {
+            if (klines.length < 10) return { slope_bps: 0, tStat: 0, r2: 0, significant: false, signal: 0 };
+            const lc = klines.map(k => Math.log(k.close));
+            const r = lc.slice(1).map((x, i) => x - lc[i]);
+            const s = std(r);
+            const t = s > 0 ? mean(r) / (s / Math.sqrt(r.length)) : 0;
+            const info = olsSlope(lc);
+            return { slope_bps: +(info.slope * 1e4).toFixed(2), tStat: +t.toFixed(3), r2: info.r2,
+                     significant: Math.abs(t) > 2, signal: +Math.tanh(t / 3).toFixed(4) };
           }
 
-          // Fetch current Open Interest
-          async function fetchBinanceOI(symbol) {
-            const cacheKey = `binance_oi_${symbol}`;
-            const cached = getCached(cache.binance, cacheKey, TTL.binance);
-            if (cached) return cached;
-            
-            try {
-              const url = `${BINANCE_FAPI}/fapi/v1/openInterest?symbol=${symbol}`;
-              const data = await getJSON(url, 10000, 2);
-              if (!data) return null;
-              
-              const result = {
-                symbol,
-                openInterest: +data.openInterest || 0,
-                ts: Date.now()
-              };
-              
-              setCached(cache.binance, cacheKey, result);
-              return result;
-            } catch (e) {
-              return null;
-            }
-          }
+          // ================================================================
+          //  KLINE TEST K2: Hurst Exponent (Rescaled Range)
+          // ================================================================
+          function K2_hurstExponent(klines) {
+            const closes = klines.map(k => k.close);
+            const n = closes.length;
+            if (n < 20) return {
+              H: 0.5, interpretation: 'insufficient', signal: 0
+            };
 
-          // Fetch OI history for ΔOI calculation
-          async function fetchBinanceOIHist(symbol) {
-            const cacheKey = `binance_oi_hist_${symbol}`;
-            const cached = getCached(cache.binance, cacheKey, TTL.binance);
-            if (cached) return cached;
-            
-            try {
-              const url = `${BINANCE_FAPI}/futures/data/openInterestHist?symbol=${symbol}&period=1h&limit=3`;
-              const data = await getJSON(url, 10000, 2);
-              if (!Array.isArray(data) || data.length < 2) return null;
-              
-              data.sort((a, b) => (+b.timestamp || 0) - (+a.timestamp || 0));
-              
-              const current = +data[0]?.sumOpenInterestValue || 0;
-              const prev1h = +data[1]?.sumOpenInterestValue || 0;
-              const prev2h = data[2] ? +data[2]?.sumOpenInterestValue : prev1h;
-              
-              const oiDelta1h = prev1h > 0 ? ((current - prev1h) / prev1h) : 0;
-              const oiDelta2h = prev2h > 0 ? ((current - prev2h) / prev2h) : 0;
-              
-              const result = {
-                symbol,
-                currentOI_USD: current,
-                prev1hOI_USD: prev1h,
-                prev2hOI_USD: prev2h,
-                oiDelta1hPct: Math.abs(oiDelta1h) * 100,
-                oiDelta2hPct: Math.abs(oiDelta2h) * 100,
-                oiDelta1hRaw: oiDelta1h,
-                ts: Date.now()
-              };
-              
-              setCached(cache.binance, cacheKey, result);
-              return result;
-            } catch (e) {
-              return null;
-            }
-          }
+            const rets = [];
+            for (let i = 1; i < n; i++)
+              rets.push(Math.log(closes[i] / closes[i - 1]));
 
-          // Fetch spot price for basis calculation
-          async function fetchBinanceSpotPrice(symbol) {
-            const cacheKey = `binance_spot_${symbol}`;
-            const cached = getCached(cache.binance, cacheKey, TTL.binance);
-            if (cached) return cached;
-            
-            try {
-              const url = `${BINANCE_SPOT}/api/v3/ticker/price?symbol=${symbol}`;
-              const data = await getJSON(url, 8000, 2);
-              if (!data?.price) return null;
-              
-              const result = {
-                symbol,
-                spotPrice: +data.price,
-                ts: Date.now()
-              };
-              
-              setCached(cache.binance, cacheKey, result);
-              return result;
-            } catch (e) {
-              return null;
+            const windowSizes = [];
+            for (
+              let w = 8;
+              w <= Math.floor(rets.length / 2);
+              w = Math.floor(w * 1.5)
+            ) {
+              if (w > windowSizes.at(-1) || windowSizes.length === 0)
+                windowSizes.push(w);
             }
-          }
+            if (windowSizes.length < 3) return {
+              H: 0.5, interpretation: 'insufficient', signal: 0
+            };
 
-          // NEW: Fetch Binance Futures orderbook
-          async function fetchBinanceFuturesDepth(symbol) {
-            const cacheKey = `binance_depth_${symbol}`;
-            const cached = getCached(cache.binance, cacheKey, 5000); // 5 sec cache
-            if (cached) return cached;
-            
-            try {
-              const url = `${BINANCE_FAPI}/fapi/v1/depth?symbol=${symbol}&limit=${DEPTH_LIMIT}`;
-              const data = await getJSON(url, 8000, 2);
-              if (!data?.bids || !data?.asks) return null;
-              
-              setCached(cache.binance, cacheKey, data);
-              return data;
-            } catch (e) {
-              return null;
+            const expRS = n => { 
+              let s = 0; 
+              for (let i = 1; i < n; i++) s += Math.sqrt((n - i) / i);
+              return ((n - 0.5) / n) * Math.pow(n * Math.PI / 2, -0.5) * s; 
+            };
+
+            const logN = [], logRS = [];
+            for (const w of windowSizes) {
+              const nBlocks = Math.floor(rets.length / w);
+              if (nBlocks < 1) continue;
+              let rsSum = 0, valid = 0;
+              for (let b = 0; b < nBlocks; b++) {
+                const block = rets.slice(b * w, (b + 1) * w);
+                const m = mean(block);
+                const s = std(block);
+                if (s < 1e-12) continue;
+                let cumDev = 0, maxD = -Infinity, minD = Infinity;
+                for (const x of block) {
+                  cumDev += (x - m);
+                  if (cumDev > maxD) maxD = cumDev;
+                  if (cumDev < minD) minD = cumDev;
+                }
+                rsSum += (maxD - minD) / s;
+                valid++;
+              }
+              if (valid > 0) {
+                logN.push(Math.log(w));
+                logRS.push(Math.log((rsSum / valid) / expRS(w)));
+              }
             }
-          }
 
-          // NEW: Fetch Binance Futures ticker (bid/ask)
-          async function fetchBinanceFuturesTicker(symbol) {
-            const cacheKey = `binance_ticker_${symbol}`;
-            const cached = getCached(cache.binance, cacheKey, 5000);
-            if (cached) return cached;
-            
-            try {
-              const url = `${BINANCE_FAPI}/fapi/v1/ticker/bookTicker?symbol=${symbol}`;
-              const data = await getJSON(url, 8000, 2);
-              if (!data?.bidPrice || !data?.askPrice) return null;
-              
-              const result = {
-                symbol,
-                bid: +data.bidPrice,
-                ask: +data.askPrice,
-                bidQty: +data.bidQty,
-                askQty: +data.askQty,
-                ts: Date.now()
-              };
-              
-              setCached(cache.binance, cacheKey, result);
-              return result;
-            } catch (e) {
-              return null;
+            if (logN.length < 3) return {
+              H: 0.5, interpretation: 'insufficient', signal: 0
+            };
+
+            const mX = mean(logN), mY = mean(logRS);
+            let num = 0, den = 0;
+            for (let i = 0; i < logN.length; i++) {
+              num += (logN[i] - mX) * (logRS[i] - mY);
+              den += (logN[i] - mX) ** 2;
             }
-          }
+            const H = den > 0 ? 0.5 + num / den : 0.5;
+            const Hc = clamp(H, 0.01, 0.99);
 
-          // Calculate basis (futures premium over spot)
-          function calculateBasis(futuresPrice, spotPrice) {
-            if (!futuresPrice || !spotPrice || spotPrice <= 0) return { basis: 0, basis_bps: 0 };
-            const basis = (futuresPrice - spotPrice) / spotPrice;
+            let interpretation = 'random_walk';
+            if (Hc > 0.55) interpretation = 'trending';
+            else if (Hc < 0.45) interpretation = 'mean_reverting';
+
             return {
-              basis,
-              basis_bps: Math.round(basis * 10000)
+              H: +Hc.toFixed(4),
+              interpretation,
+              signal: +((Hc - 0.5) * 4).toFixed(4)
             };
           }
 
-          // Fetch all 4 golden metrics for a symbol
-          async function fetchGoldenMetrics(symbol) {
-            try {
-              const [kline, funding, oiHist, spot] = await Promise.all([
-                fetchBinance1hKline(symbol),
-                fetchBinanceFundingRate(symbol),
-                fetchBinanceOIHist(symbol),
-                fetchBinanceSpotPrice(symbol)
-              ]);
-              
-              if (!kline) return null;
-              
-              const basisInfo = calculateBasis(funding?.markPrice, spot?.spotPrice);
-              
-              return {
-                symbol,
-                vol_1h_pct: kline.vol1hPct || 0,
-                price_change_1h: kline.priceChange1h || 0,
-                funding_rate: Math.abs(funding?.lastFundingRate || 0),
-                funding_rate_raw: funding?.lastFundingRate || 0,
-                oi_delta_pct: Math.max(oiHist?.oiDelta1hPct || 0, oiHist?.oiDelta2hPct || 0),
-                oi_delta_1h_pct: oiHist?.oiDelta1hPct || 0,
-                oi_delta_2h_pct: oiHist?.oiDelta2hPct || 0,
-                current_oi_usd: oiHist?.currentOI_USD || 0,
-                volume_1h_usd: kline.volume1hUSD || 0,
-                mark_price: funding?.markPrice || kline.currClose || 0,
-                spot_price: spot?.spotPrice || 0,
-                basis_bps: basisInfo.basis_bps,
-                ts: Date.now()
-              };
-            } catch (e) {
-              log(`fetchGoldenMetrics error for ${symbol}:`, e?.message || e);
-              return null;
-            }
-          }
-
-          // Calculate hedge confidence score based on 4 golden metrics
-          function calculateHedgeConfidence(metrics) {
-            if (!metrics) return 0;
-            
-            const volNorm = Math.tanh((metrics.vol_1h_pct || 0) / IDEAL_VOL_1H_PCT);
-            const fundingNorm = Math.tanh((metrics.funding_rate || 0) / IDEAL_FUNDING_RATE);
-            const oiNorm = Math.tanh((metrics.oi_delta_pct || 0) / IDEAL_OI_DELTA_PCT);
-            const volUsdNorm = Math.tanh((metrics.volume_1h_usd || 0) / IDEAL_VOLUME_1H_USD);
-            
-            const rawScore = 
-              WEIGHT_VOL_1H * volNorm +
-              WEIGHT_FUNDING * fundingNorm +
-              WEIGHT_OI_DELTA * oiNorm +
-              WEIGHT_VOLUME * volUsdNorm;
-            
-            const confidence = Math.round(rawScore * 100);
-            
-            return clamp(confidence, 0, 100);
-          }
-          // ---------- Secondary store stub (no-op) ----------
-          async function pushAuditSecondary(path, payload){
-            try{
-              return { ok:true, path };
-            }catch(e){ log("secondary store stub error", e?.message||e); return { ok:false, error:String(e) }; }
-          }
-
-          // ---------- Heartbeat & Zombie detection ----------
-          // CHANGED: Disabled for Binance version (no signed API needed for reads)
-          async function heartbeatCheck(state){
-            const res={ mismatches:0, zombies:0, details:[] };
-            // Binance version doesn't check open orders (would require API keys)
-            return res;
-          }
-
-          // ---------- State (Gist) + Calibration + Audit ----------
-          // ⚠️ THIS SECTION IS 100% UNCHANGED FROM ORIGINAL
-          async function loadState(){
-            const token=process.env.GIST_TOKEN, id=process.env.GIST_ID;
-            const init={ v:"binance-hedge-7.0",  // ← CHANGED version string
-              run_counter: 0,
-              cooldown:{}, cooldown_side:{}, pending:[], equity:[], closed:[],
-              mr_lockout:{}, sym_stats:{}, sym_stats_real:{}, calibCoeffs:{}, lastReconcileTs:0,
-              calibration_holdout:[],
-              learned_trade_keys: [],
-              calib_symbol_counts: {},
-              calib_last_version: CALIB_VERSION
+          // ================================================================
+          //  KLINE TEST K3: Mann-Kendall Trend Test
+          // ================================================================
+          function K3_mannKendall(klines) {
+            const c = klines.map(k => k.close);
+            const n = c.length;
+            if (n < 8) return {
+              tau: 0, z: 0, significant: false, signal: 0
             };
-            if(!token||!id) return { state:init, persist:null };
-            try{
-              const r=await fetchWithTimeout(`https://api.github.com/gists/${id}`,{
-                headers:{Authorization:`Bearer ${token}`,"Accept":"application/vnd.github+json","User-Agent":UA}
-              });
-              if(!r.ok) return { state:init, persist:null };
-              const etag=r.headers.get("etag");
-              const g=await r.json();
-              const c=g.files?.["state.json"]?.content;
-              const s=c?JSON.parse(c):init;
 
-              if(!s.cooldown)s.cooldown={};
-              if(!s.cooldown_side)s.cooldown_side={};
-              if(!Array.isArray(s.pending))s.pending=[];
-              if(!Array.isArray(s.closed))s.closed=[];
-              if(!Array.isArray(s.equity))s.equity=[];
-              if(!s.mr_lockout)s.mr_lockout={};
-              if(!s.sym_stats)s.sym_stats={};
-              if(!s.sym_stats_real)s.sym_stats_real={};
-              if(!s.calibCoeffs)s.calibCoeffs={};
-              if(!Array.isArray(s.calibration_holdout))s.calibration_holdout=[];
-              if(!s.lastReconcileTs)s.lastReconcileTs=0;
-              if (!Array.isArray(s.learned_trade_keys)) s.learned_trade_keys = [];
-              if (!s.calib_symbol_counts) s.calib_symbol_counts = {};
-              if (s.run_counter == null) s.run_counter = 0;
+            let S = 0;
+            const MAX_PAIRS = 50000;
+            const totalPairs = n * (n - 1) / 2;
 
-              if (s.calib_last_version !== CALIB_VERSION) {
-                log(`🔄 Calibration version change: ${s.calib_last_version} → ${CALIB_VERSION}`);
-                s.calibCoeffs = {};
-                s.calib_last_version = CALIB_VERSION;
-              }
-
-              return { state:s, persist:{ id, token, etag } };
-            }catch(e){ log("loadState warn", e?.message||e); return { state:init, persist:null }; }
-          }
-          
-          function mergeStates(remote, local) {
-            const merged = { ...remote };
-
-            merged.run_counter = Math.max(local.run_counter || 0, remote.run_counter || 0);
-
-            const remoteKeys = Array.isArray(remote.learned_trade_keys) ? remote.learned_trade_keys : [];
-            const localKeys = Array.isArray(local.learned_trade_keys) ? local.learned_trade_keys : [];
-            
-            const localSet = new Set(localKeys);
-            const uniqueRemote = remoteKeys.filter(k => !localSet.has(k));
-            merged.learned_trade_keys = [...uniqueRemote, ...localKeys].slice(-2000);
-
-            const rCounts = remote.calib_symbol_counts || {};
-            const lCounts = local.calib_symbol_counts || {};
-            const allCountKeys = new Set([...Object.keys(rCounts), ...Object.keys(lCounts)]);
-            const mergedCounts = {};
-            for (const k of allCountKeys) {
-              mergedCounts[k] = (rCounts[k] || 0) + (lCounts[k] || 0);
-            }
-            merged.calib_symbol_counts = mergedCounts;
-
-            const dropSet = new Set((local.__drop_pending_cids || []).map(x => String(x).trim()).filter(Boolean));
-            const id = (p) => String(p?.client_order_id || p?.clientOrderId || p?.idea_id || "").trim();
-
-            const remotePending = (remote.pending || []).filter(p => !dropSet.has(id(p)));
-            const remoteIds = new Set(remotePending.map(id));
-            const newLocalPending = (local.pending || []).filter(p => {
-              const k = id(p);
-              return k && !remoteIds.has(k);
-            });
-            merged.pending = [...remotePending, ...newLocalPending];
-
-            merged.equity = Array.isArray(remote.equity) ? remote.equity : [];
-            merged.sym_stats_real = remote.sym_stats_real || {};
-            merged.sym_stats = remote.sym_stats || {};
-            merged.lastReconcileTs = remote.lastReconcileTs || 0;
-            if ('fees' in remote) merged.fees = remote.fees;
-
-            merged.cooldown = local.cooldown || {};
-            merged.cooldown_side = local.cooldown_side || {};
-            merged.mr_lockout = local.mr_lockout || {};
-
-            merged.calibCoeffs = {};
-            const allKeys = new Set([
-              ...Object.keys(remote.calibCoeffs || {}),
-              ...Object.keys(local.calibCoeffs || {})
-            ]);
-            
-            for (const key of allKeys) {
-              const r = remote.calibCoeffs?.[key];
-              const l = local.calibCoeffs?.[key];
-              
-              if (!r) merged.calibCoeffs[key] = l;
-              else if (!l) merged.calibCoeffs[key] = r;
-              else {
-                const newer = ((r.n||0) >= (l.n||0)) ? r : l;
-                const older = ((r.n||0) >= (l.n||0)) ? l : r;
-                
-                merged.calibCoeffs[key] = {
-                  ...newer,
-                  recent_errors: [...(newer.recent_errors || []), ...(older.recent_errors || [])].slice(-CALIB_ERROR_WINDOW),
-                  recent_predictions: [...(newer.recent_predictions || []), ...(older.recent_predictions || [])].slice(-100)
-                };
-              }
-            }
-            
-            const keyClosed = (c) => {
-              const cid = c?.trade_details?.client_order_id || c.client_order_id || c.idea_id || "";
-              const tx  = c?.ts_exit_ms || c?.exit_ts_ms || "";
-              return `${cid}|${tx}`;
-            };
-            const localClosedMap = new Map((local.closed||[]).map(c => [keyClosed(c), c]));
-            merged.closed = (remote.closed || []).map(rc => {
-              const lc = localClosedMap.get(keyClosed(rc));
-              if (!lc) return rc;
-              const learned = Boolean(rc.learned || lc.learned);
-              const learned_at_ts = learned ? (rc.learned_at_ts || lc.learned_at_ts || Date.now()) : undefined;
-              return { ...rc, learned, learned_at_ts };
-            });
-            
-            merged.version_ts = Date.now();
-
-            log("[gha] mergeStates: remote_pending_after_drops", remotePending.length,
-                        "appended_new_local", newLocalPending.length,
-                        "merged_pending", merged.pending.length);
-
-            return merged;
-          }
-
-          async function saveState(persist, state, auditOut, retries=2, blindFallback=true) {
-            if (!persist) { log("WARN: No persist—skipping Gist save."); return; }
-
-            const gistUrl = `https://api.github.com/gists/${persist.id}`;
-            const mkFiles = (s) => ({ "state.json": { content: JSON.stringify(s) } });
-
-            const wipeToEmpty = state && Object.keys(state).length === 1 && state.run_counter === 0;
-
-            async function patch(files, etag) {
-              const headers = {
-                Authorization: `Bearer ${persist.token}`,
-                "Accept": "application/vnd.github+json",
-                "Content-Type": "application/json",
-                "User-Agent": UA
-              };
-              if (etag) headers["If-Match"] = etag;
-              return await fetchWithTimeout(gistUrl, {
-                method: "PATCH",
-                headers,
-                body: JSON.stringify({ files })
-              }, 15000);
-            }
-
-            let toSave = state;
-            let etag = persist.etag || null;
-
-            for (let attempt = 0; attempt <= retries; attempt++) {
-              log("DEBUG: saveState attempt", attempt, "etag?", !!etag, "pending=", (toSave.pending||[]).length);
-              const r = await patch(mkFiles(toSave), etag);
-              if (r.ok) {
-                const newEtag = r.headers.get("etag");
-                persist.etag = newEtag || persist.etag;
-                log("SUCCESS: Gist updated! Status=", r.status, "pending now=", (toSave.pending||[]).length);
-                return;
-              }
-
-              const body = (await r.text().catch(()=> ""))?.slice(0, 300) || "";
-              log("WARN: saveState failed status=", r.status, "body=", body);
-
-              if (r.status === 429) {
-                const ra = Number(r.headers.get("retry-after") || 2);
-                log("WARN: Rate limited. Backing off", ra, "s");
-                await sleep(ra * 1000);
-                continue;
-              }
-
-              if (r.status === 412) {
-                if (wipeToEmpty) {
-                  log("DEBUG: 412 during wipe - skipping merge");
-                  break;
-                }
-                const r2 = await fetchWithTimeout(gistUrl, {
-                  headers: {
-                    Authorization: `Bearer ${persist.token}`,
-                    "Accept": "application/vnd.github+json",
-                    "User-Agent": UA
-                  }
-                }, 12000);
-                if (!r2.ok) {
-                  log("ERROR: Refetch for merge failed status=", r2.status);
-                  break;
-                }
-                const remoteEtag = r2.headers.get("etag");
-                const remoteGist = await r2.json();
-                const remoteContent = remoteGist.files?.["state.json"]?.content;
-                const remoteState = remoteContent ? JSON.parse(remoteContent) : {};
-                toSave = mergeStates(remoteState, state);
-                etag = remoteEtag || null;
-                await sleep(250 + Math.floor(Math.random()*250));
-                continue;
-              }
-
-              break;
-            }
-
-            if (blindFallback) {
-              log("WARN: Falling back to blind PATCH (no If-Match).");
-              
-              if (!wipeToEmpty) {
-                try {
-                    const r2 = await fetchWithTimeout(gistUrl, {
-                      headers: {
-                        Authorization: `Bearer ${persist.token}`,
-                        "Accept": "application/vnd.github+json",
-                        "User-Agent": UA
-                      }
-                    }, 12000);
-
-                    if (r2.ok) {
-                      const remoteGist = await r2.json();
-                      const remoteContent = remoteGist.files?.["state.json"]?.content;
-                      const remoteState = remoteContent ? JSON.parse(remoteContent) : {};
-                      toSave = mergeStates(remoteState, state);
-                      log("DEBUG: Pre-blind-patch merge successful.");
-                    } else {
-                      log("WARN: Pre-blind-patch re-fetch failed status=", r2.status, ". Will save local state.");
-                    }
-                } catch (e) {
-                    log("ERROR: Exception during pre-blind-patch re-fetch:", e?.message || String(e));
-                }
-              } else {
-                toSave = { run_counter: 0 };
-                log("DEBUG: WipeToEmpty=true → skipping pre-merge, forcing {run_counter:0}");
-              }
-              
-              const r3 = await patch(mkFiles(toSave), null);
-              if (r3.ok) {
-                const newEtag = r3.headers.get("etag");
-                persist.etag = newEtag || persist.etag;
-                log("SUCCESS: Blind Gist update ok. pending=", (toSave.pending||[]).length);
-              } else {
-                const body = (await r3.text().catch(()=> ""))?.slice(0, 300) || "";
-                log("ERROR: Blind save failed status=", r3.status, "body=", body);
-              }
-            }
-          }
-          
-          const regFromKey = (k) => k?.includes("regime:trend") ? "trend" : k?.includes("regime:meanrevert") ? "meanrevert" : null;
-          
-          function cleanExpiredCooldowns(state) {
-            const now = Date.now();
-            
-            if (state.cooldown) {
-              for (const [base, ts] of Object.entries(state.cooldown)) {
-                if (now - ts >= COOLDOWN_MS) {
-                  delete state.cooldown[base];
-                }
-              }
-            }
-            
-            if (state.cooldown_side) {
-              for (const [base, obj] of Object.entries(state.cooldown_side)) {
-                if (now - (obj.ts_ms || 0) >= COOLDOWN_MS) {
-                  delete state.cooldown_side[base];
-                }
-              }
-            }
-            
-            if (state.mr_lockout) {
-              for (const [sym, expiry] of Object.entries(state.mr_lockout)) {
-                if (now >= expiry) {
-                  delete state.mr_lockout[sym];
-                }
-              }
-            }
-            
-            log(`🧹 Cleaned cooldowns: ${Object.keys(state.cooldown || {}).length} base, ${Object.keys(state.cooldown_side || {}).length} side, ${Object.keys(state.mr_lockout || {}).length} mr_lockout`);
-          }
-
-          function cleanExpiredClosedTrades(state) {
-            const MAX_CLOSED_TRADES = 10;
-            
-            if (!Array.isArray(state.closed)) {
-              state.closed = [];
-              return;
-            }
-            
-            const before = state.closed.length;
-            
-            if (before <= MAX_CLOSED_TRADES) {
-              log(`📦 Closed trades: ${before}/${MAX_CLOSED_TRADES} (no cleanup needed)`);
-              return;
-            }
-            
-            state.closed.sort((a, b) => {
-              const aTime = a.ts_exit_ms || a.exit_ts_ms || 0;
-              const bTime = b.ts_exit_ms || b.exit_ts_ms || 0;
-              return bTime - aTime;
-            });
-            
-            state.closed = state.closed.slice(0, MAX_CLOSED_TRADES);
-            
-            const removed = before - state.closed.length;
-            log(`🗑️  Kept ${MAX_CLOSED_TRADES} most recent closed trades, removed ${removed} old ones`);
-          }
-
-          const getCoeffs = (state, side, regime) => {
-            const key = `${side}_${regime}`;
-            if (!state.calibCoeffs) state.calibCoeffs = {};
-            
-            if (!state.calibCoeffs[key]) {
-              return null;
-            }
-            
-            const existing = state.calibCoeffs[key];
-            
-            if (existing.version !== CALIB_VERSION) {
-              log(`📦 Resetting ${key} (version ${existing.version} → ${CALIB_VERSION})`);
-              const def = {
-                version: CALIB_VERSION,
-                a: 0,
-                b: 1,
-                n: 0,
-                n_tp: 0,
-                n_sl: 0,
-                momentum_a: 0,
-                momentum_b: 0,
-                recent_errors: [],
-                recent_predictions: [],
-                last_reset_n: 0,
-                created_at: existing.created_at || Date.now(),
-                last_updated: Date.now()
-              };
-              state.calibCoeffs[key] = def;
-              return def;
-            }
-            
-            return existing;
-          };
-
-          function learnFromGistRealFills(state){
-            if (!Array.isArray(state.learned_trade_keys)) state.learned_trade_keys = [];
-            const learnedSet = new Set(state.learned_trade_keys);
-            
-            if (!state.calib_symbol_counts) state.calib_symbol_counts = {};
-            
-            const learnable = (state.closed || []).filter(c =>
-              c.reconciliation === "exchange_trade_history" &&
-              !c.learned &&
-              c.p_raw != null &&
-              isFinite(c.p_raw) &&
-              c.p_raw > 0.01 && c.p_raw < 0.99
-            );
-            
-            if (learnable.length === 0) {
-              log("📚 No new fills to learn from this cycle.");
-              return;
-            }
-
-            log(`📚 Learning from ${learnable.length} real fills...`);
-            
-            const pRawValues = learnable.map(c => c.p_raw).filter(p => p != null);
-            const pMean = mean(pRawValues);
-            const pStd = std(pRawValues) || 0.1;
-            const useOutlierFilter = learnable.length >= 20 && pStd > 0;
-            
-            let stats = { learned: 0, skipped_ttl: 0, skipped_dup: 0, skipped_invalid: 0, skipped_poison: 0, skipped_outlier: 0 };
-            
-            for (const c of learnable) {
-              const reg = c.regime || regFromKey(c.calib_key);
-              if (!reg || !c.side) {
-                stats.skipped_invalid++;
-                continue;
-              }
-
-              if (useOutlierFilter && Math.abs((c.p_raw - pMean) / pStd) > OUTLIER_ZSCORE) {
-                log(`⚠️  Outlier p_raw=${c.p_raw.toFixed(4)} z=${((c.p_raw - pMean) / pStd).toFixed(2)}`);
-                stats.skipped_outlier++;
-                continue;
-              }
-
-              const cid = c.client_order_id || c.trade_details?.client_order_id || "";
-              const sym = c.symbolFull || c.symbol || "UNK";
-              const side = c.side || "?";
-              const exit = c.exit_reason || "";
-              const tEntry = Math.floor((c.ts_entry_ms || c.entry_ts_ms || 0) / 1000);
-              const tExit = Math.floor((c.ts_exit_ms || c.exit_ts_ms || 0) / 1000);
-              
-              const learn_key = crypto.createHash('sha256')
-                .update(`${cid}|${sym}|${side}|${tEntry}|${tExit}|${exit}`)
-                .digest('hex')
-                .slice(0, 32);
-              
-              if (learnedSet.has(learn_key)) {
-                stats.skipped_dup++;
-                continue;
-              }
-
-              const symCountKey = `${side}_${reg}_${sym}`;
-              const currentTotal = state.calibCoeffs?.[`${side}_${reg}`]?.n || 0;
-              const currentSymCount = state.calib_symbol_counts[symCountKey] || 0;
-              
-              const futureTotal = currentTotal + 1;
-              const futureSymCount = currentSymCount + 1;
-              
-              if (futureTotal > 20 && futureSymCount / futureTotal > MAX_SYMBOL_CONTRIBUTION) {
-                log(`⚠️  ${sym} would be ${(futureSymCount / futureTotal * 100).toFixed(1)}% of ${side}_${reg} (limit ${(MAX_SYMBOL_CONTRIBUTION * 100).toFixed(0)}%)`);
-                stats.skipped_poison++;
-                continue;
-              }
-
-              const tp_hit = exit === "tp" || c.realized?.tp_hit === true;
-              const sl_hit = exit === "sl" || c.realized?.sl_hit === true;
-              
-              if (!tp_hit && !sl_hit) {
-                stats.skipped_ttl++;
-                c.learned_skip_reason = "ttl_exit";
-                continue;
-              }
-              
-              const pnl = c.pnl_bps || 0;
-              if ((tp_hit && pnl < -10) || (sl_hit && pnl > 10)) {
-                log(`⚠️  Anomaly: ${sym} ${side} exit=${exit} pnl=${pnl}bps - skipping`);
-                stats.skipped_invalid++;
-                continue;
-              }
-              
-              const outcome = tp_hit ? 1 : 0;
-              
-              try {
-                updateCalibration(state, c.side, reg, c.p_raw, outcome);
-                learnedSet.add(learn_key);
-                state.calib_symbol_counts[symCountKey] = currentSymCount + 1;
-                c.learned = true;
-                c.learned_at_ts = Date.now();
-                stats.learned++;
-                log(`  ✓ ${sym} ${side} ${exit.toUpperCase()} pnl=${pnl}bps p=${c.p_raw.toFixed(3)} reg=${reg}`);
-              } catch(e) {
-                log(`  ✗ Learn error: ${e?.message || e}`);
-                stats.skipped_invalid++;
-              }
-            }
-            
-            if (Object.keys(state.calib_symbol_counts || {}).length > 500) {
-              const keep = Object.entries(state.calib_symbol_counts)
-                .sort((a, b) => b[1] - a[1])
-                .slice(0, 300);
-              state.calib_symbol_counts = Object.fromEntries(keep);
-            }
-            
-            state.learned_trade_keys = Array.from(learnedSet).slice(-2000);
-            
-            log(`✅ Learned=${stats.learned} | Skipped: TTL=${stats.skipped_ttl} Dup=${stats.skipped_dup} Invalid=${stats.skipped_invalid} Poison=${stats.skipped_poison} Outlier=${stats.skipped_outlier}`);
-          }
-          
-          function validateCalibration(state) {
-            const report = {};
-            
-            for (const key of Object.keys(state.calibCoeffs || {})) {
-              const coeff = state.calibCoeffs[key];
-              
-              if (coeff.n < CALIB_MIN_SAMPLES) {
-                report[key] = { status: "insufficient_data", n: coeff.n };
-                continue;
-              }
-              
-              const predictions = coeff.recent_predictions || [];
-              let brier_raw = null, brier_cal = null;
-              
-              if (predictions.length >= 10) {
-                const clamp01 = p => Math.max(1e-6, Math.min(1 - 1e-6, p));
-                
-                brier_raw = mean(predictions.map(p => {
-                  const pSafe = clamp01(p.p_raw);
-                  return (p.outcome - pSafe) ** 2;
-                }));
-                
-                brier_cal = mean(predictions.map(p => {
-                  const pSafe = clamp01(p.p_cal);
-                  return (p.outcome - pSafe) ** 2;
-                }));
-              }
-              
-              const avg_error = mean(coeff.recent_errors || []);
-              const win_rate = coeff.n > 0 ? (coeff.n_tp || 0) / coeff.n : null;
-              const samples_since_reset = coeff.n - (coeff.last_reset_n || 0);
-              
-              const is_healthy =
-                avg_error < 0.38 &&
-                coeff.b > 0.1 &&
-                Math.abs(coeff.a) < COEFF_BOUND_A * 0.8 &&
-                Math.abs(coeff.b) < COEFF_BOUND_B * 0.8 &&
-                (brier_cal == null || brier_cal < 0.23);
-
-              report[key] = {
-                n: coeff.n,
-                n_tp: coeff.n_tp || 0,
-                n_sl: coeff.n_sl || 0,
-                win_rate: win_rate?.toFixed(3) || "N/A",
-                a: coeff.a.toFixed(4),
-                b: coeff.b.toFixed(4),
-                avg_error: avg_error.toFixed(3),
-                brier_raw: brier_raw?.toFixed(4) || "N/A",
-                brier_cal: brier_cal?.toFixed(4) || "N/A",
-                improvement: (brier_raw && brier_cal) ? ((brier_raw - brier_cal) / brier_raw * 100).toFixed(1) + "%" : "N/A",
-                samples_since_reset,
-                status: is_healthy ? "healthy" : "degraded"
-              };
-            }
-            
-            if (Object.keys(report).length > 0) {
-              log("📊 Calibration Health:");
-              for (const [k, v] of Object.entries(report)) {
-                log(`   ${k}: ${v.status} | n=${v.n} wr=${v.win_rate} brier=${v.brier_cal} (${v.improvement} better) a=${v.a} b=${v.b}`);
-              }
-            }
-            
-            return report;
-          }
-          
-          function updateCalibration(state, side, regime, pRaw, outcome) {
-            if (pRaw == null || !isFinite(pRaw) || pRaw <= 0 || pRaw >= 1) return;
-
-            const coeff = getCoeffs(state, side, regime);
-            
-            if (!coeff) {
-              log(`⏭️  Skip learning [${side}_${regime}]: no existing calibration`);
-              return;
-            }
-            
-            if (!coeff.recent_predictions) coeff.recent_predictions = [];
-            coeff.recent_predictions.push({
-              p_raw: pRaw,
-              p_cal: calibrateP(state, side, regime, pRaw),
-              outcome,
-              ts: Date.now()
-            });
-            if (coeff.recent_predictions.length > 100) coeff.recent_predictions.shift();
-            
-            const before_a = coeff.a;
-            const before_b = coeff.b;
-
-            const warmup_n = 20;
-            const warmup_factor = Math.min(1, (coeff.n + 1) / warmup_n);
-            const base_lr = MIN_LEARNING_RATE + (MAX_LEARNING_RATE - MIN_LEARNING_RATE) / Math.sqrt(1 + coeff.n / 10);
-            const lr = base_lr * warmup_factor;
-
-            const eps = 1e-7;
-            const pSafe = Math.max(eps, Math.min(1 - eps, pRaw));
-            const x = Math.log(pSafe / (1 - pSafe));
-            const x_clamped = Math.max(-6, Math.min(6, x));
-
-            const z = coeff.a + coeff.b * x_clamped;
-            const z_clamped = Math.max(-10, Math.min(10, z));
-            const pHat = 1 / (1 + Math.exp(-z_clamped));
-
-            const error = outcome - pHat;
-            const grad_a = -error;
-            const grad_b = -error * x_clamped;
-
-            const beta1 = MOMENTUM_RATE;
-            coeff.momentum_a = beta1 * coeff.momentum_a - lr * grad_a;
-            coeff.momentum_b = beta1 * coeff.momentum_b - lr * grad_b;
-
-            const lambda = LEARNING_DECAY;
-            const a_next = (1 - lambda * lr) * coeff.a + coeff.momentum_a;
-            const b_next = (1 - lambda * lr) * coeff.b + coeff.momentum_b;
-
-            const hit_a = (a_next < -COEFF_BOUND_A || a_next > COEFF_BOUND_A);
-            const hit_b = (b_next < -COEFF_BOUND_B || b_next > COEFF_BOUND_B);
-
-            if (b_next < 0.05) {
-              log(`⚠️  Negative slope [${side}_${regime}]: b=${b_next.toFixed(3)} → reset to 1.0`);
-              coeff.b = 1.0;
-              coeff.momentum_b = 0;
-              coeff.a = clamp(coeff.a, -1.0, 1.0);
+            if (totalPairs <= MAX_PAIRS) {
+              for (let i = 0; i < n - 1; i++)
+                for (let j = i + 1; j < n; j++)
+                  S += Math.sign(c[j] - c[i]);
             } else {
-              coeff.a = clamp(a_next, -COEFF_BOUND_A, COEFF_BOUND_A);
-              coeff.b = clamp(b_next, -COEFF_BOUND_B, COEFF_BOUND_B);
-              
-              if (hit_a) coeff.momentum_a *= 0.5;
-              if (hit_b) coeff.momentum_b *= 0.5;
+              for (let p = 0; p < MAX_PAIRS; p++) {
+                const i = Math.floor(Math.random() * n);
+                let j = Math.floor(Math.random() * n);
+                while (j === i) j = Math.floor(Math.random() * n);
+                if (i < j) S += Math.sign(c[j] - c[i]);
+                else S += Math.sign(c[i] - c[j]);
+              }
+              S = Math.round(S * (totalPairs / MAX_PAIRS));
             }
 
-            if (!coeff.recent_errors) coeff.recent_errors = [];
-            coeff.recent_errors.push(Math.abs(error));
-            if (coeff.recent_errors.length > CALIB_ERROR_WINDOW) {
-              coeff.recent_errors.shift();
-            }
-
-            const alpha = 0.1;
-            const weights = coeff.recent_errors.map((_, i) => Math.exp(alpha * i));
-            const weight_sum = weights.reduce((a, b) => a + b, 0) || 1;
-            const weighted_error = coeff.recent_errors.reduce((acc, e, i) => acc + e * weights[i], 0) / weight_sum;
-
-            const should_reset = (
-              weighted_error > CALIBRATION_RESET_THRESHOLD &&
-              coeff.n > CALIB_MIN_RESET_N &&
-              (coeff.n - (coeff.last_reset_n || 0)) > 20
-            );
-            
-            if (should_reset) {
-              log(`🔄 RESET [${side}_${regime}] n=${coeff.n} weighted_err=${weighted_error.toFixed(3)} > ${CALIBRATION_RESET_THRESHOLD}`);
-              coeff.a = 0;
-              coeff.b = 1;
-              coeff.momentum_a = 0;
-              coeff.momentum_b = 0;
-              coeff.recent_errors = [];
-              coeff.last_reset_n = coeff.n;
-            }
-
-            coeff.n++;
-            if (outcome === 1) coeff.n_tp = (coeff.n_tp || 0) + 1;
-            else coeff.n_sl = (coeff.n_sl || 0) + 1;
-            coeff.last_updated = Date.now();
-
-            const mag = Math.sqrt(grad_a * grad_a + grad_b * grad_b);
-            log(`📚 [${side}_${regime}] n=${coeff.n} (${coeff.n_tp}tp/${coeff.n_sl}sl) lr=${lr.toFixed(5)} |∇|=${mag.toFixed(4)}`);
-            log(`   p_raw=${pRaw.toFixed(4)} → p̂=${pHat.toFixed(4)} vs y=${outcome} (err=${error.toFixed(4)})`);
-            log(`   a: ${before_a.toFixed(4)}→${coeff.a.toFixed(4)} | b: ${before_b.toFixed(4)}→${coeff.b.toFixed(4)}${(hit_a || hit_b) ? ' [CLIP]' : ''}`);
-            log(`   Quality: weighted_err=${weighted_error.toFixed(3)} window=${coeff.recent_errors.length}`);
-
-            state.calibCoeffs[`${side}_${regime}`] = coeff;
+            const tau = 2 * S / (n * (n - 1));
+            const varS = n * (n - 1) * (2 * n + 5) / 18;
+            const z = S > 0
+              ? (S - 1) / Math.sqrt(varS)
+              : S < 0
+                ? (S + 1) / Math.sqrt(varS)
+                : 0;
+            return {
+              tau: +tau.toFixed(4),
+              z: +z.toFixed(3),
+              significant: Math.abs(z) > 1.96,
+              signal: +clamp(tau * 1.5, -1, 1).toFixed(4)
+            };
           }
 
-          const calibrateP=(state, side, regime, pRaw)=>{
-            const coeff = getCoeffs(state, side, regime);
-            if (!coeff || pRaw == null || !isFinite(pRaw)) return 0.5;
-            const x = Math.max(-5, Math.min(5, logit(pRaw)));
-            return sigmoid(coeff.a + coeff.b * x);
-          };
-
-          const calibratorInfo=(state,side,regime)=>{ 
-            const coeff=getCoeffs(state,side,regime); 
-            if (!coeff) return { type:"logistic", n:0, a:0, b:1 };
-            return { type:"logistic", n:coeff.n, a:coeff.a, b:coeff.b };
-          };
-
-          function getSymbolAdj(state, base) {
-            const real = state.sym_stats_real?.[base];
-            const s = real || state.sym_stats?.[base];
-            if (!s || s.n < 6) return 1.0;
-            const winRate = s.wins / s.n;
-            const avgPnL = s.pnl_sum / s.n;
-            let m = 1.0;
-            if (winRate < 0.4) m *= 0.7;
-            if (avgPnL < 0) m *= 0.8;
-            return clamp(m, 0.5, 1.2);
-          }
-
-          const TRADE_CSV_KEYS=["ts_close_iso","idea_id","client_order_id","symbol","side","pnl_bps","entry_ts_ms","exit_ts_ms","entry_price","exit_price","qty","commission_bps","commission_quote_usdt","commission_asset_entry","commission_asset_exit","maker_taker_entry","maker_taker_exit","slip_realized_bps","reconciliation","fingerprint_entry","fingerprint_exit","calib_key","p_raw","p_pred","regime","source"];
-          function buildAuditOutputs(state){
-            const lastNClosed=(state.closed||[]).slice(-5000);
-            const closedAudit=lastNClosed.map(x=>JSON.stringify(x)).join("\n");
-            const lastHoldout=(state.calibration_holdout||[]).slice(-500);
-            const disagreements=lastHoldout.map(x=>JSON.stringify(x)).join("\n");
-            const rows=[];
-            for(const c of lastNClosed){
-              const td=c.trade_details||{};
-              const row={
-                ts_close_iso: new Date(c.ts_exit_ms||c.predicted_snapshot?.ts_ms||Date.now()).toISOString(),
-                idea_id: td.idea_id||"",
-                client_order_id: td.client_order_id||"",
-                symbol: c.symbolFull||"",
-                side: c.side||"",
-                pnl_bps: c.pnl_bps,
-                entry_ts_ms: c.ts_entry_ms||"",
-                exit_ts_ms: c.ts_exit_ms||"",
-                entry_price: c.price_entry||"",
-                exit_price: c.price_exit||"",
-                qty: c.qty||"",
-                commission_bps: td.commission_bps!=null?td.commission_bps:"",
-                commission_quote_usdt: td.commission_quote_usdt!=null?td.commission_quote_usdt:"",
-                commission_asset_entry: td.commission_asset_entry||"",
-                commission_asset_exit: td.commission_asset_exit||"",
-                maker_taker_entry: td.maker_taker_entry||"",
-                maker_taker_exit: td.maker_taker_exit||"",
-                slip_realized_bps: td.slip_realized_bps!=null?td.slip_realized_bps:"",
-                reconciliation: c.reconciliation||"",
-                fingerprint_entry: td.fingerprint_entry||"",
-                fingerprint_exit: td.fingerprint_exit||"",
-                calib_key: c.calib_key||"",
-                p_raw: c.p_raw!=null?c.p_raw:"",
-                p_pred: c.p_pred!=null?c.p_pred:"",
-                regime: c.regime||"",
-                source: c.reconciliation||""
-              };
-              rows.push(toCSVLine(row, TRADE_CSV_KEYS));
-            }
-            const header=TRADE_CSV_KEYS.join(",");
-            const tradesCsv=[header,...rows].join("\n");
-            return { closedAudit, disagreements, tradesCsv };
-          }
-
-          // CHANGED: Stub for candle sim (not needed for Binance-only)
-          async function candleSimForIdea(p){
-            return { status:"sim_disabled", closed:false };
-          }
-          // ---------- Main ----------
-          let reason="ok", selectionTier="confidence";
-          try{
-            const { state, persist } = await loadState();
-
-            // Increment run counter and check for wipe
-            state.run_counter = (state.run_counter || 0) + 1;
-            log(`🔄 Run ${state.run_counter}/6`);
-
-            const SHOULD_WIPE = (state.run_counter >= 6);
-
-            if (SHOULD_WIPE) {
-              log("🗑️  RUN 6: WIPE GIST AND RESTART FRESH");
-              await saveState(persist, { run_counter: 0 }, {}, 2, true);
-              
-              state.v = "binance-hedge-7.0";
-              state.run_counter = 1;
-              state.cooldown = {};
-              state.cooldown_side = {};
-              state.pending = [];
-              state.equity = [];
-              state.closed = [];
-              state.mr_lockout = {};
-              state.sym_stats = {};
-              state.sym_stats_real = {};
-              state.calibCoeffs = {};
-              state.lastReconcileTs = 0;
-              state.calibration_holdout = [];
-              state.learned_trade_keys = [];
-              state.calib_symbol_counts = {};
-              state.calib_last_version = CALIB_VERSION;
-              
-              log("♻️  State reset to fresh. Continuing with idea generation...");
-            }
-
-            // 📚 Learn from ALL closed trades FIRST
-            learnFromGistRealFills(state);
-
-            // 🧹 Clean expired cooldowns
-            cleanExpiredCooldowns(state);
-
-            // 🗑️  Keep only last 10 closed trades AFTER learning
-            cleanExpiredClosedTrades(state);
-
-            // Preserve cleaned state
-            const preserved = {
-              v: state.v || "binance-hedge-7.0",
-              run_counter: state.run_counter || 0,
-              
-              cooldown: state.cooldown || {},
-              cooldown_side: state.cooldown_side || {},
-              mr_lockout: state.mr_lockout || {},
-              calibCoeffs: state.calibCoeffs || {},
-              learned_trade_keys: state.learned_trade_keys || [],
-              calib_symbol_counts: state.calib_symbol_counts || {},
-              calib_last_version: state.calib_last_version || CALIB_VERSION,
-              
-              pending: [],
-              
-              closed: state.closed || [],
-              equity: state.equity || [],
-              sym_stats_real: state.sym_stats_real || {},
-              
-              sym_stats: {},
-              calibration_holdout: [],
-              lastReconcileTs: 0
+          // ================================================================
+          //  KLINE TEST K4: Variance Ratio Test
+          // ================================================================
+          function K4_varianceRatio(klines) {
+            const closes = klines.map(k => k.close);
+            const n = closes.length;
+            if (n < 20) return {
+              VR: 1, z: 0, interpretation: 'insufficient',
+              signal: 0, details: {}
             };
 
-            Object.assign(state, preserved);
-            log(`♻️  Fresh cycle: ${Object.keys(state.cooldown).length} cooldowns, ${(state.closed||[]).length} closed trades, ${Object.keys(state.calibCoeffs || {}).length} calib models`);
-            
-            const calibHealth = validateCalibration(state);
-            
-            if(!todOK) reason="tod_gate";
+            const rets = [];
+            for (let i = 1; i < n; i++)
+              rets.push(Math.log(closes[i] / closes[i - 1]));
 
-            // ========== DYNAMIC UNIVERSE FROM BINANCE FUTURES (NO VALIDATION NEEDED) ==========
-            log("📡 Fetching Binance Futures universe...");
-            const binanceSymbols = await fetchBinanceFuturesSymbols();
-            
-            if (!binanceSymbols || binanceSymbols.length === 0) {
-              log("❌ No Binance Futures symbols found - cannot proceed");
-              reason = "no_binance_symbols";
-              throw new Error("No Binance Futures symbols available");
-            }
-            
-            log(`✅ Binance Futures universe: ${binanceSymbols.length} USDT perpetuals`);
+            const mu = mean(rets);
+            const sigma2 = rets.reduce(
+              (s, r) => s + (r - mu) ** 2, 0
+            ) / (rets.length - 1);
+            if (sigma2 < 1e-16) return {
+              VR: 1, z: 0, interpretation: 'no_variance',
+              signal: 0, details: {}
+            };
 
-            // DD/throttle
-            const equityStats=(eq)=>{ const day=Date.now()-24*3600*1000; let pnl24=0,cum=0,peak=0,dd=0; for(const e of eq||[]){ if(e.ts_ms>=day) pnl24+=e.pnl_bps; cum+=e.pnl_bps; if(cum>peak) peak=cum; dd=Math.min(dd,cum-peak); } return { pnl24_bps:Math.round(pnl24), peak_dd_bps:Math.round(dd) }; };
-            const { pnl24_bps, peak_dd_bps } = equityStats(state.equity);
-            const throttle=(pnl24_bps<=DD_24H_LIMIT_BPS) || (peak_dd_bps<=DD_PEAK_LIMIT_BPS);
+            const qs = [2, 5, 10];
+            let vrAvg = 0, zAvg = 0, cnt = 0;
+            const details = {};
 
-            // ========== FETCH GOLDEN METRICS FOR ALL BINANCE SYMBOLS ==========
-            log("📊 Fetching golden metrics for all symbols...");
-            
-            const BATCH_SIZE = 15;
-            const BATCH_DELAY = 300;
-            const allMetrics = [];
-            
-            for (let i = 0; i < binanceSymbols.length; i += BATCH_SIZE) {
-              const batch = binanceSymbols.slice(i, i + BATCH_SIZE);
-              
-              const batchResults = await Promise.all(
-                batch.map(async (sym) => {
-                  try {
-                    // Check cooldown first
-                    const lastTs = state.cooldown?.[sym.base] || 0;
-                    if (lastTs && (Date.now() - lastTs) < COOLDOWN_MS) {
-                      return null; // Skip cooldown symbols
-                    }
-                    
-                    const metrics = await fetchGoldenMetrics(sym.symbol);
-                    if (!metrics) return null;
-                    
-                    return {
-                      ...sym,
-                      ...metrics,
-                      hedge_confidence: calculateHedgeConfidence(metrics)
-                    };
-                  } catch (e) {
-                    return null;
-                  }
-                })
+            for (const q of qs) {
+              if (rets.length < q * 3) continue;
+              const qRets = [];
+              for (let i = q; i < rets.length; i++) {
+                let s = 0;
+                for (let j = 0; j < q; j++) s += rets[i - j];
+                qRets.push(s);
+              }
+              const muQ = mean(qRets);
+              const sigmaQ2 = qRets.reduce(
+                (s, r) => s + (r - muQ) ** 2, 0
+              ) / (qRets.length - 1);
+              const vr = sigmaQ2 / (q * sigma2);
+              const nq = rets.length;
+              const varVR = 2 * (2 * q - 1) * (q - 1)
+                / (3 * q * nq);
+              const zVR = (vr - 1) / Math.sqrt(
+                Math.max(varVR, 1e-9)
               );
-              
-              for (const r of batchResults) {
-                if (r && r.mark_price > 0) {
-                  allMetrics.push(r);
-                }
-              }
-              
-              // Rate limit pause between batches
-              if (i + BATCH_SIZE < binanceSymbols.length) {
-                await sleep(BATCH_DELAY);
-              }
-            }
-            
-            log(`📈 Fetched metrics for ${allMetrics.length}/${binanceSymbols.length} symbols`);
-
-            // ========== RANK BY HEDGE CONFIDENCE ==========
-            // Sort by hedge confidence (highest first)
-            allMetrics.sort((a, b) => b.hedge_confidence - a.hedge_confidence);
-            
-            // Log top 10 for debugging
-            log("🏆 Top 10 by hedge confidence:");
-            for (let i = 0; i < Math.min(10, allMetrics.length); i++) {
-              const m = allMetrics[i];
-              log(`   ${i+1}. ${m.symbol} conf=${m.hedge_confidence} vol1h=${m.vol_1h_pct.toFixed(2)}% fund=${(m.funding_rate*100).toFixed(4)}% oi_delta=${m.oi_delta_pct.toFixed(1)}% vol=$${Math.round(m.volume_1h_usd/1e6)}M`);
+              details[`q${q}`] = {
+                VR: +vr.toFixed(4), z: +zVR.toFixed(3)
+              };
+              vrAvg += vr; zAvg += zVR; cnt++;
             }
 
-            // ========== SELECT TOP CANDIDATES FOR DETAILED ANALYSIS ==========
-            const MAX_DETAILED = 30;
-            const topCandidates = allMetrics.slice(0, MAX_DETAILED);
+            vrAvg = cnt > 0 ? vrAvg / cnt : 1;
+            zAvg = cnt > 0 ? zAvg / cnt : 0;
+
+            let interpretation = 'random_walk';
+            if (vrAvg > 1.05 && Math.abs(zAvg) > 1.5)
+              interpretation = 'momentum';
+            else if (vrAvg < 0.95 && Math.abs(zAvg) > 1.5)
+              interpretation = 'mean_reversion';
+
+            return {
+              VR: +vrAvg.toFixed(4),
+              z: +zAvg.toFixed(3),
+              interpretation,
+              signal: +Math.tanh((vrAvg - 1) * 5).toFixed(4),
+              details
+            };
+          }
+
+          // ================================================================
+          //  KLINE TEST K5: ADX + Directional Indicators
+          // ================================================================
+          function K5_adxDI(klines, period = 14) {
+            const n = klines.length;
+            if (n < period + 2) return {
+              adx: 0, plusDI: 0, minusDI: 0,
+              atr: 0, atr_bps: 0,
+              direction: 'neutral', strength: 'none',
+              signal: 0
+            };
+
+            const h = klines.map(k => k.high);
+            const l = klines.map(k => k.low);
+            const c = klines.map(k => k.close);
+
+            const TR = [], plusDM = [], minusDM = [];
+            for (let i = 1; i < n; i++) {
+              const up = h[i] - h[i - 1];
+              const down = l[i - 1] - l[i];
+              plusDM.push(up > down && up > 0 ? up : 0);
+              minusDM.push(down > up && down > 0 ? down : 0);
+              TR.push(Math.max(
+                h[i] - l[i],
+                Math.abs(h[i] - c[i - 1]),
+                Math.abs(l[i] - c[i - 1])
+              ));
+            }
+
+            let trN = 0, pdmN = 0, ndmN = 0;
+            for (let i = 0; i < period; i++) {
+              trN += TR[i]; pdmN += plusDM[i]; ndmN += minusDM[i];
+            }
+
+            let pDI = 100 * pdmN / (trN || 1);
+            let nDI = 100 * ndmN / (trN || 1);
+            let dx = 100 * Math.abs(pDI - nDI) / ((pDI + nDI) || 1);
+            let adx = dx;
+
+            for (let i = period; i < TR.length; i++) {
+              trN = trN - trN / period + TR[i];
+              pdmN = pdmN - pdmN / period + plusDM[i];
+              ndmN = ndmN - ndmN / period + minusDM[i];
+              pDI = 100 * pdmN / (trN || 1);
+              nDI = 100 * ndmN / (trN || 1);
+              dx = 100 * Math.abs(pDI - nDI)
+                / ((pDI + nDI) || 1);
+              adx = ((adx * (period - 1)) + dx) / period;
+            }
+
+            const atr = trN / period;
+            const direction = pDI > nDI ? 1 : -1;
+            let strength = 'none';
+            if (adx >= 40) strength = 'strong';
+            else if (adx >= 25) strength = 'developing';
+            else if (adx >= 20) strength = 'weak';
+
+            const signal = Math.max(0, Math.tanh((adx - 20) / 20)) * direction;
+
+            return {
+              adx: +adx.toFixed(2),
+              plusDI: +pDI.toFixed(2),
+              minusDI: +nDI.toFixed(2),
+              atr: +atr.toFixed(8),
+              atr_bps: c.at(-1) > 0
+                ? Math.round(atr / c.at(-1) * 10000) : 0,
+              direction: direction > 0 ? 'bullish' : 'bearish',
+              strength,
+              signal: +signal.toFixed(4)
+            };
+          }
+
+          // ================================================================
+          //  KLINE TEST K6: 2D Kalman Filter (Price + Velocity)
+          // ================================================================
+          function K6_kalmanTrend(klines) {
+            const closes = klines.map(k => k.close);
+            const n = closes.length;
+            if (n < 10) return {
+              velocity: 0, velocityBps: 0,
+              acceleration: 0, accelerating: 'flat',
+              signal: 0
+            };
+
+            const lc = closes.map(Math.log);
+            const rets = lc.slice(1).map((x, i) => x - lc[i]);
+            const R = Math.max(1e-10, std(rets) ** 2);
+            const Q_x = R * 0.1, Q_v = R * 0.001;
             
-            // BTC regime detection (using Binance data)
-            const btcMetrics = allMetrics.find(m => m.symbol === "BTCUSDT");
-            const btcUp1h = btcMetrics ? (btcMetrics.price_change_1h > 0) : true;
+            let x = lc[0], v = 0, pX = R * 10, pV = R, pXV = 0;
+            const velocities = [];
+
+            for (let i = 1; i < n; i++) {
+              const xP = x + v;
+              const vP = v;
+              const pXP = pX + 2 * pXV + pV + Q_x;
+              const pVP = pV + Q_v;
+              const pXVP = pXV + pV;
+
+              const z = lc[i];
+              const innov = z - xP;
+              const S = pXP + R;
+              const Kx = pXP / S;
+              const Kv = pXVP / S;
+
+              x = xP + Kx * innov;
+              v = vP + Kv * innov;
+              pX = (1 - Kx) * pXP;
+              pV = pVP - Kv * pXVP;
+              pXV = (1 - Kx) * pXVP;
+
+              velocities.push(v);
+            }
+
+            const lastV = velocities.at(-1) || 0;
+            const vBps = lastV * 10000;
+
+            const recentV = velocities.slice(-10);
+            let accel = 0;
+            if (recentV.length >= 3) {
+              accel = (recentV.at(-1) - recentV[0])
+                / recentV.length;
+            }
+            const accelBps = accel * 10000;
+
+            return {
+              velocity: +lastV.toFixed(8),
+              velocityBps: +vBps.toFixed(2),
+              acceleration: +accelBps.toFixed(4),
+              accelerating: accelBps > 0.5
+                ? 'up'
+                : accelBps < -0.5 ? 'down' : 'flat',
+              signal: +Math.tanh(lastV / Math.sqrt(R) * 3).toFixed(4)
+            };
+          }
+
+          // ================================================================
+          //  RSI 
+          // ================================================================
+          function rsi(closes, period = 14) {
+            if (closes.length <= period) return 50;
+            let g = 0, l = 0;
+            for (let i = 1; i <= period; i++) {
+              const d = closes[i] - closes[i - 1];
+              if (d > 0) g += d; else l -= d;
+            }
+            let ag = g / period, al = l / period;
+            for (let i = period + 1; i < closes.length; i++) {
+              const d = closes[i] - closes[i - 1];
+              ag = (ag * (period - 1) + Math.max(0, d)) / period;
+              al = (al * (period - 1) + Math.max(0, -d)) / period;
+            }
+            return al === 0
+              ? 100
+              : +(100 - 100 / (1 + ag / al)).toFixed(2);
+          }
+
+          // ================================================================
+          //  COMPOSITE: All 6 kline tests for one timeframe
+          // ================================================================
+          function analyzeKlinesForTF(klines) {
+            if (!klines || klines.length < 10) return null;
+
+            const k1 = K1_olsRegression(klines);
+            const k2 = K2_hurstExponent(klines);
+            const k3 = K3_mannKendall(klines);
+            const k4 = K4_varianceRatio(klines);
+            const k5 = K5_adxDI(klines);
+            const k6 = K6_kalmanTrend(klines);
+            const closes = klines.map(k => k.close);
+            const rsi14 = rsi(closes, 14);
+
+            const dirSignals = [
+              { v: k1.signal, w: 0.30 }, { v: k3.signal, w: 0.20 },
+              { v: k5.signal, w: 0.25 }, { v: k6.signal, w: 0.25 }
+            ];
+            let wS = 0, sS = 0;
+            for (const s of dirSignals) { sS += s.v * s.w; wS += s.w; }
+            const dirComp = wS > 0 ? sS / wS : 0;
             
-            // ========== DETAILED REFINEMENT WITH BINANCE DATA ==========
-            const refined = [];
-            
-            for (const cand of topCandidates) {
-              try {
-                // Fetch BINANCE execution quality data (depth, spread)
-                const ticker = await fetchBinanceFuturesTicker(cand.symbol);
-                const depth = await fetchBinanceFuturesDepth(cand.symbol);
-                
-                let spreadBps = 5; // Default
-                let mid = cand.mark_price;
-                
-                if (ticker?.bid && ticker?.ask) {
-                  const bid = ticker.bid;
-                  const ask = ticker.ask;
-                  mid = (bid + ask) / 2;
-                  spreadBps = Math.round(((ask - bid) / mid) * 10000);
-                }
-                
-                // Calculate OBI and slip estimation using Binance depth
-                const obi = computeOBI(depth, OBI_TOPN);
-                
-                const sideSlipL = slipFromDepth(depth, mid, "long", NOTIONAL);
-                const sideSlipS = slipFromDepth(depth, mid, "short", NOTIONAL);
-                const slipL = sideSlipL?.slip_bps ?? Math.round(spreadBps / 2);
-                const slipS = sideSlipS?.slip_bps ?? Math.round(spreadBps / 2);
-                
-                const costLong = COST_BPS + slipL;
-                const costShort = COST_BPS + slipS;
-                
-                // Depth quality
-                const d1 = depthWithinPctUSD(depth, mid, 0.01);
-                const depth1pUSD = (d1.asksUSD || 0) + (d1.bidsUSD || 0);
-                
-                // Determine regime based on volatility and funding
-                const regime = (cand.vol_1h_pct >= 1.5 && Math.abs(cand.funding_rate) >= 0.0003) ? "trend" : "meanrevert";
-                
-                // Get calibrated probabilities
-                const coeffL = getCoeffs(state, "long", regime);
-                const coeffS = getCoeffs(state, "short", regime);
-                const nL = Math.max(1, Math.min(500, coeffL?.n || 0));
-                const nS = Math.max(1, Math.min(500, coeffS?.n || 0));
-                
-                // Base probability from golden metrics
-                const pBase = 0.45 + 0.35 * Math.tanh(cand.vol_1h_pct / 3);
-                
-                // Direction bias from funding rate
-                const fundingBias = -Math.sign(cand.funding_rate_raw) * Math.min(0.15, Math.abs(cand.funding_rate_raw) * 100);
-                
-                const pLong0 = clamp(pBase + fundingBias, 0.30, 0.85);
-                const pShort0 = clamp(pBase - fundingBias, 0.30, 0.85);
-                
-                const pLong = calibrateP(state, "long", regime, pLong0);
-                const pShort = calibrateP(state, "short", regime, pShort0);
-                const pLong_lcb = wilsonLCB(pLong, nL, WILSON_Z);
-                const pShort_lcb = wilsonLCB(pShort, nS, WILSON_Z);
-                
-                // ATR estimation from 1h volatility
-                const atr_bps = Math.round(cand.vol_1h_pct * 100);
-                
-                // TP/SL based on volatility
-                const MAX_SL_BPS = 80;
-                let candLong = null, candShort = null;
-                
-                if (DIRECTION !== "short") {
-                  let tp = Math.round(atr_bps * LONG_BOUNCE_TP_ATR);
-                  let sl = Math.round(atr_bps * LONG_BOUNCE_SL_ATR);
-                  sl = Math.min(sl, MAX_SL_BPS);
-                  tp = Math.max(tp, Math.round(sl * 1.5));
-                  
-                  const evLCB = Math.round(pLong_lcb * tp - (1 - pLong_lcb) * sl - costLong);
-                  const edgeL = tp / Math.max(1, LONG_EDGE_MULT_MIN * costLong);
-                  const evScoreL = evLCB / Math.max(8, EXP_LCB_MIN_BPS_BASE);
-                  const viabMultL = clamp(0.5 * clamp(edgeL, 0.3, 1.4) + 0.5 * clamp(evScoreL, 0.3, 1.4), 0.3, 1.3);
-                  
-                  candLong = {
-                    side: "long",
-                    p_lcb: pLong_lcb,
-                    p_raw: pLong0,
-                    ev_bps: evLCB,
-                    exp_lcb_bps: evLCB,
-                    tp_bps: tp,
-                    sl_bps: sl,
-                    cost_bps: costLong,
-                    style: "hedge",
-                    regime,
-                    viab_mult: viabMultL
-                  };
-                }
-                
-                if (DIRECTION !== "long") {
-                  let tp = Math.round(atr_bps * 1.0);
-                  let sl = Math.round(atr_bps * 0.5);
-                  sl = Math.min(sl, MAX_SL_BPS);
-                  tp = Math.max(tp, Math.round(sl * 1.5));
-                  
-                  const evLCB = Math.round(pShort_lcb * tp - (1 - pShort_lcb) * sl - costShort);
-                  const edgeS = tp / Math.max(1, 4 * costShort);
-                  const evScoreS = evLCB / Math.max(8, EXP_LCB_MIN_BPS_BASE);
-                  const viabMultS = clamp(0.5 * clamp(edgeS, 0.3, 1.4) + 0.5 * clamp(evScoreS, 0.3, 1.4), 0.3, 1.3);
-                  
-                  candShort = {
-                    side: "short",
-                    p_lcb: pShort_lcb,
-                    p_raw: pShort0,
-                    ev_bps: evLCB,
-                    exp_lcb_bps: evLCB,
-                    tp_bps: tp,
-                    sl_bps: sl,
-                    cost_bps: costShort,
-                    style: "hedge",
-                    regime,
-                    viab_mult: viabMultS
-                  };
-                }
-                
-                // Choose better side
-                const chosen = candLong && candShort
-                  ? (candLong.exp_lcb_bps >= candShort.exp_lcb_bps ? candLong : candShort)
-                  : (candLong || candShort || null);
-                
-                if (!chosen) continue;
-                
-                // ========== FINAL CONFIDENCE CALCULATION ==========
-                // Base from golden 4 metrics (already 0-100)
-                const baseConf = cand.hedge_confidence;
-                
-                // Execution quality multipliers
-                const spreadMult = clamp(1 - Math.max(0, (spreadBps - 5)) / 30, 0.5, 1.1);
-                const depthMult = clamp(depth1pUSD / Math.max(1, DEPTH_1P_MIN_USD), 0.3, 1.2);
-                const slipMult = clamp(1 - Math.max(0, (chosen.cost_bps - COST_BPS)) / 25, 0.5, 1.1);
-                const oiMult = clamp(cand.current_oi_usd / 50_000_000, 0.4, 1.3);
-                
-                // EV multiplier
-                const evMult = clamp(chosen.viab_mult || 1, 0.3, 1.3);
-                
-                // Direction bias for BTC regime
-                const btcMult = (chosen.side === "long" && !btcUp1h) ? 0.85 : 1.0;
-                
-                // Funding alignment bonus
-                const fundingAlignBonus = (
-                  (chosen.side === "short" && cand.funding_rate_raw > 0) ||
-                  (chosen.side === "long" && cand.funding_rate_raw < 0)
-                ) ? 1.1 : 1.0;
-                
-                // Final confidence
-                const finalConf = Math.round(
-                  baseConf * spreadMult * depthMult * slipMult * oiMult * evMult * btcMult * fundingAlignBonus
-                );
-                
-                // Build reasons
-                const reasons = reasonBuilder({
-                  vol_1h_pct: cand.vol_1h_pct,
-                  funding_rate: cand.funding_rate,
-                  oi_delta_pct: cand.oi_delta_pct,
-                  volume_1h_usd: cand.volume_1h_usd,
-                  basis_bps: cand.basis_bps
-                });
-                
-                refined.push({
-                  symbol: cand.symbol,
-                  base: cand.base,
-                  quote: cand.quote,
-                  
-                  side: chosen.side,
-                  p_lcb: +chosen.p_lcb.toFixed(3),
-                  p_raw: +chosen.p_raw.toFixed(3),
-                  exp_bps: chosen.ev_bps,
-                  exp_lcb_bps: chosen.exp_lcb_bps,
-                  tp_bps: chosen.tp_bps,
-                  sl_bps: chosen.sl_bps,
-                  rrr: +(chosen.tp_bps / Math.max(1, chosen.sl_bps)).toFixed(2),
-                  spread_bps: spreadBps,
-                  cost_bps: chosen.cost_bps,
-                  atr_bps,
-                  regime: chosen.regime,
-                  style: chosen.style,
-                  
-                  // Golden metrics
-                  vol_1h_pct: cand.vol_1h_pct,
-                  funding_rate: cand.funding_rate,
-                  funding_rate_raw: cand.funding_rate_raw,
-                  oi_delta_pct: cand.oi_delta_pct,
-                  volume_1h_usd: cand.volume_1h_usd,
-                  basis_bps: cand.basis_bps,
-                  current_oi_usd: cand.current_oi_usd,
-                  
-                  // Prices
-                  mark_price: cand.mark_price,
-                  spot_price: cand.spot_price,
-                  
-                  // Execution quality
-                  depth1p_usd: depth1pUSD,
-                  obi,
-                  slip_est: chosen.side === "long" ? slipL : slipS,
-                  
-                  // TTL (max 2 hours for hedge trades)
-                  hold_sec: clamp(3600, TTL_MIN, TTL_MAX), // Default 1 hour
-                  
-                  confidence: clamp(finalConf, 0, 100),
-                  hedge_confidence: cand.hedge_confidence,
-                  reasons,
-                  
-                  ret5: [] // Simplified
-                });
-                
-              } catch (e) {
-                log(`Refine error for ${cand.symbol}:`, e?.message || e);
+            // persistence scales conviction, never direction
+            const persist = clamp(1 + 0.5 * (0.6 * k2.signal + 0.4 * k4.signal), 0.5, 1.3);
+            const composite = clamp(dirComp * persist, -1, 1);
+
+            return {
+              k1_ols: k1,
+              k2_hurst: k2,
+              k3_mann_kendall: k3,
+              k4_variance_ratio: k4,
+              k5_adx_di: k5,
+              k6_kalman: k6,
+              rsi: rsi14,
+              composite: +composite.toFixed(4),
+              lastClose: closes.at(-1),
+              lastTs: klines.at(-1).ts
+            };
+          }
+
+          // ================================================================
+          //  MULTI-TIMEFRAME AGGREGATION
+          // ================================================================
+          function analyzeKlinesMultiTF(tfData) {
+            const weights = {
+              '5': 0.10, '15': 0.15, '60': 0.25, '240': 0.30
+            };
+            const perTF = {};
+            let wS = 0, sS = 0;
+            const dirs = [];
+
+            for (const [tf, klines] of Object.entries(tfData)) {
+              const a = analyzeKlinesForTF(klines);
+              if (!a) continue;
+              perTF[tf] = a;
+              const w = weights[tf] || 0.15;
+              sS += a.composite * w;
+              wS += w;
+              dirs.push(Math.sign(a.composite));
+            }
+
+            const composite = wS > 0 ? sS / wS : 0;
+            const nTFs = dirs.length;
+            const agreeing = dirs.filter(
+              d => d === Math.sign(composite)
+            ).length;
+            const tfAlignment = nTFs > 0 ? agreeing / nTFs : 0;
+
+            let regime = 'ranging';
+            if (Math.abs(composite) > 0.5 && tfAlignment >= 0.8)
+              regime = composite > 0
+                ? 'strong_uptrend' : 'strong_downtrend';
+            else if (Math.abs(composite) > 0.25)
+              regime = composite > 0
+                ? 'weak_uptrend' : 'weak_downtrend';
+
+            const hurstVals = Object.values(perTF)
+              .map(a => a.k2_hurst.H).filter(h => h > 0);
+            const avgHurst = hurstVals.length > 0
+              ? mean(hurstVals) : 0.5;
+            const meanReverting = avgHurst < 0.45
+              && hurstVals.filter(h => h < 0.45).length
+                > hurstVals.length / 2;
+
+            return {
+              perTF,
+              composite: +composite.toFixed(4),
+              tfAlignment: +tfAlignment.toFixed(2),
+              regime,
+              avgHurst: +avgHurst.toFixed(4),
+              meanReverting,
+              direction: composite > 0.15
+                ? 'bullish'
+                : composite < -0.15 ? 'bearish' : 'neutral'
+            };
+          }
+
+          // ================================================================
+          //  PHASE 5: CROSS-VALIDATION
+          // ================================================================
+          function crossValidate(tradeAnalysis, klineAnalysis) {
+            const tDir = tradeAnalysis?.trade_direction || 'neutral';
+            const kDir = klineAnalysis?.direction || 'neutral';
+            const tScore = tradeAnalysis?.composite_trade_trend || 0;
+            const kScore = klineAnalysis?.composite || 0;
+
+            let agreement = 'none';
+            let confAdj = 0;
+
+            if (tDir === 'neutral' && kDir === 'neutral') {
+              agreement = 'both_neutral';
+              confAdj = -15;
+            } else if (tDir === 'neutral') {
+              agreement = 'kline_only';
+              confAdj = -5;
+            } else if (kDir === 'neutral') {
+              agreement = 'trade_only';
+              confAdj = -5;
+            } else if (tDir === kDir) {
+              agreement = 'AGREE';
+              confAdj = +25;
+            } else {
+              agreement = 'DISAGREE';
+              confAdj = -20;
+            }
+
+            const finalScore = tScore * 0.40 + kScore * 0.60;
+
+            let finalDirection = 'neutral';
+            if (Math.abs(finalScore) > 0.15)
+              finalDirection = finalScore > 0
+                ? 'bullish' : 'bearish';
+
+            return {
+              trade_direction: tDir,
+              trade_score: +tScore.toFixed(4),
+              kline_direction: kDir,
+              kline_score: +kScore.toFixed(4),
+              agreement,
+              confidence_adjustment: confAdj,
+              final_score: +finalScore.toFixed(4),
+              final_direction: finalDirection
+            };
+          }
+
+          // ================================================================
+          //  PHASE 6: IDEA GENERATION
+          // ================================================================
+          function generateIdea(
+            symbol, tradeA, klineA, crossVal, ticker
+          ) {
+            if (!crossVal || crossVal.final_direction === 'neutral')
+              return null;
+            if (crossVal.agreement === 'DISAGREE') return null;
+
+            const side = crossVal.final_direction === 'bullish'
+              ? 'long' : 'short';
+            const mid = ticker?.lastPrice
+              || klineA?.perTF?.['60']?.lastClose || 0;
+            if (mid <= 0) return null;
+
+            const atrBps = klineA?.perTF?.['60']?.k5_adx_di?.atr_bps
+              || klineA?.perTF?.['15']?.k5_adx_di?.atr_bps || 50;
+
+            const hurst = klineA?.avgHurst || 0.5;
+            const meanRev = klineA?.meanReverting || false;
+            if (meanRev) return null;
+
+            const lossA = tradeA?.t3_loss_acceleration;
+            const accelTrend = lossA?.ttslTrend || 'stable';
+            const consLosses = lossA?.consecutiveSameDirLosses || 0;
+            const lastLossDir = lossA?.lastLossDir || null;
+
+            if (consLosses >= 2) {
+              const longBlocked =
+                side === 'long'
+                && lastLossDir === 'long_loss';
+              const shortBlocked =
+                side === 'short'
+                && lastLossDir === 'short_loss';
+              if (longBlocked || shortBlocked) {
+                return null;
               }
             }
-            
-            log(`🔍 Refined ${refined.length} candidates with execution quality analysis`);
 
-            // ========== FINAL SELECTION ==========
-            refined.sort((a, b) => b.confidence - a.confidence);
-            
-            const TARGET_TOP_N = Math.max(1, TOP_N || 3);
-            
-            const selected = [];
-            for (const cand of refined) {
-              if (selected.length >= TARGET_TOP_N) break;
-              
-              // Simple diversity: don't pick same base twice
-              const alreadyHaveBase = selected.some(s => s.base === cand.base);
-              if (!alreadyHaveBase) {
-                selected.push(cand);
-              }
+            let tpMult, slMult, style;
+            if (
+              Math.abs(crossVal.final_score) > 0.5
+              && hurst > 0.55
+            ) {
+              tpMult = 1.5; slMult = 0.75;
+              style = 'strong_trend';
+            } else {
+              tpMult = 1.0; slMult = 0.6;
+              style = 'weak_trend';
             }
-            
-            // Fill remaining slots if needed
-            if (selected.length < TARGET_TOP_N) {
-              const haveSyms = new Set(selected.map(s => s.symbol));
-              for (const c of refined) {
-                if (selected.length >= TARGET_TOP_N) break;
-                if (!haveSyms.has(c.symbol)) {
-                  selected.push(c);
-                  haveSyms.add(c.symbol);
-                }
-              }
+
+            if (accelTrend === 'accelerating') {
+              tpMult *= 1.2;
+            } else if (accelTrend === 'exhausting') {
+              tpMult *= 0.8;
             }
+
+            const avgLossBps = Math.round(lossA?.avgLossBps || 0);
+            let tp_bps = Math.round(atrBps * tpMult);
+            let sl_bps = Math.round(atrBps * slMult);
+
+            if (avgLossBps > 0 && sl_bps < avgLossBps * 0.8) {
+              sl_bps = Math.round(avgLossBps * 0.8);
+            }
+
+            sl_bps = Math.min(sl_bps, MAX_SL_BPS);
+            tp_bps = Math.max(tp_bps, Math.round(sl_bps * 1.5));
+            const rrr = +(tp_bps / Math.max(1, sl_bps)).toFixed(2);
+
+            const spread = (ticker && ticker.ask > 0 && ticker.bid > 0)
+              ? Math.abs(ticker.ask - ticker.bid) : 0;
+            const spreadBps = mid > 0
+              ? Math.round(spread / mid * 10000) : 0;
+            let entry;
+            if (side === 'long') {
+              entry = mid - spread * 0.3;
+            } else {
+              entry = mid + spread * 0.3;
+            }
+
+            let tp_abs, sl_abs;
+            if (side === 'long') {
+              tp_abs = entry * (1 + tp_bps / 10000);
+              sl_abs = entry * (1 - sl_bps / 10000);
+            } else {
+              tp_abs = entry * (1 - tp_bps / 10000);
+              sl_abs = entry * (1 + sl_bps / 10000);
+            }
+
+            entry = +entry.toPrecision(7);
+            tp_abs = +tp_abs.toPrecision(7);
+            sl_abs = +sl_abs.toPrecision(7);
+
+            const sideStats = side === 'long'
+              ? tradeA?.t4_side_asymmetry?.long
+              : tradeA?.t4_side_asymmetry?.short;
+            const histN = sideStats?.total || 0;
+            const histWR = histN >= 3 ? sideStats.wr_lcb : 0.40;
+
+            const baseConf = Math.abs(crossVal.final_score) * 50;
+            const tfAlignB = (klineA?.tfAlignment || 0) * 20;
+            const hurstB = hurst > 0.65
+              ? 15 : hurst > 0.55
+                ? 10 : hurst > 0.50 ? 5 : 0;
+            const histB = Math.max(0, (histWR - 0.5)) * 30;
+            const crossB = crossVal.confidence_adjustment || 0;
+            const spreadP = Math.max(0, (spreadBps - 5) * 2);
+
+            let lossAccelB = 0;
+            if (
+              accelTrend === 'accelerating'
+              && consLosses >= 2
+            ) {
+              const sideMatchesTrend =
+                (side === 'short'
+                  && lossA?.impliedTrend === 'bearish')
+                || (side === 'long'
+                  && lossA?.impliedTrend === 'bullish');
+              if (sideMatchesTrend) lossAccelB = 10;
+            }
+
+            const bayesB =
+              tradeA?.t6_bayesian_posterior?.strength === 'strong'
+                ? 8
+                : tradeA?.t6_bayesian_posterior?.strength === 'moderate'
+                  ? 4 : 0;
+
+            const confidence = Math.round(clamp(
+              baseConf + tfAlignB + hurstB + histB
+              + crossB + lossAccelB + bayesB - spreadP,
+              0, 100
+            ));
+
+            if (confidence < MIN_CONFIDENCE) return null;
+
+            const pWin = clamp(
+              histWR * 0.5 + (confidence / 100) * 0.5,
+              0.30, 0.80
+            );
+            const b = rrr;
+            const q = 1 - pWin;
+            const kellyFull = (pWin * b - q) / b;
+            const kellyFrac = kellyFull > 0
+              ? kellyFull * 0.25 : 0;
+            const size_bps = kellyFrac > 0
+              ? clamp(Math.round(kellyFrac * 10000), 10, 200)
+              : 0;
+            if (size_bps < 10) return null;
+
+            const ev_bps = Math.round(
+              pWin * tp_bps - q * sl_bps - 10
+            );
+
+            if (tp_bps < 25 || ev_bps <= 0) return null;
+
+            const adxByTF = {};
+            for (const [tf, a] of Object.entries(
+              klineA?.perTF || {}
+            )) {
+              adxByTF[tf] = a?.k5_adx_di?.adx || 0;
+            }
+            const domTF = Object.entries(adxByTF)
+              .sort((a, b) => b[1] - a[1])[0]?.[0] || '60';
+            const ttl_sec = TTL_MAP[domTF] || 3600;
+
+            const reasons = [];
+
+            if (crossVal.agreement === 'AGREE') {
+              reasons.push(
+                `Trades + klines AGREE: ${crossVal.final_direction}`
+              );
+            }
+
+            if (hurst > 0.55) {
+              reasons.push(
+                `Hurst ${klineA.avgHurst} → trendable`
+              );
+            } else if (hurst < 0.45) {
+              reasons.push(
+                `Hurst ${klineA.avgHurst} → mean-reverting`
+              );
+            }
+
+            const ols1h = klineA?.perTF?.['60']?.k1_ols;
+            if (ols1h?.significant) {
+              reasons.push(
+                `1h OLS: slope=${ols1h.slope_bps}bps t=${ols1h.tStat}`
+              );
+            }
+
+            const bayes = tradeA?.t6_bayesian_posterior;
+            if (bayes?.strength !== 'weak') {
+              const pMax = Math.max(bayes.pUp, bayes.pDown);
+              reasons.push(
+                `Bayesian P(${bayes.direction})=${pMax.toFixed(2)} [${bayes.strength}]`
+              );
+            }
+
+            if (consLosses >= 2) {
+              reasons.push(
+                `${consLosses} consecutive ${lastLossDir}s → `
+                + `${lossA.impliedTrend}`
+              );
+            }
+
+            if (accelTrend !== 'stable') {
+              reasons.push(
+                `Loss velocity ${accelTrend}`
+                + ` (TTSL: ${(lossA?.ttslValues || []).join(' → ')} min)`
+              );
+            }
+
+            if (lossA?.lossMagnitudeTrend && lossA.lossMagnitudeTrend !== 'stable' && lossA.avgLoss > 0) {
+              reasons.push(
+                `Loss sizes ${lossA.lossMagnitudeTrend}`
+                + ` (avg $${lossA.avgLoss.toFixed(2)})`
+              );
+            }
+
+            if (tradeA?.t2_entry_exit_slope?.agree) {
+              reasons.push(
+                `Entry+exit slopes agree: `
+                + `${tradeA.t2_entry_exit_slope.entry.slope_bps}bps/trade`
+              );
+            }
+
+            const mk1h = klineA?.perTF?.['60']?.k3_mann_kendall;
+            if (mk1h?.significant) {
+              reasons.push(
+                `Mann-Kendall τ=${mk1h.tau} z=${mk1h.z}`
+              );
+            }
+
+            const asym = tradeA?.t4_side_asymmetry;
+            if (asym?.bestSide !== 'neutral') {
+              const wr = side === 'long'
+                ? asym.long.wr_lcb : asym.short.wr_lcb;
+              reasons.push(
+                `${asym.bestSide} historically better `
+                + `(WR_LCB=${wr})`
+              );
+            }
+
+            if (asym?.lossSizeAsymmetry
+              && Math.abs(asym.lossSizeAsymmetry) > 0.2
+            ) {
+              const bigger = asym.lossSizeAsymmetry > 0
+                ? 'long' : 'short';
+              reasons.push(
+                `${bigger} losses bigger → `
+                + `${bigger === 'long' ? 'bearish' : 'bullish'}`
+              );
+            }
+
+            const kf = klineA?.perTF?.['60']?.k6_kalman;
+            if (kf && Math.abs(kf.velocityBps) > 2) {
+              reasons.push(
+                `Kalman vel=${kf.velocityBps > 0 ? '+' : ''}`
+                + `${kf.velocityBps}bps (${kf.accelerating})`
+              );
+            }
+
+            const vr = klineA?.perTF?.['60']?.k4_variance_ratio;
+            if (vr && !['random_walk', 'insufficient', 'no_variance'].includes(vr.interpretation)) {
+              reasons.push(
+                `Var.Ratio: ${vr.interpretation} `
+                + `(VR=${vr.VR})`
+              );
+            }
+
+            const skew = tradeA?.t5_displacement_skew;
+            if (skew?.interpretation !== 'symmetric'
+              && skew?.interpretation !== 'insufficient'
+            ) {
+              reasons.push(
+                `Displacement skew: ${skew.interpretation} `
+                + `(${skew.skewness.toFixed(2)})`
+              );
+            }
+
+            if (ticker?.fundingRate
+              && Math.abs(ticker.fundingRate) > 0.0003
+            ) {
+              const fdDir = ticker.fundingRate > 0
+                ? 'longs pay' : 'shorts pay';
+              reasons.push(
+                `Funding ${(ticker.fundingRate * 100).toFixed(4)}% `
+                + `(${fdDir})`
+              );
+            }
+
+            return {
+              symbol,
+              base: symbol.replace('USDT', ''),
+              quote: 'USDT',
+              side,
+              style,
+              confidence,
+              regime: klineA?.regime || 'unknown',
+              hurst: klineA?.avgHurst || 0.5,
+              mean_reverting: meanRev,
+              entry,
+              tp_abs,
+              sl_abs,
+              tp_bps,
+              sl_bps,
+              rrr,
+              ev_bps,
+              p_win: +pWin.toFixed(3),
+              size_bps,
+              ttl_sec,
+              spread_bps: spreadBps,
+              funding_rate: ticker?.fundingRate || 0,
+              volume_24h: ticker?.turnover24h || 0,
+              open_interest: ticker?.openInterest || 0,
+              cross_validation: crossVal,
+              trade_tests_summary: {
+                n_trades: tradeA?.n_trades || 0,
+                direction_consensus:
+                  tradeA?.t1_direction_consensus?.score || 0,
+                entry_slope_significant:
+                  tradeA?.t2_entry_exit_slope?.entry?.significant
+                  || false,
+                entry_slope_bps:
+                  tradeA?.t2_entry_exit_slope?.entry?.slope_bps
+                  || 0,
+                loss_acceleration: accelTrend,
+                consecutive_losses: consLosses,
+                loss_magnitude_trend:
+                  lossA?.lossMagnitudeTrend || 'unknown',
+                side_asymmetry:
+                  tradeA?.t4_side_asymmetry?.asymmetry || 0,
+                displacement_skew:
+                  tradeA?.t5_displacement_skew?.skewness || 0,
+                bayesian_direction:
+                  tradeA?.t6_bayesian_posterior?.direction
+                  || 'neutral',
+                bayesian_strength:
+                  tradeA?.t6_bayesian_posterior?.strength || 'weak'
+              },
+              kline_tests_summary: {
+                composite: klineA?.composite || 0,
+                tf_alignment: klineA?.tfAlignment || 0,
+                hurst: klineA?.avgHurst || 0.5,
+                regime: klineA?.regime || 'unknown',
+                mean_reverting: meanRev
+              },
+              reasons: reasons.slice(0, 10),
+              generated_at: new Date().toISOString()
+            };
+          }
+
+          // ================================================================
+          //  MAIN EXECUTION
+          // ================================================================
+
+          log('╔═══════════════════════════════════════════════╗');
+          log('║  Trade Archaeology Analyzer v' + VERSION + '          ║');
+          log('╚═══════════════════════════════════════════════╝');
+
+          // ---- STEP 1: Fetch data from worker ----
+          log('');
+          log('━━━ STEP 1: Fetch worker data ━━━');
+          log('Worker URL:', WORKER_URL);
+
+          const prev = await readAnalysisGist();
+          const pushedPrev = prev.pushed || {};
+
+          let pnlData, stateData;
+          try {
+            pnlData = await fetchRetry(`${WORKER_URL}/pnl?limit=100`);
+          } catch (e) {
+            log('FATAL: Cannot reach worker pnl:', e?.message);
+            await writeAnalysisGist({
+              ts: new Date().toISOString(),
+              version: VERSION,
+              status: 'worker_unreachable',
+              error: e?.message,
+              ideas: [],
+              pushed: pushedPrev
+            });
+            process.exit(1);
+          }
+          
+          try {
+            stateData = await fetchRetry(`${WORKER_URL}/json`);
+          } catch (e) {
+            log('WARN: Cannot reach worker state /json:', e?.message);
+            stateData = {};
+          }
+
+          if (!Array.isArray(pnlData)) pnlData = pnlData?.items || pnlData?.data || pnlData?.closedPnl || [];
+
+          if (!Array.isArray(pnlData) || pnlData.length === 0) {
+            log('No closed trades found. Writing empty analysis.');
+            await writeAnalysisGist({
+              ts: new Date().toISOString(),
+              version: VERSION,
+              status: 'no_trades',
+              analyzed_symbols: 0,
+              ideas: [],
+              pushed: pushedPrev
+            });
+            process.exit(0);
+          }
+
+          log(`Fetched ${pnlData.length} closed trades`);
+          const regime = stateData?.regime?.regime || 'Unknown';
+          const positions = Array.isArray(stateData?.positions) 
+            ? stateData.positions.filter(p => !(+p.size === 0)) : [];
+          const openSyms = new Set(positions.map(p => p.symbol));
+          log(`Regime: ${regime}`);
+          log(`Open positions: ${positions.length}`);
+          if (positions.length > 0) {
+            log(`  Symbols: ${[...openSyms].join(', ')}`);
+          }
+
+          // ---- STEP 2: Group trades by symbol ----
+          log('');
+          log('━━━ STEP 2: Group trades by symbol ━━━');
+          const bySymbol = {};
+          const MAX_AGE_H = 72;
+          let sideMismatch = 0;
+          
+          for (const t of pnlData) {
+            if (!t.symbol) continue;
+            const entryPrice = +t.entryPrice || +t.avgEntryPrice || 0;
+            const exitPrice  = +t.exitPrice  || +t.avgExitPrice  || 0;
+            const pnl        = +t.closedPnl || +t.pnl || 0;
+            const ms = v => (v > 0 && v < 1e11) ? v * 1000 : v;
+            const closedAt   = ms(+t.closedAt || +t.updatedTime || 0);
+            let openedAt     = ms(+t.openedAt || +t.createdTime || 0);
             
-            log(`✅ Selected ${selected.length} ideas for pushing`);
+            if (!(entryPrice > 0 && exitPrice > 0 && closedAt > 0)) continue;
+            if (Date.now() - closedAt > MAX_AGE_H * 3600e3) continue;
 
-            // ========== GENERATE FLIPPED IDEAS ==========
-            const flipped = selected.map(orig => ({
-              ...orig,
-              side: orig.side === "long" ? "short" : "long",
-              flipped: true,
-              original_idea_id: orig.symbol + "_" + orig.side
-            }));
-            
-            const selectedWithFlipped = [...selected, ...flipped];
+            let side = t.side || 'Buy';
+            const mv = exitPrice - entryPrice;
+            if (pnl !== 0 && Math.abs(mv / entryPrice) * 1e4 > 20) {
+              const inferred = ((mv > 0) === (pnl > 0)) ? 'Buy' : 'Sell';
+              if (inferred !== side) sideMismatch++;
+              side = inferred;
+            }
 
-            // Risk weights via softmax of EV
-            const wEv = softmax(selectedWithFlipped.map(x => x.exp_lcb_bps), 20);
-            // Build full v2 ideas
-            let picksV2 = selectedWithFlipped.map((x, i) => {
-              const mid = x.mark_price;
+            const adverseBps = side === 'Buy'
+              ? (entryPrice - exitPrice) / entryPrice * 1e4
+              : (exitPrice - entryPrice) / entryPrice * 1e4;
+            const stopLoss = pnl < 0 && adverseBps > 10;
+            if (openedAt <= 0 || openedAt > closedAt) openedAt = closedAt;
 
-              // Compute abs exits
-              let entry_limit = null, tp_abs = null, sl_abs = null;
-              if (mid != null) {
-                const slF = x.sl_bps / 10000, tpF = x.tp_bps / 10000;
-                if (x.side === "long") {
-                  entry_limit = mid * (1 - Math.max(0.001, slF * 0.5));
-                  tp_abs = entry_limit * (1 + tpF);
-                  sl_abs = entry_limit * (1 - slF);
-                } else {
-                  entry_limit = mid * (1 + slF);
-                  tp_abs = entry_limit * (1 - tpF);
-                  sl_abs = entry_limit * (1 + slF);
-                }
+            if (!bySymbol[t.symbol]) bySymbol[t.symbol] = [];
+            bySymbol[t.symbol].push({
+              ...t,
+              entryPrice,
+              exitPrice,
+              pnl,
+              closedAt,
+              openedAt,
+              side,
+              stopLoss
+            });
+          }
+          log(`Side mismatches corrected: ${sideMismatch}`);
+
+          const symbols = Object.keys(bySymbol);
+          log(`${symbols.length} symbols: ${symbols.join(', ')}`);
+          for (const [sym, trades] of Object.entries(bySymbol)) {
+            const wins = trades.filter(t => t.pnl >= 0).length;
+            log(`  ${sym}: ${trades.length} trades (${wins}W ${trades.length - wins}L)`);
+          }
+
+          // ---- STEP 3: Trade-based analysis ----
+          log('');
+          log('━━━ STEP 3: Trade-based trend tests (6 tests) ━━━');
+          const tradeAnalyses = {};
+          for (const [sym, trades] of Object.entries(bySymbol)) {
+            const sorted = trades.sort(
+              (a, b) => a.closedAt - b.closedAt
+            );
+            tradeAnalyses[sym] = analyzeTradesForSymbol(sorted);
+            const ta = tradeAnalyses[sym];
+            log(`  ${sym}: ${ta.trade_direction} `
+              + `(composite=${ta.composite_trade_trend})`);
+            log(`    T1 consensus=${ta.t1_direction_consensus.score}`);
+            log(`    T2 entry_slope=${ta.t2_entry_exit_slope.entry.slope_bps}bps `
+              + `t=${ta.t2_entry_exit_slope.entry.tStat} `
+              + `agree=${ta.t2_entry_exit_slope.agree}`);
+            log(`    T3 loss_accel=${ta.t3_loss_acceleration.ttslTrend} `
+              + `consec=${ta.t3_loss_acceleration.consecutiveSameDirLosses} `
+              + `TTSL=[${ta.t3_loss_acceleration.ttslValues.join(',')}]`);
+            log(`    T4 side_asym=${ta.t4_side_asymmetry.asymmetry} `
+              + `best=${ta.t4_side_asymmetry.bestSide}`);
+            log(`    T5 skew=${ta.t5_displacement_skew.skewness} `
+              + `(${ta.t5_displacement_skew.interpretation})`);
+            log(`    T6 bayes=${ta.t6_bayesian_posterior.direction} `
+              + `P(up)=${ta.t6_bayesian_posterior.pUp} `
+              + `[${ta.t6_bayesian_posterior.strength}]`);
+            log(`    Entry prices: [${ta.entry_prices.join(', ')}]`);
+            log(`    Exit prices:  [${ta.exit_prices.join(', ')}]`);
+          }
+
+          // ---- STEP 4: Fetch klines ----
+          log('');
+          log('━━━ STEP 4: Fetch Bybit public klines ━━━');
+          const klData = {};
+          const INTERVALS = ['5', '15', '60', '240'];
+          const LIMITS = { '5': 200, '15': 200, '60': 200, '240': 100 };
+
+          for (const sym of symbols) {
+            klData[sym] = {};
+            for (const iv of INTERVALS) {
+              klData[sym][iv] = await getBybitKlines(
+                sym, iv, LIMITS[iv]
+              );
+              await sleep(120);
+            }
+            log(`  ${sym}: ${INTERVALS.map(
+              i => `${i}m=${klData[sym][i]?.length || 0}`
+            ).join(' ')}`);
+          }
+
+          if (symbols.length && symbols.every(s => INTERVALS.every(i => !klData[s][i]?.length))) {
+            log('FATAL: no klines (Bybit blocked?)'); process.exit(1);
+          }
+
+          // ---- STEP 5: Kline-based analysis ----
+          log('');
+          log('━━━ STEP 5: Kline-based trend tests (6 tests × 4 TFs) ━━━');
+          const klineAnalyses = {};
+          for (const sym of symbols) {
+            klineAnalyses[sym] = analyzeKlinesMultiTF(klData[sym]);
+            const ka = klineAnalyses[sym];
+            log(`  ${sym}: ${ka.regime} `
+              + `(composite=${ka.composite} `
+              + `Hurst=${ka.avgHurst} `
+              + `TF-align=${ka.tfAlignment}`
+              + `${ka.meanReverting ? ' ⚠️MEAN-REVERTING' : ''})`);
+            for (const [tf, a] of Object.entries(ka.perTF)) {
+              log(`    ${tf}m: composite=${a.composite} `
+                + `ADX=${a.k5_adx_di.adx}(${a.k5_adx_di.strength}) `
+                + `Hurst=${a.k2_hurst.H} `
+                + `Kalman=${a.k6_kalman.velocityBps}bps `
+                + `RSI=${a.rsi}`);
+            }
+          }
+
+          // ---- STEP 6: Cross-validate ----
+          log('');
+          log('━━━ STEP 6: Cross-validation ━━━');
+          const crossVals = {};
+          for (const sym of symbols) {
+            crossVals[sym] = crossValidate(
+              tradeAnalyses[sym], klineAnalyses[sym]
+            );
+            const cv = crossVals[sym];
+            const icon = cv.agreement === 'AGREE' ? '✅'
+              : cv.agreement === 'DISAGREE' ? '❌' : '⚠️';
+            log(`  ${icon} ${sym}: trades=${cv.trade_direction} `
+              + `klines=${cv.kline_direction} `
+              + `→ ${cv.agreement} `
+              + `→ FINAL: ${cv.final_direction} `
+              + `(score=${cv.final_score})`);
+          }
+
+          // ---- STEP 7: Fetch tickers ----
+          log('');
+          log('━━━ STEP 7: Fetch tickers ━━━');
+          const tickers = {};
+          for (const sym of symbols) {
+            tickers[sym] = await getBybitTicker(sym);
+            await sleep(100);
+            if (tickers[sym]) {
+              log(`  ${sym}: $${tickers[sym].lastPrice} `
+                + `spread=${((tickers[sym].ask - tickers[sym].bid) / tickers[sym].lastPrice * 10000).toFixed(1)}bps `
+                + `vol24h=$${Math.round(tickers[sym].turnover24h / 1e6)}M `
+                + `FR=${(tickers[sym].fundingRate * 100).toFixed(4)}%`);
+            }
+          }
+
+          // ---- STEP 8: Generate ideas ----
+          log('');
+          log('━━━ STEP 8: Generate ideas ━━━');
+          const allIdeas = [];
+          for (const sym of symbols) {
+            if (openSyms.has(sym)) {
+              log(`  ⏭️  ${sym}: SKIP (position open)`);
+              continue;
+            }
+
+            let idea = null;
+            try {
+              idea = generateIdea(
+                sym,
+                tradeAnalyses[sym],
+                klineAnalyses[sym],
+                crossVals[sym],
+                tickers[sym]
+              );
+            } catch (e) { log(`  💥 ${sym}: generateIdea error: ${e?.message}`); }
+
+            if (idea) {
+              allIdeas.push(idea);
+              log(`  ✅ ${sym} ${idea.side.toUpperCase()} `
+                + `conf=${idea.confidence} ev=${idea.ev_bps}bps `
+                + `rrr=${idea.rrr} style=${idea.style}`);
+              for (const r of idea.reasons.slice(0, 4)) {
+                log(`     → ${r}`);
               }
+            } else {
+              const cv = crossVals[sym];
+              log(`  ❌ ${sym}: no idea `
+                + `(dir=${cv?.final_direction} `
+                + `agreement=${cv?.agreement})`);
+            }
+          }
 
-              const idea_id = uuidv4();
-              const client_order_id = mkClientOrderId("bnh");  // ← CHANGED prefix for Binance Hedge
+          // ---- Sort by confidence × ev, apply diversity ----
+          allIdeas.sort(
+            (a, b) => (b.confidence * Math.max(1, b.ev_bps))
+              - (a.confidence * Math.max(1, a.ev_bps))
+          );
 
-              const ttl = clamp(Math.round((x.hold_sec || 3600) + i * 12), TTL_MIN, TTL_MAX);
-              const size_bps = (Number(process.env.FORCE_SIZE_BPS || "0") > 0)
-                ? Math.round(Number(process.env.FORCE_SIZE_BPS))
-                : (x.sl_bps > 0 ? Math.min(220, Math.round((wEv[i] * TARGET_PORT_RISK_BPS / x.sl_bps) * 100)) : 0);
+          const finalIdeas = [];
+          const usedBases = new Set();
+          let longCnt = 0, shortCnt = 0;
+          for (const idea of allIdeas) {
+            if (finalIdeas.length >= TOP_N) break;
+            if (usedBases.has(idea.base)) continue;
+            if (idea.side === 'long' && longCnt >= 2) continue;
+            if (idea.side === 'short' && shortCnt >= 2) continue;
+            finalIdeas.push(idea);
+            usedBases.add(idea.base);
+            if (idea.side === 'long') longCnt++;
+            else shortCnt++;
+          }
 
-              return {
-                idea_id, client_order_id,
+          log('');
+          log('╔═══════════════════════════════════════════════╗');
+          log(`║  FINAL IDEAS: ${finalIdeas.length}                              ║`);
+          log('╚═══════════════════════════════════════════════╝');
+          for (const idea of finalIdeas) {
+            log(`  ${idea.symbol} ${idea.side.toUpperCase()} `
+              + `conf=${idea.confidence} ev=${idea.ev_bps}bps `
+              + `rrr=${idea.rrr} tp=${idea.tp_bps}bps `
+              + `sl=${idea.sl_bps}bps size=${idea.size_bps}bps `
+              + `ttl=${idea.ttl_sec}s style=${idea.style}`);
+            for (const r of idea.reasons) {
+              log(`    → ${r}`);
+            }
+          }
 
-                symbol: x.base,
-                symbol_full: x.symbol,
-                symbolFull: x.symbol,
-                quote: x.quote,
-                side: x.side,
+          // ---- STEP 9: Write to analysis Gist ----
+          log('');
+          log('━━━ STEP 9: Write analysis Gist ━━━');
+          const pushedNext = {};
+          for (const [k, ts] of Object.entries(pushedPrev)) {
+            if (Date.now() - ts < 6 * 3600e3) pushedNext[k] = ts;
+          }
+          const pushIdeas = finalIdeas.filter(i => {
+            const ts = pushedPrev[i.symbol + '|' + i.side];
+            return !(ts && Date.now() - ts < i.ttl_sec * 1000);
+          });
+
+          const output = {
+            ts: new Date().toISOString(),
+            version: VERSION,
+            status: 'ok',
+            worker_regime: regime,
+            open_positions: positions.length,
+            analyzed_symbols: symbols.length,
+            total_closed_trades: pnlData.length,
+            ideas_generated: allIdeas.length,
+            ideas_after_filter: finalIdeas.length,
+            ideas: finalIdeas,
+            pushed: pushedNext,
+            per_symbol: {},
+            config: {
+              top_n: TOP_N,
+              min_confidence: MIN_CONFIDENCE,
+              max_sl_bps: MAX_SL_BPS,
+              notional_usd: NOTIONAL,
+              worker_url: WORKER_URL.replace(
+                /https?:\/\//, '***.'
+              )
+            }
+          };
+
+          for (const sym of symbols) {
+            output.per_symbol[sym] = {
+              trade_analysis: tradeAnalyses[sym],
+              kline_analysis: {
+                composite: klineAnalyses[sym]?.composite,
+                tfAlignment: klineAnalyses[sym]?.tfAlignment,
+                regime: klineAnalyses[sym]?.regime,
+                avgHurst: klineAnalyses[sym]?.avgHurst,
+                meanReverting: klineAnalyses[sym]?.meanReverting,
+                direction: klineAnalyses[sym]?.direction,
+                perTF_summary: Object.fromEntries(
+                  Object.entries(
+                    klineAnalyses[sym]?.perTF || {}
+                  ).map(([tf, a]) => [tf, {
+                    composite: a.composite,
+                    rsi: a.rsi,
+                    adx: a.k5_adx_di?.adx,
+                    adx_strength: a.k5_adx_di?.strength,
+                    adx_direction: a.k5_adx_di?.direction,
+                    atr_bps: a.k5_adx_di?.atr_bps,
+                    hurst: a.k2_hurst?.H,
+                    hurst_interp: a.k2_hurst?.interpretation,
+                    ols_slope_bps: a.k1_ols?.slope_bps,
+                    ols_significant: a.k1_ols?.significant,
+                    mk_tau: a.k3_mann_kendall?.tau,
+                    mk_significant: a.k3_mann_kendall?.significant,
+                    vr: a.k4_variance_ratio?.VR,
+                    vr_interp:
+                      a.k4_variance_ratio?.interpretation,
+                    kalman_vel_bps: a.k6_kalman?.velocityBps,
+                    kalman_accel: a.k6_kalman?.accelerating
+                  }])
+                )
+              },
+              cross_validation: crossVals[sym],
+              ticker: tickers[sym] ? {
+                lastPrice: tickers[sym].lastPrice,
+                fundingRate: tickers[sym].fundingRate,
+                volume24h: tickers[sym].volume24h,
+                turnover24h: tickers[sym].turnover24h,
+                openInterest: tickers[sym].openInterest
+              } : null
+            };
+          }
+
+          await writeAnalysisGist(output);
+          log('Analysis Gist written.');
+
+          // ---- STEP 10: Push ideas to worker (optional) ----
+          if (PUSH_URL && PUSH_TOKEN && pushIdeas.length > 0) {
+            log('');
+            log('━━━ STEP 10: Push ideas to worker ━━━');
+            const pushPayload = {
+              ts: new Date().toISOString(),
+              mode: 'normal',
+              source: 'trade_archaeology_analyzer',
+              meta: {
+                origin: 'github_actions_analyzer',
+                version: VERSION,
+                worker_regime: regime,
+                analyzed_symbols: symbols.length,
+                total_closed_trades: pnlData.length,
+                methods: [
+                  'OLS_regression',
+                  'Hurst_exponent',
+                  'Mann_Kendall',
+                  'Variance_ratio',
+                  'ADX_DI',
+                  'Kalman_filter',
+                  'Direction_consensus',
+                  'Entry_exit_slope',
+                  'Loss_acceleration',
+                  'Side_asymmetry',
+                  'Displacement_skew',
+                  'Bayesian_posterior'
+                ]
+              },
+              top_n: pushIdeas.length,
+              ideas: pushIdeas.map((idea, i) => ({
+                idea_id: crypto.randomUUID(),
+                client_order_id:
+                  ('ta_' + crypto.randomUUID().replace(/-/g, ''))
+                    .slice(0, 28),
+                symbol: idea.base,
+                symbol_full: idea.symbol,
+                quote: idea.quote,
+                side: idea.side,
                 rank: i + 1,
-
-                // v2/futures intent
-                target_exchange: TARGET_EXCHANGE,  // "binance_futures"
-                market_type: MARKET_TYPE,
-                margin_mode: MARGIN_MODE,
-                leverage: LEVERAGE,
-
-                // code2 entry intent
-                entry_policy: "maker_join",
-                exec: { exec: "post_only" },
-
-                // entry + exits
-                entry_mid: mid,
-                entry_limit,
-                tp_abs,
-                sl_abs,
-
-                tp_bps: x.tp_bps,
-                sl_bps: x.sl_bps,
-                rrr: x.rrr,
-                exp_lcb_bps: x.exp_lcb_bps,
-                ev_bps: x.exp_bps,
-                cost_bps: x.cost_bps,
-
-                p_win: x.p_lcb,
-                p_lcb: x.p_lcb,
-                p_raw: x.p_raw,
-                calib_key: `side:${x.side}|regime:${x.regime}`,
-                regime: x.regime,
-
-                ttl_sec: ttl,
-                size_bps,
-
+                entry_policy: 'smart_swing_limit',
+                entry_type: 'limit',
+                activation: 'on_fill',
+                entry_mid: idea.entry,
+                entry_limit: idea.entry,
+                tp_abs: idea.tp_abs,
+                sl_abs: idea.sl_abs,
+                tp_bps: idea.tp_bps,
+                sl_bps: idea.sl_bps,
+                rrr: idea.rrr,
+                exp_lcb_bps: idea.ev_bps,
+                ev_bps: idea.ev_bps,
+                cost_bps: 10,
+                p_win: idea.p_win,
+                p_lcb: idea.p_win,
+                p_raw: idea.p_win,
+                confidence: idea.confidence,
+                size_bps: idea.size_bps,
+                ttl_sec: idea.ttl_sec,
+                regime: idea.regime,
+                calib_key:
+                  `side:${idea.side}|regime:${idea.regime}`,
                 predicted: {
                   ts_ms: Date.now(),
-                  p_cal: x.p_lcb,
-                  ev_bps: x.exp_lcb_bps ?? x.exp_bps,
-                  confidence_score: x.confidence,
-                  flipped: x.flipped || false,
-                  
-                  // Hedge-specific metadata
-                  vol_1h_pct: x.vol_1h_pct,
-                  funding_rate: x.funding_rate,
-                  oi_delta_pct: x.oi_delta_pct,
-                  volume_1h_usd: x.volume_1h_usd,
-                  basis_bps: x.basis_bps,
-                  hedge_confidence: x.hedge_confidence
-                },
-
-                confidence: x.confidence,
-                reasons: x.reasons,
-                reasons_text: (x.reasons || []).slice(0, 3).map(r => `${r.factor}:${r.value}(${r.contribution >= 0 ? "+" : ""}${r.contribution})`),
-
-                // Keep hedge metrics for state/debug
-                hedge_metrics: {
-                  vol_1h_pct: x.vol_1h_pct,
-                  funding_rate_raw: x.funding_rate_raw,
-                  oi_delta_pct: x.oi_delta_pct,
-                  volume_1h_usd: x.volume_1h_usd,
-                  basis_bps: x.basis_bps,
-                  mark_price: x.mark_price,
-                  spot_price: x.spot_price,
-                  current_oi_usd: x.current_oi_usd
-                }
-              };
-            });
-
-            // Convert v2 ideas to v1-compatible shape for current Worker
-            const toV1Compat = (pv2) => ({
-              idea_id: pv2.idea_id,
-              client_order_id: pv2.client_order_id,
-
-              symbol: pv2.symbol,
-              symbol_full: pv2.symbol_full,
-              quote: pv2.quote,
-              side: pv2.side,
-              rank: pv2.rank,
-
-              // v1 entry shape
-              entry_policy: "smart_swing_limit",
-              entry_type: "limit",
-              activation: "on_fill",
-
-              entry_mid: pv2.entry_mid,
-              entry_limit: pv2.entry_limit,
-              tp_abs: pv2.tp_abs,
-              sl_abs: pv2.sl_abs,
-
-              tp_bps: pv2.tp_bps,
-              sl_bps: pv2.sl_bps,
-              rrr: pv2.rrr,
-              exp_lcb_bps: pv2.exp_lcb_bps,
-              ev_bps: pv2.ev_bps,
-              cost_bps: pv2.cost_bps,
-
-              p_win: pv2.p_lcb,
-              p_lcb: pv2.p_lcb,
-              p_raw: pv2.p_raw,
-              calib_key: pv2.calib_key,
-              regime: pv2.regime,
-
-              ttl_sec: pv2.ttl_sec,
-              size_bps: pv2.size_bps,
-
-              predicted: {
-                ...pv2.predicted,
-                meta: {
-                  strategy: STRATEGY_NAME,
-                  model_version: MODEL_VERSION,
-                  schema_version: SCHEMA_VERSION,
-                  git_sha: GIT_SHA,
-                  config_hash: CONFIG_HASH,
-                  futures_hint: {
-                    target_exchange: pv2.target_exchange,
-                    market_type: pv2.market_type,
-                    margin_mode: pv2.margin_mode,
-                    leverage: pv2.leverage,
-                    entry_policy_override: pv2.entry_policy,
-                    exec: pv2.exec
+                  confidence_score: idea.confidence,
+                  hurst: idea.hurst,
+                  mean_reverting: idea.mean_reverting,
+                  cross_validation: idea.cross_validation.agreement,
+                  style: idea.style,
+                  trade_tests: idea.trade_tests_summary,
+                  kline_tests: idea.kline_tests_summary,
+                  meta: {
+                    strategy: 'trade-archaeology',
+                    model_version: VERSION,
+                    methods_used: 12,
+                    schema_version: '1'
                   }
-                }
-              },
-
-              confidence: pv2.confidence,
-              reasons: pv2.reasons,
-              reasons_text: pv2.reasons_text,
-              hedge_metrics: pv2.hedge_metrics
-            });
-
-            let picks = picksV2.map(toV1Compat);
-
-            // Portfolio VaR/ES throttle on sizes
-            try {
-              // For hedge trades, simplified size allocation based on volatility
-              const maxVolPick = Math.max(...picks.map(p => p.predicted?.vol_1h_pct || 1));
-              if (maxVolPick > 5) {
-                const scale = clamp(5 / maxVolPick, 0.4, 1);
-                picks = picks.map(p => ({ ...p, size_bps: Math.max(4, Math.round(p.size_bps * scale)) }));
-                log("[gha] High volatility detected, scaling sizes by", scale.toFixed(2));
-              }
-            } catch (e) {
-              log("[gha] Portfolio risk adjustment warn", e?.message || e);
-            }
-
-            // Update state with pending ideas + cooldowns
-            try {
-              const nowMs = Date.now();
-              const ideasTs = new Date(nowMs).toISOString();
-              for (const p of picks) {
-                state.cooldown[p.symbol] = nowMs;
-                state.cooldown_side[p.symbol] = { side: p.side, ts_ms: nowMs };
-                state.pending.push({
-                  ts: ideasTs,
-                  ts_ms: nowMs,
-                  ttl_ts_ms: nowMs + p.ttl_sec * 1000,
-
-                  symbolFull: p.symbol_full,
-                  flipped: p.predicted?.flipped || false,
-                  base: p.symbol,
-                  quote: p.quote,
-                  side: p.side,
-
-                  entry_limit: p.entry_limit,
-                  tp_abs: p.tp_abs,
-                  sl_abs: p.sl_abs,
-
-                  hold_sec: p.ttl_sec,
-                  tp_bps: p.tp_bps,
-                  sl_bps: p.sl_bps,
-                  cost_bps: p.cost_bps,
-                  tier: p.tier || "confidence",
-
-                  p_lcb: p.p_lcb,
-                  p_raw: p.p_raw,
-                  calib_key: p.calib_key,
-                  predicted: p.predicted,
-                  regime: p.regime,
-
-                  decision_context: {
-                    source: "binance_futures",
-                    golden_metrics: p.hedge_metrics
-                  },
-
-                  notional_usd: NOTIONAL,
-                  size_bps: p.size_bps,
-
-                  idea_id: p.idea_id,
-                  client_order_id: p.client_order_id,
-                  hedge_metrics: p.hedge_metrics,
-
-                  status: "planned",
-                  entry_ts_ms: null,
-                  entry_price: null,
-                  qty: null
-                });
-              }
-              if (state.pending.length > 550) state.pending = state.pending.slice(-550);
-              log("DEBUG: Appended", picks.length, "plans. New pending length=", (state.pending || []).length, "example ID:", state.pending.slice(-1)[0]?.client_order_id || "none");
-            } catch (e) {
-              log("state update warn", e?.message || e);
-            }
-
-            // Persist state + audit artifacts
-            const auditOut = buildAuditOutputs(state);
-            log("DEBUG: Pre-save: pending length=", (state.pending || []).length);
-            await saveState(persist, state, auditOut, 2, true);
-            log("DEBUG: saveState call complete.");
-
-            // Build meta and payload
-            for (const p of picks) {
-              log(`idea ${p.symbol_full} ${p.side} conf=${p.confidence} vol1h=${(p.predicted?.vol_1h_pct || 0).toFixed(2)}% fund=${((p.hedge_metrics?.funding_rate_raw || 0) * 100).toFixed(4)}% reasons=${(p.reasons_text || []).join("; ")}`);
-            }
-            
-            const ideaLogs = picks.map(p => ({
-              symbol: p.symbol_full,
-              side: p.side,
-              flipped: p.predicted?.flipped || false,
-              confidence: p.confidence,
-              hedge_confidence: p.predicted?.hedge_confidence || 0,
-              vol_1h_pct: +(p.predicted?.vol_1h_pct || 0).toFixed(2),
-              funding_rate: +(p.predicted?.funding_rate || 0).toFixed(5),
-              oi_delta_pct: +(p.predicted?.oi_delta_pct || 0).toFixed(1),
-              volume_1h_usd: Math.round((p.predicted?.volume_1h_usd || 0) / 1e6) + "M",
-              reasons: p.reasons_text,
-              p_cal: +p.p_lcb.toFixed(3),
-              ev_bps: p.ev_bps,
-              idea_id: p.idea_id
-            }));
-
-            const meta = {
-              origin: "github_actions",
-              reason,
-              exchange: "binance_futures",  // ← CHANGED
-              execution_exchange: "binance_futures",  // ← CHANGED
-              strategy: STRATEGY_NAME,
-              model_version: MODEL_VERSION,
-              schema_version: SCHEMA_VERSION,
-              git_sha: GIT_SHA,
-              config_hash: CONFIG_HASH,
-              counts: {
-                binance_universe: binanceSymbols.length,
-                metrics_fetched: allMetrics.length,
-                refined: refined.length,
-                selected: picks.length
-              },
-              dd_gate: { pnl24_bps, peak_dd_bps, throttle },
-              tod: { active: S_H != null && E_H != null, start: S_H, end: E_H },
-              heartbeat: { mismatches: 0, zombies: 0 },
-              tier: selectionTier,
-              idea_logs: ideaLogs,
-              calibration_health: calibHealth,
-              golden_metrics_config: {
-                ideal_vol_1h_pct: IDEAL_VOL_1H_PCT,
-                ideal_funding_rate: IDEAL_FUNDING_RATE,
-                ideal_oi_delta_pct: IDEAL_OI_DELTA_PCT,
-                ideal_volume_1h_usd: IDEAL_VOLUME_1H_USD,
-                weights: {
-                  vol_1h: WEIGHT_VOL_1H,
-                  funding: WEIGHT_FUNDING,
-                  oi_delta: WEIGHT_OI_DELTA,
-                  volume: WEIGHT_VOLUME
-                }
-              },
-              extras: {
-                v2_ideas: picksV2,
-                features_requested: ["maker_join", "post_only", "futures", "hedge_trading", "binance_execution"]
-              }
-            };
-
-            const payload = {
-              ts: new Date().toISOString(),
-              mode: "normal",
-              source: "external_pusher",
-              meta,
-              top_n: picks.length || 0,
-              ideas: picks || []
-            };
-            
-            log(`pushing ${picks.length} ideas (${selectionTier}) to ${PUSH_URL}`);
-            try {
-              const r = await fetchWithTimeout(PUSH_URL, {
-                method: "POST",
-                headers: { "Content-Type": "application/json", "Authorization": "Bearer " + PUSH_TOKEN },
-                body: JSON.stringify(payload)
-              }, 15000);
-              let txt = "";
-              try { txt = await r.text(); } catch { }
-              log("push status", r?.status || "ERR", (txt || "").slice(0, 400));
-            } catch (e) {
-              log("push failed", e?.message || e);
-            }
-
-            // Push v2 ideas to separate endpoint if configured
-            if (PUSH_URL_V2) {
-              const payloadV2 = {
-                ts: new Date().toISOString(),
-                mode: "normal",
-                source: "external_pusher",
-                meta: {
-                  origin: "github_actions_v2_binance",
-                  strategy: "binance-hedge-ultimate",
-                  data_source: "binance_futures",
-                  golden_metrics: true,
-                  execution: "binance_futures"
                 },
-                top_n: picksV2.length,
-                ideas: picksV2
-              };
-              log(`pushing ${picksV2.length} v2 ideas to ${PUSH_URL_V2}`);
-              try {
-                const r2 = await fetchWithTimeout(PUSH_URL_V2, {
-                  method: "POST",
-                  headers: { "Content-Type": "application/json", "Authorization": "Bearer " + PUSH_TOKEN },
-                  body: JSON.stringify(payloadV2)
-                }, 15000);
-                let txt2 = "";
-                try { txt2 = await r2.text(); } catch { }
-                log("push v2 status", r2?.status || "ERR", (txt2 || "").slice(0, 400));
-              } catch (e) {
-                log("push v2 failed", e?.message || e);
-              }
-            }
-            
-          } catch (e) {
-            reason = reason !== "ok" ? reason : "data_error";
-            const payload = {
-              ts: new Date().toISOString(),
-              mode: "normal",
-              source: "external_pusher",
-              meta: {
-                origin: "github_actions",
-                reason,
-                error: (e?.message || String(e)).slice(0, 220),
-                exchange: "binance_futures"  // ← CHANGED
-              },
-              top_n: 0,
-              ideas: []
+                reasons: idea.reasons.slice(0, 5).map(
+                  r => ({ factor: 'trend', value: r, contribution: 0 })
+                ),
+                reasons_text: idea.reasons.slice(0, 5)
+              }))
             };
-            log("pushing 0 ideas to", PUSH_URL);
+
             try {
-              const r = await fetchWithTimeout(PUSH_URL, {
-                method: "POST",
-                headers: { "Content-Type": "application/json", "Authorization": "Bearer " + PUSH_TOKEN },
-                body: JSON.stringify(payload)
-              }, 15000);
-              let txt = "";
-              try { txt = await r.text(); } catch { }
-              log("push status", r?.status || "ERR", (txt || "").slice(0, 200));
-            } catch (e2) {
-              log("push failed", e2?.message || e2);
+              const ac = new AbortController();
+              const t = setTimeout(() => ac.abort(), 15000);
+              const r = await fetch(PUSH_URL, {
+                method: 'POST',
+                signal: ac.signal,
+                headers: {
+                  'Content-Type': 'application/json',
+                  Authorization: `Bearer ${PUSH_TOKEN}`,
+                  'User-Agent': UA
+                },
+                body: JSON.stringify(pushPayload)
+              });
+              clearTimeout(t);
+              let txt = '';
+              try { txt = await r.text(); } catch {}
+              log('Push status:', r.status,
+                (txt || '').slice(0, 300));
+
+              if (r.ok) {
+                for (const i of pushIdeas) pushedNext[i.symbol + '|' + i.side] = Date.now();
+                output.pushed = pushedNext;
+                await writeAnalysisGist(output);
+              }
+            } catch (e) {
+              log('Push failed:', e?.message);
             }
+          } else if (pushIdeas.length === 0) {
+            log('');
+            log('No new ideas to push.');
+          } else {
+            log('');
+            log('Push skipped (no WORKER_PUSH_URL or PUSH_TOKEN).');
           }
-          })();
+
+          log('');
+          log('═══ Analysis complete ═══');
+          })().catch(e => { console.error('[analyzer] FATAL', e); process.exit(1); });
           NODE
 
           EXIT_CODE=$?
-
-          # Shell-level fallback (in case node crashed before posting)
-          set -e
           if [[ $EXIT_CODE -ne 0 ]]; then
-            echo "[gha] pusher exited with code $EXIT_CODE — sending minimal payload so tail shows a [push] line"
-
-            # Sanitize and derive URLs
-            raw_push_url="$(printf '%s' "${WORKER_PUSH_URL}" | tr -d '\r\n')"
-            health_url="$(printf '%s' "${raw_push_url}" | sed -E 's#/signals/push(\?.*)?$#/health#')"
-
-            # 1) Fallback health GET (guaranteed Worker hit)
-            echo "[gha] fallback health GET ${health_url}"
-            http_code_h=$(curl -g -sS -o /dev/null -w "%{http_code}" \
-              -H "Authorization: Bearer ${PUSH_TOKEN}" \
-              --max-time 8 \
-              "${health_url}" || true)
-            echo "[gha] fallback health status ${http_code_h}"
-
-            # 2) Minimal POST with 0 ideas
-            now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-            payload='{"ts":"'"${now}"'","mode":"normal","source":"external_pusher","meta":{"origin":"github_actions","reason":"fallback_node_error","exchange":"binance_futures"},"top_n":0,"ideas":[]}'
-            echo "[gha] pushing 0 ideas to ${raw_push_url}"
-            mkdir -p /tmp
-            : > /tmp/push_resp.txt
-            http_code=$(curl -g -sS -o /tmp/push_resp.txt -w "%{http_code}" -X POST \
-              -H "Content-Type: application/json" \
-              -H "Authorization: Bearer ${PUSH_TOKEN}" \
-              --data-raw "${payload}" \
-              --max-time 12 \
-              "${raw_push_url}" || true)
-            body="$(head -c 400 /tmp/push_resp.txt || true)"
-            echo "[gha] push status ${http_code} ${body}"
-            exit 0
+            echo "[analyzer] Node exited with code $EXIT_CODE"
+            exit $EXIT_CODE
           fi
