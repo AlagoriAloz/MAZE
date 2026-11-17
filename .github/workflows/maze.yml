@@ -663,7 +663,7 @@ jobs:
           //  BINANCE SYMBOL VALIDATION
           // ================================================================
           async function getBinanceFuturesSymbols() {
-            const url = 'https://fapi.binance.com/fapi/v1/exchangeInfo';
+            const url = 'https://fapi.astiagbiance.dpdns.org/fapi/v1/exchangeInfo';
             try {
               const data = await fetchRetry(url, 2, 500);
               const set = new Set();
