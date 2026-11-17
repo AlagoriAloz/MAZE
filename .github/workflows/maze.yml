@@ -29,6 +29,7 @@ jobs:
       MIN_CONFIDENCE: ${{ vars.ANALYZER_MIN_CONFIDENCE }}
       MAX_SL_BPS: ${{ vars.ANALYZER_MAX_SL_BPS }}
       NOTIONAL_USD: ${{ vars.NOTIONAL_USD }}
+      ADV_MICRO_MODE: ${{ vars.ANALYZER_ADV_MICRO_MODE }}
 
     steps:
       - name: Setup Node 20
@@ -68,6 +69,8 @@ jobs:
           const MIN_CONFIDENCE = Math.max(0, Math.min(100, Number(process.env.MIN_CONFIDENCE || '55')));
           const MAX_SL_BPS = Math.max(20, Math.min(200, Number(process.env.MAX_SL_BPS || '80')));
           const NOTIONAL = Math.max(50, Number(process.env.NOTIONAL_USD || '300'));
+          const ADV_MICRO_MODE = /^(1|true|yes)$/i.test(process.env.ADV_MICRO_MODE || '');
+          log('ADV_MICRO_MODE:', ADV_MICRO_MODE ? 'ON (strict TOP_N + micro-trend override)' : 'OFF (legacy behavior)');
           const BYBIT_PUBLIC = (process.env.BYBIT_PROXY_URL || 'https://api.bybit.com').replace(/\/+$/, '');
           const WILSON_Z = 1.34;
           const TTL_MAP = { '5': 1800, '15': 3600, '60': 7200, '240': 14400 };
@@ -1027,6 +1030,61 @@ jobs:
           }
 
           // ================================================================
+          //  KLINE TEST M1: Micro-Trend Kalman Filter (1m data override)
+          // ================================================================
+          function M1_microTrendKalman(klines1m) {
+            const n = klines1m.length;
+            if (n < 20) return { direction: 'neutral', velocityBps: 0, signal: 0, confidence: 0 };
+
+            const closes = klines1m.map(k => k.close);
+            const lc = closes.map(Math.log);
+            const rets = lc.slice(1).map((x, i) => x - lc[i]);
+            const baseR = Math.max(1e-10, std(rets) ** 2);
+
+            const HALF_LIFE = 10; // minutes — last 10m weighted heaviest
+            const lambda = Math.log(2) / HALF_LIFE;
+
+            let x = lc[0], v = 0, pX = baseR * 10, pV = baseR, pXV = 0;
+            const velocities = [];
+
+            for (let i = 1; i < n; i++) {
+              const age = n - 1 - i; // 0 = most recent candle
+              const boost = 1 + 4 * Math.exp(-lambda * age); // up to 5x trust for last ~10 bars
+              const Q_x = baseR * 0.1 * boost;
+              const Q_v = baseR * 0.001 * boost;
+              const R = baseR / boost;
+
+              const xP = x + v, vP = v;
+              const pXP = pX + 2 * pXV + pV + Q_x;
+              const pVP = pV + Q_v;
+              const pXVP = pXV + pV;
+
+              const innov = lc[i] - xP;
+              const S = pXP + R;
+              const Kx = pXP / S, Kv = pXVP / S;
+
+              x = xP + Kx * innov;
+              v = vP + Kv * innov;
+              pX = (1 - Kx) * pXP;
+              pV = pVP - Kv * pXVP;
+              pXV = (1 - Kx) * pXVP;
+
+              velocities.push(v);
+            }
+
+            const lastV = velocities.at(-1) || 0;
+            const sigV = std(velocities.slice(-10)) || 1e-9;
+            const tLike = lastV / sigV;
+
+            return {
+              velocityBps: +(lastV * 10000).toFixed(2),
+              signal: +Math.tanh(tLike / 2).toFixed(4),
+              direction: lastV * 10000 > 0.5 ? 'bullish' : lastV * 10000 < -0.5 ? 'bearish' : 'neutral',
+              confidence: +Math.min(1, Math.abs(tLike) / 3).toFixed(3)
+            };
+          }
+
+          // ================================================================
           //  RSI 
           // ================================================================
           function rsi(closes, period = 14) {
@@ -1194,10 +1252,32 @@ jobs:
           }
 
           // ================================================================
+          //  HELPER: Recompute Targets
+          // ================================================================
+          function recomputeTargetsForSide(idea, ticker) {
+            const mid = ticker?.lastPrice || idea.entry;
+            const spread = (ticker && ticker.ask > 0 && ticker.bid > 0) ? Math.abs(ticker.ask - ticker.bid) : 0;
+
+            let entry = idea.side === 'long' ? mid - spread * 0.3 : mid + spread * 0.3;
+            let tp_abs, sl_abs;
+            if (idea.side === 'long') {
+              tp_abs = entry * (1 + idea.tp_bps / 10000);
+              sl_abs = entry * (1 - idea.sl_bps / 10000);
+            } else {
+              tp_abs = entry * (1 - idea.tp_bps / 10000);
+              sl_abs = entry * (1 + idea.sl_bps / 10000);
+            }
+
+            idea.entry = +entry.toPrecision(7);
+            idea.tp_abs = +tp_abs.toPrecision(7);
+            idea.sl_abs = +sl_abs.toPrecision(7);
+          }
+
+          // ================================================================
           //  PHASE 6: IDEA GENERATION
           // ================================================================
           function generateIdea(
-            symbol, tradeA, klineA, crossVal, ticker
+            symbol, tradeA, klineA, crossVal, ticker, relaxed = false
           ) {
             if (!crossVal || crossVal.final_direction === 'neutral')
               return null;
@@ -1214,7 +1294,7 @@ jobs:
 
             const hurst = klineA?.avgHurst || 0.5;
             const meanRev = klineA?.meanReverting || false;
-            if (meanRev) return null;
+            if (meanRev && !relaxed) return null;
 
             const lossA = tradeA?.t3_loss_acceleration;
             const accelTrend = lossA?.ttslTrend || 'stable';
@@ -1228,7 +1308,7 @@ jobs:
               const shortBlocked =
                 side === 'short'
                 && lastLossDir === 'short_loss';
-              if (longBlocked || shortBlocked) {
+              if ((longBlocked || shortBlocked) && !relaxed) {
                 return null;
               }
             }
@@ -1327,7 +1407,7 @@ jobs:
               0, 100
             ));
 
-            if (confidence < MIN_CONFIDENCE) return null;
+            if (confidence < MIN_CONFIDENCE && !relaxed) return null;
 
             const pWin = clamp(
               histWR * 0.5 + (confidence / 100) * 0.5,
@@ -1341,13 +1421,13 @@ jobs:
             const size_bps = kellyFrac > 0
               ? clamp(Math.round(kellyFrac * 10000), 10, 200)
               : 0;
-            if (size_bps < 10) return null;
+            if (size_bps < 10 && !relaxed) return null;
 
             const ev_bps = Math.round(
               pWin * tp_bps - q * sl_bps - 10
             );
 
-            if (tp_bps < 25 || ev_bps <= 0) return null;
+            if ((tp_bps < 25 || ev_bps <= 0) && !relaxed) return null;
 
             const adxByTF = {};
             for (const [tf, a] of Object.entries(
@@ -1797,6 +1877,8 @@ jobs:
           log('');
           log('━━━ STEP 8: Generate ideas ━━━');
           const allIdeas = [];
+          const relaxedCandidates = [];
+
           for (const sym of symbols) {
             if (openSyms.has(sym)) {
               log(`  ⏭️  ${sym}: SKIP (position open)`);
@@ -1810,23 +1892,24 @@ jobs:
                 tradeAnalyses[sym],
                 klineAnalyses[sym],
                 crossVals[sym],
-                tickers[sym]
+                tickers[sym],
+                false
               );
             } catch (e) { log(`  💥 ${sym}: generateIdea error: ${e?.message}`); }
 
             if (idea) {
               allIdeas.push(idea);
-              log(`  ✅ ${sym} ${idea.side.toUpperCase()} `
-                + `conf=${idea.confidence} ev=${idea.ev_bps}bps `
-                + `rrr=${idea.rrr} style=${idea.style}`);
-              for (const r of idea.reasons.slice(0, 4)) {
-                log(`     → ${r}`);
-              }
+              log(`  ✅ ${sym} ${idea.side.toUpperCase()} conf=${idea.confidence} ev=${idea.ev_bps}bps`);
             } else {
-              const cv = crossVals[sym];
-              log(`  ❌ ${sym}: no idea `
-                + `(dir=${cv?.final_direction} `
-                + `agreement=${cv?.agreement})`);
+              log(`  ❌ ${sym}: no idea (strict)`);
+            }
+
+            // Only build relaxed pool if ADV_MICRO_MODE is ON — saves compute otherwise
+            if (ADV_MICRO_MODE) {
+              try {
+                const relaxedIdea = generateIdea(sym, tradeAnalyses[sym], klineAnalyses[sym], crossVals[sym], tickers[sym], true);
+                if (relaxedIdea && !idea) relaxedCandidates.push(relaxedIdea);
+              } catch (e) { /* ignore */ }
             }
           }
 
@@ -1837,45 +1920,83 @@ jobs:
 
           if (binanceSymbols) {
             log(`Binance has ${binanceSymbols.size} active perpetual symbols`);
-            const validIdeas = [];
+            const filterValid = arr => arr.filter(i => binanceSymbols.has(i.symbol));
             const originalCount = allIdeas.length;
-            for (const idea of allIdeas) {
-              if (binanceSymbols.has(idea.symbol)) {
-                validIdeas.push(idea);
-              } else {
-                log(`  ⏭️  ${idea.symbol}: NOT FOUND on Binance — dropping idea`);
-              }
-            }
-            allIdeas.length = 0;
-            allIdeas.push(...validIdeas);
-            log(`  ${validIdeas.length}/${originalCount} ideas passed Binance validation`);
+            allIdeas.length && (allIdeas.splice(0, allIdeas.length, ...filterValid(allIdeas)));
+            if (ADV_MICRO_MODE) relaxedCandidates.splice(0, relaxedCandidates.length, ...filterValid(relaxedCandidates));
+            log(`  ${allIdeas.length}/${originalCount} strict ideas passed Binance validation`);
           } else {
             log('  ⚠️ Binance validation unavailable (fetch failed) — skipping check, ideas unfiltered');
           }
 
           // ---- Sort by confidence × ev, apply diversity ----
-          allIdeas.sort(
-            (a, b) => (b.confidence * Math.max(1, b.ev_bps))
-              - (a.confidence * Math.max(1, a.ev_bps))
-          );
+          allIdeas.sort((a, b) => (b.confidence * Math.max(1, b.ev_bps)) - (a.confidence * Math.max(1, a.ev_bps)));
+          if (ADV_MICRO_MODE) {
+            relaxedCandidates.sort((a, b) => (b.confidence * Math.max(1, b.ev_bps)) - (a.confidence * Math.max(1, a.ev_bps)));
+          }
 
-          const finalIdeas = [];
-          const usedBases = new Set();
-          let longCnt = 0, shortCnt = 0;
-          for (const idea of allIdeas) {
-            if (finalIdeas.length >= TOP_N) break;
-            if (usedBases.has(idea.base)) continue;
-            if (idea.side === 'long' && longCnt >= 2) continue;
-            if (idea.side === 'short' && shortCnt >= 2) continue;
-            finalIdeas.push(idea);
-            usedBases.add(idea.base);
-            if (idea.side === 'long') longCnt++;
-            else shortCnt++;
+          function buildFinalIdeas(strictPool, relaxedPool, topN, strictMode) {
+            const finalIdeas = [];
+            const usedBases = new Set();
+            let longCnt = 0, shortCnt = 0;
+
+            const tryAdd = (idea, enforceDiversity) => {
+              if (finalIdeas.length >= topN) return false;
+              if (usedBases.has(idea.base)) return false;
+              if (enforceDiversity) {
+                if (idea.side === 'long' && longCnt >= 2) return false;
+                if (idea.side === 'short' && shortCnt >= 2) return false;
+              }
+              finalIdeas.push(idea);
+              usedBases.add(idea.base);
+              idea.side === 'long' ? longCnt++ : shortCnt++;
+              return true;
+            };
+
+            // Pass 1: strict pool, diversity enforced (same as legacy behavior)
+            for (const idea of strictPool) tryAdd(idea, true);
+
+            // Pass 2 (ONLY in strictMode / ADV_MICRO_MODE ON): backfill to guarantee topN
+            if (strictMode && finalIdeas.length < topN) {
+              const backfillPool = [...strictPool, ...relaxedPool]
+                .filter(i => !usedBases.has(i.base))
+                .sort((a, b) => (b.confidence * Math.max(1, b.ev_bps)) - (a.confidence * Math.max(1, a.ev_bps)));
+              for (const idea of backfillPool) tryAdd(idea, false); // diversity cap dropped if needed
+            }
+
+            return finalIdeas;
+          }
+
+          const finalIdeas = buildFinalIdeas(allIdeas, relaxedCandidates, TOP_N, ADV_MICRO_MODE);
+
+          if (ADV_MICRO_MODE && finalIdeas.length) {
+            log('');
+            log('━━━ STEP 8c: Micro-trend override (last 100×1m, last 10m dominant) ━━━');
+            for (const idea of finalIdeas) {
+              const kl1m = await getBybitKlines(idea.symbol, '1', 100);
+              await sleep(100);
+              if (!kl1m.length) { log(`  ⚠️ ${idea.symbol}: no 1m data, keeping original side`); continue; }
+
+              const micro = M1_microTrendKalman(kl1m);
+              idea.micro_trend = micro;
+
+              const microSide = micro.direction === 'bullish' ? 'long'
+                : micro.direction === 'bearish' ? 'short' : null;
+
+              if (microSide && microSide !== idea.side) {
+                log(`  ⚠️ ${idea.symbol}: flipping ${idea.side} → ${microSide} (micro vel=${micro.velocityBps}bps conf=${micro.confidence})`);
+                idea.side = microSide;
+                recomputeTargetsForSide(idea, tickers[idea.symbol]);
+              } else {
+                log(`  ✅ ${idea.symbol}: micro-trend confirms ${idea.side} (vel=${micro.velocityBps}bps)`);
+              }
+            }
           }
 
           log('');
+          let boxTitle = `║  FINAL IDEAS: ${finalIdeas.length}${ADV_MICRO_MODE ? ' (strict TOP_N mode)' : ''}`;
           log('╔═══════════════════════════════════════════════╗');
-          log(`║  FINAL IDEAS: ${finalIdeas.length}                              ║`);
+          log(boxTitle.padEnd(47, ' ') + ' ║');
           log('╚═══════════════════════════════════════════════╝');
           for (const idea of finalIdeas) {
             log(`  ${idea.symbol} ${idea.side.toUpperCase()} `
