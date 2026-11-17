@@ -29,6 +29,7 @@ jobs:
       MIN_CONFIDENCE: ${{ vars.ANALYZER_MIN_CONFIDENCE }}
       MAX_SL_BPS: ${{ vars.ANALYZER_MAX_SL_BPS }}
       NOTIONAL_USD: ${{ vars.NOTIONAL_USD }}
+      COST_BPS: ${{ vars.COST_BPS }}
 
     steps:
       - name: Setup Node 20
@@ -66,11 +67,14 @@ jobs:
           const PUSH_TOKEN = process.env.PUSH_TOKEN || '';
           const TOP_N = Math.max(1, Math.min(10, Number(process.env.TOP_N || '3')));
           const MIN_CONFIDENCE = Math.max(0, Math.min(100, Number(process.env.MIN_CONFIDENCE || '55')));
-          const MAX_SL_BPS = Math.max(20, Math.min(200, Number(process.env.MAX_SL_BPS || '80')));
+          const MAX_SL_BPS = Math.max(8, Math.min(50, Number(process.env.MAX_SL_BPS || '25')));
+          const COST_BPS   = Number(process.env.COST_BPS || '10');
+          const MIN_TP_BPS = Math.max(12, COST_BPS * 1.5);
           const NOTIONAL = Math.max(50, Number(process.env.NOTIONAL_USD || '300'));
           const BYBIT_PUBLIC = (process.env.BYBIT_PROXY_URL || 'https://api.bybit.com').replace(/\/+$/, '');
           const WILSON_Z = 1.34;
-          const TTL_MAP = { '5': 1800, '15': 3600, '60': 7200, '240': 14400 };
+          const TTL_MAP = { '1': 300, '3': 600, '5': 900, '15': 1800 };
+          const MAX_TTL = 1800;
 
           // ================================================================
           //  SECOND GIST (Ideas Pusher main state)
@@ -301,7 +305,7 @@ jobs:
               const move = t.exitPrice - t.entryPrice;
               const moveBps = (t.exitPrice / t.entryPrice - 1) * 10000;
               const age = Math.max(1, now - t.closedAt);
-              const recency = Math.exp(-age / (24 * 3600 * 1000));
+              const recency = Math.exp(-age / (2 * 3600 * 1000));
               const magnitude = Math.min(1, Math.abs(moveBps) / 50);
               const lossBoost = t.stopLoss ? 1.3 : 1.0;
               const w = recency * magnitude * lossBoost;
@@ -1093,7 +1097,7 @@ jobs:
           // ================================================================
           function analyzeKlinesMultiTF(tfData) {
             const weights = {
-              '5': 0.10, '15': 0.15, '60': 0.25, '240': 0.30
+              '1': 0.15, '3': 0.30, '5': 0.35, '15': 0.20
             };
             const perTF = {};
             let wS = 0, sS = 0;
@@ -1206,11 +1210,20 @@ jobs:
             const side = crossVal.final_direction === 'bullish'
               ? 'long' : 'short';
             const mid = ticker?.lastPrice
-              || klineA?.perTF?.['60']?.lastClose || 0;
+              || klineA?.perTF?.['5']?.lastClose || 0;
             if (mid <= 0) return null;
 
-            const atrBps = klineA?.perTF?.['60']?.k5_adx_di?.atr_bps
-              || klineA?.perTF?.['15']?.k5_adx_di?.atr_bps || 50;
+            const adxByTF = {};
+            for (const [tf, a] of Object.entries(klineA?.perTF || {})) {
+              adxByTF[tf] = a?.k5_adx_di?.adx || 0;
+            }
+            const domTF = Object.entries(adxByTF)
+              .sort((a, b) => b[1] - a[1])[0]?.[0] || '5';
+            const ttl_sec = Math.min(MAX_TTL, TTL_MAP[domTF] || 900);
+            const tfMin = Number(domTF);
+            const atrTF = klineA?.perTF?.[domTF]?.k5_adx_di?.atr_bps || 15;
+            // scale per-candle ATR to the horizon (random-walk sqrt-time)
+            const atrBps = atrTF * Math.sqrt(Math.max(1, (ttl_sec / 60) / tfMin));
 
             const hurst = klineA?.avgHurst || 0.5;
             const meanRev = klineA?.meanReverting || false;
@@ -1343,21 +1356,8 @@ jobs:
               : 0;
             if (size_bps < 10) return null;
 
-            const ev_bps = Math.round(
-              pWin * tp_bps - q * sl_bps - 10
-            );
-
-            if (tp_bps < 25 || ev_bps <= 0) return null;
-
-            const adxByTF = {};
-            for (const [tf, a] of Object.entries(
-              klineA?.perTF || {}
-            )) {
-              adxByTF[tf] = a?.k5_adx_di?.adx || 0;
-            }
-            const domTF = Object.entries(adxByTF)
-              .sort((a, b) => b[1] - a[1])[0]?.[0] || '60';
-            const ttl_sec = TTL_MAP[domTF] || 3600;
+            const ev_bps = Math.round(pWin * tp_bps - q * sl_bps - COST_BPS);
+            if (tp_bps < MIN_TP_BPS || ev_bps <= 0) return null;
 
             const reasons = [];
 
@@ -1377,10 +1377,10 @@ jobs:
               );
             }
 
-            const ols1h = klineA?.perTF?.['60']?.k1_ols;
+            const ols1h = klineA?.perTF?.[domTF]?.k1_ols;
             if (ols1h?.significant) {
               reasons.push(
-                `1h OLS: slope=${ols1h.slope_bps}bps t=${ols1h.tStat}`
+                `${domTF}m OLS: slope=${ols1h.slope_bps}bps t=${ols1h.tStat}`
               );
             }
 
@@ -1420,7 +1420,7 @@ jobs:
               );
             }
 
-            const mk1h = klineA?.perTF?.['60']?.k3_mann_kendall;
+            const mk1h = klineA?.perTF?.[domTF]?.k3_mann_kendall;
             if (mk1h?.significant) {
               reasons.push(
                 `Mann-Kendall τ=${mk1h.tau} z=${mk1h.z}`
@@ -1448,7 +1448,7 @@ jobs:
               );
             }
 
-            const kf = klineA?.perTF?.['60']?.k6_kalman;
+            const kf = klineA?.perTF?.[domTF]?.k6_kalman;
             if (kf && Math.abs(kf.velocityBps) > 2) {
               reasons.push(
                 `Kalman vel=${kf.velocityBps > 0 ? '+' : ''}`
@@ -1456,7 +1456,7 @@ jobs:
               );
             }
 
-            const vr = klineA?.perTF?.['60']?.k4_variance_ratio;
+            const vr = klineA?.perTF?.[domTF]?.k4_variance_ratio;
             if (vr && !['random_walk', 'insufficient', 'no_variance'].includes(vr.interpretation)) {
               reasons.push(
                 `Var.Ratio: ${vr.interpretation} `
@@ -1564,12 +1564,12 @@ jobs:
 
           // ── WIPE LOGIC ──────────────────────────────────────────
           const run_counter = (prev.run_counter || 0) + 1;
-          log(`🔄 Analyzer run ${run_counter}/6`);
+          log(`🔄 Analyzer run ${run_counter}/60`);
 
-          const SHOULD_WIPE = (run_counter >= 6);
+          const SHOULD_WIPE = (run_counter >= 60);
 
           if (SHOULD_WIPE) {
-            log('🗑️  RUN 6: WIPING BOTH GISTS NOW...');
+            log('🗑️  RUN 60: WIPING BOTH GISTS NOW...');
 
             const w1 = await wipeAnalysisGist();
             log(`  → Analysis Gist wipe: ${w1 ? '✅ OK' : '❌ FAILED'}`);
@@ -1635,7 +1635,7 @@ jobs:
           log('');
           log('━━━ STEP 2: Group trades by symbol ━━━');
           const bySymbol = {};
-          const MAX_AGE_H = 72;
+          const MAX_AGE_H = 6;
           let sideMismatch = 0;
           
           for (const t of pnlData) {
@@ -1719,8 +1719,8 @@ jobs:
           log('');
           log('━━━ STEP 4: Fetch Bybit public klines ━━━');
           const klData = {};
-          const INTERVALS = ['5', '15', '60', '240'];
-          const LIMITS = { '5': 200, '15': 200, '60': 200, '240': 100 };
+          const INTERVALS = ['1', '3', '5', '15'];
+          const LIMITS = { '1': 200, '3': 200, '5': 200, '15': 200 };
 
           for (const sym of symbols) {
             klData[sym] = {};
@@ -2025,7 +2025,7 @@ jobs:
                 rrr: idea.rrr,
                 exp_lcb_bps: idea.ev_bps,
                 ev_bps: idea.ev_bps,
-                cost_bps: 10,
+                cost_bps: COST_BPS,
                 p_win: idea.p_win,
                 p_lcb: idea.p_win,
                 p_raw: idea.p_win,
