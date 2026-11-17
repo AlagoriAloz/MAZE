@@ -660,6 +660,26 @@ jobs:
           }
 
           // ================================================================
+          //  BINANCE SYMBOL VALIDATION
+          // ================================================================
+          async function getBinanceFuturesSymbols() {
+            const url = 'https://fapi.binance.com/fapi/v1/exchangeInfo';
+            try {
+              const data = await fetchRetry(url, 2, 500);
+              const set = new Set();
+              for (const s of data?.symbols || []) {
+                if (s.status === 'TRADING' && s.contractType === 'PERPETUAL') {
+                  set.add(s.symbol);
+                }
+              }
+              return set;
+            } catch (e) {
+              log('Binance exchangeInfo fetch failed:', e?.message);
+              return null;
+            }
+          }
+
+          // ================================================================
           //  KLINE TEST K1: OLS Drift on Log Returns
           // ================================================================
           function K1_olsRegression(klines) {
@@ -1808,6 +1828,29 @@ jobs:
                 + `(dir=${cv?.final_direction} `
                 + `agreement=${cv?.agreement})`);
             }
+          }
+
+          // ---- STEP 8b: Validate symbols exist on Binance ----
+          log('');
+          log('━━━ STEP 8b: Validate Binance symbol names ━━━');
+          const binanceSymbols = await getBinanceFuturesSymbols();
+
+          if (binanceSymbols) {
+            log(`Binance has ${binanceSymbols.size} active perpetual symbols`);
+            const validIdeas = [];
+            const originalCount = allIdeas.length;
+            for (const idea of allIdeas) {
+              if (binanceSymbols.has(idea.symbol)) {
+                validIdeas.push(idea);
+              } else {
+                log(`  ⏭️  ${idea.symbol}: NOT FOUND on Binance — dropping idea`);
+              }
+            }
+            allIdeas.length = 0;
+            allIdeas.push(...validIdeas);
+            log(`  ${validIdeas.length}/${originalCount} ideas passed Binance validation`);
+          } else {
+            log('  ⚠️ Binance validation unavailable (fetch failed) — skipping check, ideas unfiltered');
           }
 
           // ---- Sort by confidence × ev, apply diversity ----
