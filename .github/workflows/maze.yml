@@ -1418,10 +1418,11 @@ jobs:
             const kellyFull = (pWin * b - q) / b;
             const kellyFrac = kellyFull > 0
               ? kellyFull * 0.25 : 0;
-            const size_bps = kellyFrac > 0
+            let size_bps = kellyFrac > 0
               ? clamp(Math.round(kellyFrac * 10000), 10, 200)
               : 0;
             if (size_bps < 10 && !relaxed) return null;
+            if (relaxed && size_bps < 10) size_bps = 10;
 
             const ev_bps = Math.round(
               pWin * tp_bps - q * sl_bps - 10
@@ -1899,9 +1900,11 @@ jobs:
 
             if (idea) {
               allIdeas.push(idea);
-              log(`  ✅ ${sym} ${idea.side.toUpperCase()} conf=${idea.confidence} ev=${idea.ev_bps}bps`);
+              log(`  ✅ ${sym} ${idea.side.toUpperCase()} conf=${idea.confidence} ev=${idea.ev_bps}bps rrr=${idea.rrr} style=${idea.style}`);
+              idea.reasons.slice(0, 4).forEach(r => log(`      → ${r}`));
             } else {
-              log(`  ❌ ${sym}: no idea (strict)`);
+              const cv = crossVals[sym];
+              log(`  ❌ ${sym}: no idea (dir=${cv?.final_direction || 'n/a'} agreement=${cv?.agreement || 'n/a'})`);
             }
 
             // Only build relaxed pool if ADV_MICRO_MODE is ON — saves compute otherwise
@@ -1922,8 +1925,14 @@ jobs:
             log(`Binance has ${binanceSymbols.size} active perpetual symbols`);
             const filterValid = arr => arr.filter(i => binanceSymbols.has(i.symbol));
             const originalCount = allIdeas.length;
+            const droppedStrict = allIdeas.filter(i => !binanceSymbols.has(i.symbol)).map(i => i.symbol);
             allIdeas.length && (allIdeas.splice(0, allIdeas.length, ...filterValid(allIdeas)));
-            if (ADV_MICRO_MODE) relaxedCandidates.splice(0, relaxedCandidates.length, ...filterValid(relaxedCandidates));
+            if (droppedStrict.length) log(`  Dropped (not on Binance): ${droppedStrict.join(', ')}`);
+            if (ADV_MICRO_MODE) {
+              const droppedRelaxed = relaxedCandidates.filter(i => !binanceSymbols.has(i.symbol)).map(i => i.symbol);
+              relaxedCandidates.splice(0, relaxedCandidates.length, ...filterValid(relaxedCandidates));
+              if (droppedRelaxed.length) log(`  Dropped relaxed (not on Binance): ${droppedRelaxed.join(', ')}`);
+            }
             log(`  ${allIdeas.length}/${originalCount} strict ideas passed Binance validation`);
           } else {
             log('  ⚠️ Binance validation unavailable (fetch failed) — skipping check, ideas unfiltered');
@@ -1985,10 +1994,12 @@ jobs:
 
               if (microSide && microSide !== idea.side) {
                 log(`  ⚠️ ${idea.symbol}: flipping ${idea.side} → ${microSide} (micro vel=${micro.velocityBps}bps conf=${micro.confidence})`);
+                idea.reasons.unshift(`Micro-trend flip: vel=${micro.velocityBps}bps → ${microSide.toUpperCase()}`);
                 idea.side = microSide;
                 recomputeTargetsForSide(idea, tickers[idea.symbol]);
               } else {
                 log(`  ✅ ${idea.symbol}: micro-trend confirms ${idea.side} (vel=${micro.velocityBps}bps)`);
+                idea.reasons.unshift(`Micro-trend confirm: vel=${micro.velocityBps}bps`);
               }
             }
           }
@@ -2040,6 +2051,7 @@ jobs:
               min_confidence: MIN_CONFIDENCE,
               max_sl_bps: MAX_SL_BPS,
               notional_usd: NOTIONAL,
+              adv_micro_mode: ADV_MICRO_MODE,
               worker_url: WORKER_URL.replace(
                 /https?:\/\//, '***.'
               )
