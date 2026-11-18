@@ -19,6 +19,7 @@ jobs:
 
     env:
       WORKER_URL: ${{ secrets.WORKER_URL }}
+      WORKER_URL_2: ${{ secrets.WORKER_URL_2 }}
       ANALYSIS_GIST_ID: ${{ secrets.ANALYSIS_GIST_ID }}
       GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
       GIST_ID: ${{ secrets.GIST_ID }}
@@ -1607,8 +1608,23 @@ jobs:
 
           if (!Array.isArray(pnlData)) pnlData = pnlData?.items || pnlData?.data || pnlData?.closedPnl || [];
 
-          if (!Array.isArray(pnlData) || pnlData.length === 0) {
-            log('No closed trades found. Writing empty analysis.');
+          // ---- Fetch Worker 2 (analysis-only merge, no push impact) ----
+          const WORKER_URL_2 = (process.env.WORKER_URL_2 || '').replace(/\/+$/, '');
+          let pnlData2 = [];
+          if (WORKER_URL_2) {
+            try {
+              const raw2 = await fetchRetry(`${WORKER_URL_2}/pnl`);
+              pnlData2 = Array.isArray(raw2?.trades) ? raw2.trades : [];
+              log(`Worker 2: fetched ${pnlData2.length} closed trades`);
+            } catch (e) {
+              log('WARN: Worker 2 /pnl unreachable:', e?.message);
+            }
+          } else {
+            log('Worker 2: not configured (WORKER_URL_2 empty) — skipping');
+          }
+
+          if ((!Array.isArray(pnlData) || pnlData.length === 0) && pnlData2.length === 0) {
+            log('No closed trades found (either worker). Writing empty analysis.');
             await writeAnalysisGist({
               ts: new Date().toISOString(),
               version: VERSION,
@@ -1676,6 +1692,41 @@ jobs:
               stopLoss
             });
           }
+
+          // ---- Merge Worker 2 trades (native schema — no flip/inference needed) ----
+          let w2Added = 0;
+          for (const t of pnlData2) {
+            if (!t.symbol) continue;
+            const entryPrice = +t.entryPrice || 0;
+            const exitPrice  = +t.exitPrice  || 0;
+            const pnl        = +t.realizedPnl || +t.netPnl || 0;
+            const closedAt   = +t.time || 0;
+
+            if (!(entryPrice > 0 && exitPrice > 0 && closedAt > 0)) continue;
+            if (Date.now() - closedAt > MAX_AGE_H * 3600e3) continue;
+
+            // positionSide is authoritative here — no inference/flip required
+            const side = t.positionSide === 'SHORT' ? 'Sell' : 'Buy';
+            const adverseBps = side === 'Buy'
+              ? (entryPrice - exitPrice) / entryPrice * 1e4
+              : (exitPrice - entryPrice) / entryPrice * 1e4;
+            const stopLoss = pnl < 0 && adverseBps > 10;
+
+            if (!bySymbol[t.symbol]) bySymbol[t.symbol] = [];
+            bySymbol[t.symbol].push({
+              symbol: t.symbol,
+              entryPrice,
+              exitPrice,
+              pnl,
+              closedAt,
+              openedAt: closedAt, // worker 2 has no separate open-time field
+              side,
+              stopLoss
+            });
+            w2Added++;
+          }
+          if (w2Added) log(`Worker 2 merged: +${w2Added} trades into bySymbol`);
+
           log(`Side mismatches corrected: ${sideMismatch}`);
 
           const symbols = Object.keys(bySymbol);
@@ -1908,7 +1959,7 @@ jobs:
             worker_regime: regime,
             open_positions: positions.length,
             analyzed_symbols: symbols.length,
-            total_closed_trades: pnlData.length,
+            total_closed_trades: pnlData.length + pnlData2.length,
             ideas_generated: allIdeas.length,
             ideas_after_filter: finalIdeas.length,
             ideas: finalIdeas,
@@ -1986,7 +2037,7 @@ jobs:
                 version: VERSION,
                 worker_regime: regime,
                 analyzed_symbols: symbols.length,
-                total_closed_trades: pnlData.length,
+                total_closed_trades: pnlData.length + pnlData2.length,
                 methods: [
                   'OLS_regression',
                   'Hurst_exponent',
