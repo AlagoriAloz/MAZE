@@ -1,4 +1,4 @@
-name: Trend Analyzer (Simple Entry/Exit v4.0)
+name: Trend Analyzer (Simple Entry/Exit v4.1)
 on:
   repository_dispatch:
     types: [run_X]
@@ -26,10 +26,12 @@ jobs:
       SL_BPS: ${{ vars.ANALYZER_SL_BPS }}
       NOTIONAL_USD: ${{ vars.NOTIONAL_USD }}
       MIN_MOVE_BPS: ${{ vars.ANALYZER_MIN_MOVE_BPS }}
-      WATCH_MIN: ${{ vars.ANALYZER_WATCH_MIN }}
-      ARTIFICIAL_SL_PCT: ${{ vars.ANALYZER_ARTIFICIAL_SL_PCT }}
-      WATCH_POOL: ${{ vars.ANALYZER_WATCH_POOL }}
-      PNL_LIMIT: ${{ vars.ANALYZER_PNL_LIMIT }}
+      # New variables accept both the ANALYZER_ name and the plain name
+      WATCH_MIN: ${{ vars.ANALYZER_WATCH_MIN || vars.WATCH_MIN }}
+      ARTIFICIAL_SL_PCT: ${{ vars.ANALYZER_ARTIFICIAL_SL_PCT || vars.ARTIFICIAL_SL_PCT }}
+      WATCH_POOL: ${{ vars.ANALYZER_WATCH_POOL || vars.WATCH_POOL }}
+      PNL_LIMIT: ${{ vars.ANALYZER_PNL_LIMIT || vars.PNL_LIMIT }}
+      WORKER_MODE: ${{ vars.ANALYZER_WORKER_MODE || vars.WORKER_MODE }}
     steps:
       - name: Setup Node 20
         uses: actions/setup-node@v4
@@ -50,7 +52,7 @@ jobs:
           (async () => {
           'use strict';
           const crypto = require('crypto');
-          const VERSION = '4.0.0';
+          const VERSION = '4.1.0';
           const UA = `trend-analyzer/${VERSION}`;
           const log = (...a) => console.log('[analyzer]', ...a);
 
@@ -72,14 +74,20 @@ jobs:
           const BYBIT_PUBLIC = (process.env.BYBIT_PROXY_URL || 'https://api.bybit.com').replace(/\/+$/, '');
           const MIN_MOVE_BPS = Math.max(0, Number(process.env.MIN_MOVE_BPS || '5'));
 
-          // --- NEW: watch phase ---
+          // --- Watch phase ---
           const WATCH_MIN = Math.max(0, Math.min(15, Number(process.env.WATCH_MIN || '3')));
           const ARTIFICIAL_SL_PCT = Math.max(0.01, Math.min(5, Number(process.env.ARTIFICIAL_SL_PCT || '0.3')));
           const WATCH_POOL = Math.max(TOP_N, Math.min(30, Number(process.env.WATCH_POOL || '10')));
           const POLL_MS = 10000;
 
-          // --- NEW: fetch full history ---
+          // --- Full history request size ---
           const PNL_LIMIT = Math.max(100, Number(process.env.PNL_LIMIT || '1000'));
+
+          // --- Worker mode: '1' | '2' | 'both' ---
+          const WORKER_MODE_RAW = String(process.env.WORKER_MODE || '').trim().toLowerCase();
+          const WORKER_MODE = ['1', '2', 'both'].includes(WORKER_MODE_RAW) ? WORKER_MODE_RAW : 'both';
+          const USE_W1 = WORKER_MODE === '1' || WORKER_MODE === 'both';
+          const USE_W2 = WORKER_MODE === '2' || WORKER_MODE === 'both';
 
           // --- Cooldown: 5 minutes (also sent to worker as idea ttl_sec) ---
           const TTL_SEC = 300;
@@ -188,7 +196,7 @@ jobs:
           //  CORE: direction = compare current price vs last exit price
           // ================================================================
           function computeDirection(trades, currentPrice) {
-            if (!trades.length) return {
+            if (!trades || !trades.length) return {
               direction: 'neutral', reason: 'no_trades',
               lastExit: null, moveBps: 0
             };
@@ -246,27 +254,31 @@ jobs:
           log('╔═══════════════════════════════════════════════╗');
           log('║  Simple Entry/Exit Analyzer v' + VERSION + '          ║');
           log('╚═══════════════════════════════════════════════╝');
-          log(`Config: topN=${TOP_N} pool=${WATCH_POOL} watch=${WATCH_MIN}min artificialSL=${ARTIFICIAL_SL_PCT}% cooldown=${TTL_SEC}s pnlLimit=${PNL_LIMIT}`);
+          log(`Config: workerMode=${WORKER_MODE} topN=${TOP_N} pool=${WATCH_POOL} watch=${WATCH_MIN}min artificialSL=${ARTIFICIAL_SL_PCT}% cooldown=${TTL_SEC}s pnlLimit=${PNL_LIMIT}`);
 
           const prev = await readAnalysisGist();
           const pushedPrev = prev.pushed || {};
 
-          // ---- STEP 1: Fetch ALL trades from both workers ----
+          // ---- STEP 1: Fetch trades from the selected worker(s) ----
           log('');
           log('━━━ STEP 1: Fetch worker trades (full history) ━━━');
           let pnlData = [];
           let stateData = {};
-          try {
-            const raw = await fetchRetry(`${WORKER_URL}/pnl?limit=${PNL_LIMIT}`);
-            pnlData = Array.isArray(raw) ? raw : (raw?.items || raw?.data || raw?.closedPnl || []);
-            log(`Worker 1: fetched ${pnlData.length} closed trades`);
-          } catch (e) {
-            log('FATAL: Cannot reach worker 1 /pnl:', e?.message);
-            await writeAnalysisGist({
-              ts: new Date().toISOString(), version: VERSION,
-              status: 'worker_unreachable', error: e?.message, ideas: [], pushed: pushedPrev
-            });
-            process.exit(1);
+          if (USE_W1) {
+            try {
+              const raw = await fetchRetry(`${WORKER_URL}/pnl?limit=${PNL_LIMIT}`);
+              pnlData = Array.isArray(raw) ? raw : (raw?.items || raw?.data || raw?.closedPnl || []);
+              log(`Worker 1: fetched ${pnlData.length} closed trades`);
+            } catch (e) {
+              log('FATAL: Cannot reach worker 1 /pnl:', e?.message);
+              await writeAnalysisGist({
+                ts: new Date().toISOString(), version: VERSION,
+                status: 'worker_unreachable', error: e?.message, ideas: [], pushed: pushedPrev
+              });
+              process.exit(1);
+            }
+          } else {
+            log('Worker 1 trades: skipped (WORKER_MODE=2)');
           }
           try {
             stateData = await fetchRetry(`${WORKER_URL}/json`);
@@ -274,19 +286,23 @@ jobs:
             log('WARN: Cannot reach worker state /json:', e?.message);
           }
           let pnlData2 = [];
-          if (WORKER_URL_2) {
-            try {
-              const raw2 = await fetchRetry(`${WORKER_URL_2}/pnl`);
-              pnlData2 = Array.isArray(raw2?.trades) ? raw2.trades : [];
-              log(`Worker 2: fetched ${pnlData2.length} closed trades`);
-            } catch (e) {
-              log('WARN: Worker 2 /pnl unreachable:', e?.message);
+          if (USE_W2) {
+            if (WORKER_URL_2) {
+              try {
+                const raw2 = await fetchRetry(`${WORKER_URL_2}/pnl`);
+                pnlData2 = Array.isArray(raw2?.trades) ? raw2.trades : [];
+                log(`Worker 2: fetched ${pnlData2.length} closed trades`);
+              } catch (e) {
+                log('WARN: Worker 2 /pnl unreachable:', e?.message);
+              }
+            } else {
+              log('Worker 2: WORKER_URL_2 not configured.');
             }
           } else {
-            log('Worker 2: not configured — both-agree check cannot run, aborting.');
+            log('Worker 2 trades: skipped (WORKER_MODE=1)');
           }
-          if (!pnlData.length || !pnlData2.length) {
-            log('Need closed trades from BOTH workers to agree. Writing empty analysis.');
+          if ((USE_W1 && !pnlData.length) || (USE_W2 && !pnlData2.length)) {
+            log(`Missing closed trades for selected mode (${WORKER_MODE}). Writing empty analysis.`);
             await writeAnalysisGist({
               ts: new Date().toISOString(), version: VERSION,
               status: 'insufficient_data', ideas: [], pushed: pushedPrev
@@ -306,14 +322,17 @@ jobs:
           // ---- STEP 2: Normalize + group by symbol per worker ----
           log('');
           log('━━━ STEP 2: Normalize trades per worker ━━━');
-          const bySymbol1 = normalizeWorker1Trades(pnlData);
-          const bySymbol2 = normalizeWorker2Trades(pnlData2);
+          const bySymbol1 = USE_W1 ? normalizeWorker1Trades(pnlData) : {};
+          const bySymbol2 = USE_W2 ? normalizeWorker2Trades(pnlData2) : {};
           log(`Worker1 symbols: ${Object.keys(bySymbol1).join(', ') || '(none)'}`);
           log(`Worker2 symbols: ${Object.keys(bySymbol2).join(', ') || '(none)'}`);
-          const commonSymbols = Object.keys(bySymbol1).filter(s => bySymbol2[s]);
-          log(`Common symbols (both workers): ${commonSymbols.join(', ') || '(none)'}`);
+          const commonSymbols =
+            WORKER_MODE === '1' ? Object.keys(bySymbol1)
+            : WORKER_MODE === '2' ? Object.keys(bySymbol2)
+            : Object.keys(bySymbol1).filter(s => bySymbol2[s]);
+          log(`Symbols used (mode ${WORKER_MODE}): ${commonSymbols.join(', ') || '(none)'}`);
           if (!commonSymbols.length) {
-            log('No common symbols between workers. Writing empty analysis.');
+            log('No usable symbols. Writing empty analysis.');
             await writeAnalysisGist({
               ts: new Date().toISOString(), version: VERSION,
               status: 'no_common_symbols', ideas: [], pushed: pushedPrev
@@ -332,7 +351,7 @@ jobs:
             else log(`  ${sym}: ticker fetch failed`);
           }
 
-          // ---- STEP 4: Direction per worker, agreement, open-pos, cooldown ----
+          // ---- STEP 4: Direction, agreement, open-pos, cooldown ----
           log('');
           log('━━━ STEP 4: Trend table (lastExit vs current) ━━━');
           const rows = [];
@@ -342,43 +361,39 @@ jobs:
             const ticker = tickers[sym];
             if (!ticker || !(ticker.lastPrice > 0)) continue;
             const currentPrice = ticker.lastPrice;
-            const d1 = computeDirection(bySymbol1[sym], currentPrice);
-            const d2 = computeDirection(bySymbol2[sym], currentPrice);
-            const agree = (d1.direction !== 'neutral') && (d1.direction === d2.direction);
+
+            const d1 = USE_W1 ? computeDirection(bySymbol1[sym], currentPrice) : null;
+            const d2 = USE_W2 ? computeDirection(bySymbol2[sym], currentPrice) : null;
+            const used = [d1, d2].filter(Boolean);
+            const side = used[0].direction;
+            const agree = side !== 'neutral' && used.every(d => d.direction === side);
+            const score = used.reduce((s, d) => s + Math.abs(d.moveBps), 0) / used.length;
 
             let skip = null;
             if (!agree) skip = 'no_agreement';
             else if (openSyms.has(sym)) skip = 'open_position';
             else {
-              const cdTs = pushedPrev[sym + '|' + d1.direction];
+              const cdTs = pushedPrev[sym + '|' + side];
               if (cdTs && Date.now() - cdTs < TTL_SEC * 1000) skip = 'cooldown';
             }
 
             rows.push({
               symbol: sym,
-              w1LastExit: d1.lastExit,
-              w2LastExit: d2.lastExit,
+              w1LastExit: d1 ? d1.lastExit : null,
+              w2LastExit: d2 ? d2.lastExit : null,
               current: currentPrice,
-              w1Dir: d1.direction,
-              w2Dir: d2.direction,
+              w1Dir: d1 ? d1.direction : 'n/a',
+              w2Dir: d2 ? d2.direction : 'n/a',
               agree,
               skip
             });
             perSymbolDebug[sym] = { currentPrice, worker1: d1, worker2: d2, agree, skip };
 
             if (skip) continue;
-
-            const score = (Math.abs(d1.moveBps) + Math.abs(d2.moveBps)) / 2;
-            candidates.push({
-              symbol: sym,
-              side: d1.direction,
-              score,
-              currentPrice,
-              ticker
-            });
+            candidates.push({ symbol: sym, side, score, currentPrice, ticker });
           }
 
-          const arrow = d => d === 'long' ? '🔼 UP' : d === 'short' ? '🔽 DOWN' : '⏸ FLAT';
+          const arrow = d => d === 'long' ? '🔼 UP' : d === 'short' ? '🔽 DOWN' : d === 'n/a' ? '— N/A' : '⏸ FLAT';
           log('');
           log('Symbol         | W1 LastExit  | W2 LastExit  | Current      | Trend(W1) | Trend(W2) | Agree? | Skip');
           log('---------------|--------------|--------------|--------------|-----------|-----------|--------|-----');
@@ -502,6 +517,9 @@ jobs:
               sl_abs = +(entry * (1 + sl_bps / 10000)).toPrecision(7);
             }
             const rrr = +(tp_bps / sl_bps).toFixed(2);
+            const basis = WORKER_MODE === 'both'
+              ? 'Both workers agree: price'
+              : `Worker ${WORKER_MODE}: price`;
             return {
               symbol: c.symbol,
               base: c.symbol.replace('USDT', ''),
@@ -515,7 +533,7 @@ jobs:
               funding_rate: c.ticker?.fundingRate || 0,
               volume_24h: c.ticker?.turnover24h || 0,
               reasons: [
-                `Both workers: price ${c.side === 'long' ? 'above' : 'below'} last exit price`,
+                `${basis} ${c.side === 'long' ? 'above' : 'below'} last exit price`,
                 `Score (avg move from last exit) = ${c.score.toFixed(1)}bps`,
                 `Survived ${WATCH_MIN}min watch (artificial SL ${ARTIFICIAL_SL_PCT}%, max adverse ${c.maxAdversePct.toFixed(3)}%)`
               ],
@@ -542,6 +560,7 @@ jobs:
             ts: new Date().toISOString(),
             version: VERSION,
             status: 'ok',
+            worker_mode: WORKER_MODE,
             worker_regime: regime,
             open_positions: positions.length,
             common_symbols: commonSymbols.length,
@@ -566,6 +585,7 @@ jobs:
             debug_per_symbol: perSymbolDebug,
             pushed: pushedNext,
             config: {
+              worker_mode: WORKER_MODE,
               top_n: TOP_N, tp_bps, sl_bps, min_move_bps: MIN_MOVE_BPS, notional_usd: NOTIONAL,
               watch_min: WATCH_MIN, artificial_sl_pct: ARTIFICIAL_SL_PCT,
               watch_pool: WATCH_POOL, cooldown_sec: TTL_SEC, pnl_limit: PNL_LIMIT
@@ -582,7 +602,7 @@ jobs:
               ts: new Date().toISOString(),
               mode: 'normal',
               source: 'simple_entry_exit_analyzer',
-              meta: { origin: 'github_actions_analyzer', version: VERSION, worker_regime: regime },
+              meta: { origin: 'github_actions_analyzer', version: VERSION, worker_regime: regime, worker_mode: WORKER_MODE },
               top_n: pushIdeas.length,
               ideas: pushIdeas.map((idea, i) => ({
                 idea_id: crypto.randomUUID(),
