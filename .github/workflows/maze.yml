@@ -1,4 +1,4 @@
-name: Trend Analyzer (Simple Entry/Exit v4.3)
+name: Trend Analyzer (Simple Entry/Exit v4.4)
 on:
   repository_dispatch:
     types: [run_X]
@@ -38,6 +38,10 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 20
+
+      - name: Install watch-phase dependencies (ws)
+        run: npm install ws@8 --no-save
+
       - name: Run Simple Entry/Exit Analyzer
         shell: bash
         run: |
@@ -53,7 +57,8 @@ jobs:
           (async () => {
           'use strict';
           const crypto = require('crypto');
-          const VERSION = '4.3.1';
+          const WebSocket = require('ws');
+          const VERSION = '4.4.0';
           const UA = `trend-analyzer/${VERSION}`;
           const log = (...a) => console.log('[analyzer]', ...a);
 
@@ -73,13 +78,18 @@ jobs:
           const SL_BPS_CFG = Math.max(10, Number(process.env.SL_BPS || '50'));
           const NOTIONAL = Math.max(50, Number(process.env.NOTIONAL_USD || '300'));
           const BYBIT_PUBLIC = (process.env.BYBIT_PROXY_URL || 'https://api.bybit.com').replace(/\/+$/, '');
+          const BYBIT_WS_URL = 'wss://stream.bybit.com/v5/public/linear';
           const MIN_MOVE_BPS = Math.max(0, Number(process.env.MIN_MOVE_BPS || '5'));
 
           // --- Watch phase ---
           const WATCH_MIN = Math.max(0, Math.min(15, Number(process.env.WATCH_MIN || '3')));
           const ARTIFICIAL_SL_PCT = Math.max(0.01, Math.min(5, Number(process.env.ARTIFICIAL_SL_PCT || '0.3')));
           const WATCH_POOL = Math.max(TOP_N, Math.min(30, Number(process.env.WATCH_POOL || '10')));
-          const POLL_MS = 10000;
+          const POLL_MS = 10000;          // REST confirmation poll interval
+          const WS_STALE_MS = 15000;      // if no WS tick in this long, treat WS as dead
+          const DEBOUNCE_TICKS = 2;       // consecutive WS breach ticks required before "pending"
+          const REST_FALLBACK_TICKS = 2;  // consecutive REST breach polls required if WS is stale
+          const TICKLOG_CAP = 60;         // per-symbol audit log cap
 
           // --- Full history request size ---
           const PNL_LIMIT = Math.max(100, Number(process.env.PNL_LIMIT || '1000'));
@@ -90,17 +100,15 @@ jobs:
           const USE_W1 = WORKER_MODE === '1' || WORKER_MODE === 'both';
           const USE_W2 = WORKER_MODE === '2' || WORKER_MODE === 'both';
 
-          // --- Hedge mode: 'off' | 'on' (default 'off') ---
+          // --- Hedge mode ---
           const HEDGE_RAW = String(process.env.HEDGE || '').trim().toLowerCase();
           const IS_HEDGE = ['on', 'true', '1'].includes(HEDGE_RAW);
 
-          // --- Reverse mode: 'off' | 'on' (default 'off') ---
-          // on = flip every idea's side (long->short, short->long) and
-          //      recalculate tp_abs / sl_abs right before the push payload is built.
+          // --- Reverse mode ---
           const REVERSE_RAW = String(process.env.REVERSE || '').trim().toLowerCase();
           const IS_REVERSE = ['on', 'true', '1'].includes(REVERSE_RAW);
 
-          // --- Cooldown: 5 minutes ---
+          // --- Cooldown ---
           const TTL_SEC = 300;
           const PUSHED_KEEP_MS = Math.max(30 * 60e3, TTL_SEC * 1000 * 2);
 
@@ -127,6 +135,27 @@ jobs:
               }
             }
           }
+
+          // ================================================================
+          //  EXCHANGE TIME SYNC (avoid CI runner clock drift)
+          // ================================================================
+          let serverOffsetMs = 0;
+          async function syncServerTime() {
+            try {
+              const st = await fetchJSON(`${BYBIT_PUBLIC}/v5/market/time`);
+              const sec = Number(st?.result?.timeSecond);
+              const nano = Number(st?.result?.timeNano);
+              const serverMs = nano > 0 ? nano / 1e6 : (sec > 0 ? sec * 1000 : 0);
+              if (serverMs > 0) {
+                serverOffsetMs = serverMs - Date.now();
+                log(`Exchange time offset: ${serverOffsetMs.toFixed(0)}ms`);
+              }
+            } catch (e) {
+              log('WARN: time sync failed, using local clock:', e?.message);
+            }
+          }
+          const exchNow = () => Date.now() + serverOffsetMs;
+          const exchISO = () => new Date(exchNow()).toISOString();
 
           // ================================================================
           //  GIST I/O
@@ -172,7 +201,7 @@ jobs:
           }
 
           // ================================================================
-          //  BYBIT
+          //  BYBIT REST
           // ================================================================
           async function getBybitTicker(symbol) {
             const url = `${BYBIT_PUBLIC}/v5/market/tickers?category=linear&symbol=${symbol}`;
@@ -191,13 +220,16 @@ jobs:
               };
             } catch { return null; }
           }
-          async function getAllLastPrices() {
+          // REST snapshot used as the INDEPENDENT confirmation source during watch phase
+          async function getAllTickersFull() {
             const url = `${BYBIT_PUBLIC}/v5/market/tickers?category=linear`;
             const data = await fetchRetry(url, 2, 300);
             const map = {};
             for (const t of data?.result?.list || []) {
-              const p = +t.lastPrice;
-              if (p > 0) map[t.symbol] = p;
+              const last = +t.lastPrice;
+              if (last > 0) {
+                map[t.symbol] = { last, bid: +t.bid1Price || 0, ask: +t.ask1Price || 0 };
+              }
             }
             return map;
           }
@@ -265,6 +297,8 @@ jobs:
           log(`  Simple Entry/Exit Analyzer v${VERSION}`);
           log('==================================================');
           log(`Config: workerMode=${WORKER_MODE} hedge=${IS_HEDGE ? 'on' : 'off'} reverse=${IS_REVERSE ? 'on' : 'off'} topN=${TOP_N} pool=${WATCH_POOL} watch=${WATCH_MIN}min artificialSL=${ARTIFICIAL_SL_PCT}% cooldown=${TTL_SEC}s pnlLimit=${PNL_LIMIT} fallbackToW1=${WORKER_MODE === 'both'}`);
+
+          await syncServerTime();
 
           const prev = await readAnalysisGist();
           const pushedPrev = prev.pushed || {};
@@ -334,6 +368,160 @@ jobs:
           const arrow = d => d === 'long' ? '🔼 UP' : d === 'short' ? '🔽 DOWN' : d === 'n/a' ? '— N/A' : '⏸ FLAT';
 
           // ================================================================
+          //  WATCH PHASE ENGINE (WebSocket primary + REST dual-source confirm)
+          // ================================================================
+          async function runWatchPhase(pool, tag) {
+            const watch = pool.map(c => {
+              const ref = c.currentPrice;
+              const line = c.side === 'long'
+                ? ref * (1 - ARTIFICIAL_SL_PCT / 100)
+                : ref * (1 + ARTIFICIAL_SL_PCT / 100);
+              return {
+                ...c,
+                refEntry: ref,
+                elimLine: +line.toPrecision(7),
+                last: ref,
+                maxAdversePct: 0,
+                maxFavorablePct: 0,
+                eliminated: false,
+                elimPrice: null,
+                elimAt: null,
+                elimReason: null,
+                wsCache: null,
+                wsStrikes: 0,
+                wsBreachPending: false,
+                restStrikes: 0,
+                tickLog: []
+              };
+            });
+            for (const w of watch) {
+              log(`  ${w.symbol} ${w.side.toUpperCase()} ref=${w.refEntry} elimLine=${w.elimLine}`);
+            }
+            if (!watch.length) return { watch, polls: 0, wsConnected: false };
+
+            const byId = new Map(watch.map(w => [w.symbol, w]));
+
+            const eliminate = (w, price, reason) => {
+              w.eliminated = true;
+              w.elimPrice = +price;
+              w.elimAt = exchISO();
+              w.elimReason = reason;
+              log(`  ❌ ${tag}${w.symbol} ${w.side.toUpperCase()} eliminated @ ${price} reason=${reason}`);
+            };
+
+            // ---- WebSocket: real-time primary feed ----
+            let ws = null, wsAlive = false, pingTimer = null;
+            try {
+              ws = new WebSocket(BYBIT_WS_URL);
+              ws.on('open', () => {
+                wsAlive = true;
+                ws.send(JSON.stringify({ op: 'subscribe', args: watch.map(w => `tickers.${w.symbol}`) }));
+                log(`  ${tag}WS connected, subscribed to ${watch.length} symbol(s)`);
+                pingTimer = setInterval(() => {
+                  try { ws.send(JSON.stringify({ op: 'ping' })); } catch {}
+                }, 20000);
+              });
+              ws.on('message', (raw) => {
+                let msg; try { msg = JSON.parse(raw.toString()); } catch { return; }
+                if (!msg.topic || !msg.topic.startsWith('tickers.')) return;
+                const sym = msg.topic.split('.')[1];
+                const w = byId.get(sym);
+                if (!w || w.eliminated) return;
+                const d = msg.data || {};
+                w.wsCache = w.wsCache || {};
+                if (d.bid1Price) w.wsCache.bid = +d.bid1Price;
+                if (d.ask1Price) w.wsCache.ask = +d.ask1Price;
+                if (d.lastPrice) w.wsCache.last = +d.lastPrice;
+                w.wsCache.ts = Date.now();
+
+                const trigger = w.side === 'long'
+                  ? (w.wsCache.bid || w.wsCache.last)
+                  : (w.wsCache.ask || w.wsCache.last);
+                if (!(trigger > 0)) return;
+
+                const adverse = w.side === 'long'
+                  ? (w.refEntry - trigger) / w.refEntry * 100
+                  : (trigger - w.refEntry) / w.refEntry * 100;
+
+                if (adverse > w.maxAdversePct) w.maxAdversePct = adverse;
+                if (-adverse > w.maxFavorablePct) w.maxFavorablePct = -adverse;
+
+                if (adverse >= ARTIFICIAL_SL_PCT) {
+                  w.wsStrikes++;
+                  w.wsBreachPrice = trigger;
+                } else {
+                  w.wsStrikes = 0;
+                }
+                w.wsBreachPending = w.wsStrikes >= DEBOUNCE_TICKS;
+              });
+              ws.on('error', (e) => { wsAlive = false; log(`  ${tag}WS error:`, e?.message); });
+              ws.on('close', () => { wsAlive = false; log(`  ${tag}WS closed`); });
+            } catch (e) {
+              log(`  ${tag}WS setup failed, REST-only fallback:`, e?.message);
+            }
+
+            // ---- REST: independent confirmation + fallback poller ----
+            let polls = 0;
+            const endAt = Date.now() + WATCH_MIN * 60e3;
+            while (true) {
+              let full = null;
+              try { full = await getAllTickersFull(); } catch (e) { log(`  ${tag}REST poll warn:`, e?.message); }
+              if (full) {
+                polls++;
+                for (const w of watch) {
+                  if (w.eliminated) continue;
+                  const t = full[w.symbol];
+                  if (!t) continue;
+                  const restTrigger = w.side === 'long' ? (t.bid || t.last) : (t.ask || t.last);
+                  if (!(restTrigger > 0)) continue;
+                  w.last = t.last || restTrigger;
+
+                  const adverseRest = w.side === 'long'
+                    ? (w.refEntry - restTrigger) / w.refEntry * 100
+                    : (restTrigger - w.refEntry) / w.refEntry * 100;
+                  if (adverseRest > w.maxAdversePct) w.maxAdversePct = adverseRest;
+                  if (-adverseRest > w.maxFavorablePct) w.maxFavorablePct = -adverseRest;
+
+                  const restBreach = adverseRest >= ARTIFICIAL_SL_PCT;
+                  const wsStale = !wsAlive || !w.wsCache || (Date.now() - w.wsCache.ts > WS_STALE_MS);
+
+                  w.tickLog.push({
+                    t: exchISO(),
+                    rest: { bid: t.bid, ask: t.ask, last: t.last, adversePct: +adverseRest.toFixed(4) },
+                    ws: w.wsCache ? { bid: w.wsCache.bid, ask: w.wsCache.ask, strikes: w.wsStrikes } : null,
+                    wsStale
+                  });
+                  if (w.tickLog.length > TICKLOG_CAP) w.tickLog.shift();
+
+                  if (restBreach && w.wsBreachPending) {
+                    eliminate(w, restTrigger, 'dual_source_confirmed');
+                  } else if (restBreach && wsStale) {
+                    w.restStrikes++;
+                    if (w.restStrikes >= REST_FALLBACK_TICKS) {
+                      eliminate(w, restTrigger, 'rest_only_fallback_ws_unavailable');
+                    }
+                  } else if (!restBreach) {
+                    w.restStrikes = 0;
+                  }
+                }
+              }
+              if (watch.every(w => w.eliminated)) { log(`  ${tag}All candidates eliminated — stopping watch early.`); break; }
+              const remaining = endAt - Date.now();
+              if (remaining <= 0) break;
+              await sleep(Math.min(POLL_MS, remaining));
+            }
+
+            if (pingTimer) clearInterval(pingTimer);
+            if (ws) { try { ws.close(); } catch {} }
+
+            log(`${tag}Watch finished (${polls} REST confirmations, WS connected=${wsAlive})`);
+            for (const w of watch) {
+              log(`  ${w.eliminated ? '❌' : '✅'} ${w.symbol} ${w.side.toUpperCase()} last=${w.last} maxAdverse=${w.maxAdversePct.toFixed(3)}% maxFavorable=${w.maxFavorablePct.toFixed(3)}% reason=${w.elimReason || '-'}`);
+            }
+            return { watch, polls, wsConnected: wsAlive };
+          }
+
+          // ================================================================
           //  ONE FULL PASS
           // ================================================================
           async function runPass(passMode, isFallback) {
@@ -343,7 +531,8 @@ jobs:
             const res = {
               mode: passMode, fallback: isFallback, status: 'ok',
               commonSymbols: [], rows: [], perSymbolDebug: {},
-              candidates: [], pool: [], watch: [], survivors: [], finalIdeas: []
+              candidates: [], pool: [], watch: [], survivors: [], finalIdeas: [],
+              watchMeta: { polls: 0, wsConnected: false }
             };
 
             if ((useW1 && !pnlData.length) || (useW2 && !pnlData2.length)) {
@@ -445,68 +634,12 @@ jobs:
             res.pool = pool;
             log(`Watch pool: ${pool.length} candidate(s)`);
 
-            // ---- STEP 6: watch phase ----
+            // ---- STEP 6: watch phase (WS + REST dual-source, debounced) ----
             log('');
-            log(`━━━ ${tag}STEP 6: Watch phase (${WATCH_MIN} min, artificial SL ${ARTIFICIAL_SL_PCT}%) ━━━`);
-            const watch = pool.map(c => {
-              const ref = c.currentPrice;
-              const line = c.side === 'long'
-                ? ref * (1 - ARTIFICIAL_SL_PCT / 100)
-                : ref * (1 + ARTIFICIAL_SL_PCT / 100);
-              return {
-                ...c,
-                refEntry: ref,
-                elimLine: +line.toPrecision(7),
-                last: ref,
-                maxAdversePct: 0,
-                maxFavorablePct: 0,
-                eliminated: false,
-                elimPrice: null,
-                elimAt: null
-              };
-            });
+            log(`━━━ ${tag}STEP 6: Watch phase (${WATCH_MIN} min, artificial SL ${ARTIFICIAL_SL_PCT}%, dual-source confirm) ━━━`);
+            const { watch, polls, wsConnected } = await runWatchPhase(pool, tag);
             res.watch = watch;
-            for (const w of watch) {
-              log(`  ${w.symbol} ${w.side.toUpperCase()} ref=${w.refEntry} elimLine=${w.elimLine}`);
-            }
-
-            let polls = 0;
-            if (watch.length) {
-              const endAt = Date.now() + WATCH_MIN * 60e3;
-              while (true) {
-                let prices = null;
-                try { prices = await getAllLastPrices(); } catch (e) { log('  poll warn:', e?.message); }
-                if (prices) {
-                  polls++;
-                  for (const w of watch) {
-                    if (w.eliminated) continue;
-                    const p = prices[w.symbol];
-                    if (!(p > 0)) continue;
-                    w.last = p;
-                    const adverse = w.side === 'long'
-                      ? (w.refEntry - p) / w.refEntry * 100
-                      : (p - w.refEntry) / w.refEntry * 100;
-                    const favorable = -adverse;
-                    if (adverse > w.maxAdversePct) w.maxAdversePct = adverse;
-                    if (favorable > w.maxFavorablePct) w.maxFavorablePct = favorable;
-                    if (adverse >= ARTIFICIAL_SL_PCT) {
-                      w.eliminated = true;
-                      w.elimPrice = p;
-                      w.elimAt = new Date().toISOString();
-                      log(`  ❌ ${w.symbol} ${w.side.toUpperCase()} eliminated @ ${p} (adverse ${adverse.toFixed(3)}%)`);
-                    }
-                  }
-                }
-                if (watch.every(w => w.eliminated)) { log('  All candidates eliminated — stopping watch early.'); break; }
-                const remaining = endAt - Date.now();
-                if (remaining <= 0) break;
-                await sleep(Math.min(POLL_MS, remaining));
-              }
-            }
-            log(`Watch finished (${polls} successful polls)`);
-            for (const w of watch) {
-              log(`  ${w.eliminated ? '❌' : '✅'} ${w.symbol} ${w.side.toUpperCase()} last=${w.last} maxAdverse=${w.maxAdversePct.toFixed(3)}% maxFavorable=${w.maxFavorablePct.toFixed(3)}%`);
-            }
+            res.watchMeta = { polls, wsConnected };
 
             // ---- STEP 7: survivors -> re-check open positions -> top N ----
             log('');
@@ -554,7 +687,7 @@ jobs:
                 : passMode === 'both' ? 'Both workers agree: price' : `Worker ${passMode}: price`;
               const isPrimary = side === c.side;
               const hedgeLabel = IS_HEDGE ? ` [Hedge Mode: ${isPrimary ? 'Primary' : 'Opposite'}]` : '';
-              const survivedText = `Survived ${WATCH_MIN}min watch (artificial SL ${ARTIFICIAL_SL_PCT}%, max adverse ${c.maxAdversePct.toFixed(3)}%)`;
+              const survivedText = `Survived ${WATCH_MIN}min dual-source watch (artificial SL ${ARTIFICIAL_SL_PCT}%, max adverse ${c.maxAdversePct.toFixed(3)}%)`;
               const hedgeText = `Hedge counterpart of ${c.side} signal (not separately watched; primary ${survivedText.charAt(0).toLowerCase()}${survivedText.slice(1)})`;
 
               return {
@@ -621,7 +754,7 @@ jobs:
             }
           }
 
-          const { commonSymbols, rows, perSymbolDebug, candidates, pool, watch, survivors, finalIdeas } = result;
+          const { commonSymbols, rows, perSymbolDebug, candidates, pool, watch, survivors, finalIdeas, watchMeta } = result;
 
           // ================================================================
           //  REVERSE: flip side + recalculate tp/sl right before push
@@ -671,6 +804,14 @@ jobs:
             candidates_found: candidates.length,
             watch_pool: pool.length,
             survivors: survivors.length,
+            watch_engine: {
+              rest_confirmations: watchMeta.polls,
+              ws_connected: watchMeta.wsConnected,
+              debounce_ticks: DEBOUNCE_TICKS,
+              rest_fallback_ticks: REST_FALLBACK_TICKS,
+              ws_stale_ms: WS_STALE_MS,
+              server_offset_ms: +serverOffsetMs.toFixed(0)
+            },
             trend_table: rows,
             watch_results: watch.map(w => ({
               symbol: w.symbol,
@@ -683,7 +824,9 @@ jobs:
               max_favorable_pct: +w.maxFavorablePct.toFixed(3),
               eliminated: w.eliminated,
               elim_price: w.elimPrice,
-              elim_at: w.elimAt
+              elim_at: w.elimAt,
+              elim_reason: w.elimReason,
+              tick_log: w.tickLog
             })),
             ideas: pushIdeas,
             debug_per_symbol: perSymbolDebug,
