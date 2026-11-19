@@ -1,4 +1,4 @@
-name: Trend Analyzer (Simple Entry/Exit v4.6)
+name: Trend Analyzer (Simple Entry/Exit v4.2)
 on:
   repository_dispatch:
     types: [run_X]
@@ -26,14 +26,12 @@ jobs:
       SL_BPS: ${{ vars.ANALYZER_SL_BPS }}
       NOTIONAL_USD: ${{ vars.NOTIONAL_USD }}
       MIN_MOVE_BPS: ${{ vars.ANALYZER_MIN_MOVE_BPS }}
+      # New variables accept both the ANALYZER_ name and the plain name
       WATCH_MIN: ${{ vars.ANALYZER_WATCH_MIN || vars.WATCH_MIN }}
       ARTIFICIAL_SL_PCT: ${{ vars.ANALYZER_ARTIFICIAL_SL_PCT || vars.ARTIFICIAL_SL_PCT }}
       WATCH_POOL: ${{ vars.ANALYZER_WATCH_POOL || vars.WATCH_POOL }}
       PNL_LIMIT: ${{ vars.ANALYZER_PNL_LIMIT || vars.PNL_LIMIT }}
       WORKER_MODE: ${{ vars.ANALYZER_WORKER_MODE || vars.WORKER_MODE }}
-      # Optional overrides for worker 2 trade field names (leave unset to auto-detect)
-      W2_PNL_FIELD: ${{ vars.W2_PNL_FIELD }}
-      W2_OPEN_TIME_FIELD: ${{ vars.W2_OPEN_TIME_FIELD }}
     steps:
       - name: Setup Node 20
         uses: actions/setup-node@v4
@@ -54,11 +52,7 @@ jobs:
           (async () => {
           'use strict';
           const crypto = require('crypto');
-          const { execFileSync } = require('child_process');
-          const fs = require('fs');
-          const os = require('os');
-          const path = require('path');
-          const VERSION = '4.6.0';
+          const VERSION = '4.2.0';
           const UA = `trend-analyzer/${VERSION}`;
           const log = (...a) => console.log('[analyzer]', ...a);
 
@@ -71,10 +65,12 @@ jobs:
           const GIST_TOKEN = process.env.GIST_TOKEN || '';
           const PUSH_URL = process.env.WORKER_PUSH_URL || '';
           const PUSH_TOKEN = process.env.PUSH_TOKEN || '';
+
           const TOP_N = Math.max(1, Math.min(10, Number(process.env.TOP_N || '3')));
           const MAX_SL_BPS = Math.max(10, Math.min(300, Number(process.env.MAX_SL_BPS || '80')));
           const TP_BPS_CFG = Math.max(10, Number(process.env.TP_BPS || '100'));
           const SL_BPS_CFG = Math.max(10, Number(process.env.SL_BPS || '50'));
+          const NOTIONAL = Math.max(50, Number(process.env.NOTIONAL_USD || '300'));
           const BYBIT_PUBLIC = (process.env.BYBIT_PROXY_URL || 'https://api.bybit.com').replace(/\/+$/, '');
           const MIN_MOVE_BPS = Math.max(0, Number(process.env.MIN_MOVE_BPS || '5'));
 
@@ -87,29 +83,16 @@ jobs:
           // --- Full history request size ---
           const PNL_LIMIT = Math.max(100, Number(process.env.PNL_LIMIT || '1000'));
 
-          // --- Worker mode (which workers' trades drive the TREND signal) ---
+          // --- Worker mode: '1' | '2' | 'both' (default 'both') ---
+          // In 'both' mode, if the run ends with 0 ideas, a fallback pass runs with worker 1 only.
           const WORKER_MODE_RAW = String(process.env.WORKER_MODE || '').trim().toLowerCase();
           const WORKER_MODE = ['1', '2', 'both'].includes(WORKER_MODE_RAW) ? WORKER_MODE_RAW : 'both';
-          const USE_W1 = WORKER_MODE === '1' || WORKER_MODE === 'both';
-          const USE_W2 = WORKER_MODE === '2' || WORKER_MODE === 'both';
+          const USE_W1 = WORKER_MODE === '1' || WORKER_MODE === 'both';   // fetch worker 1 trades
+          const USE_W2 = WORKER_MODE === '2' || WORKER_MODE === 'both';   // fetch worker 2 trades
 
-          // --- Cooldown (also the only time a "pushed" entry is kept in the Gist) ---
+          // --- Cooldown: 5 minutes (also sent to worker as idea ttl_sec) ---
           const TTL_SEC = 300;
-
-          // --- Normal/Reverse operating mode rules ---
-          const EVAL_TRADES = 4;
-          const SWITCH_IF_WINS_BELOW = 2;          // wins < 2 => switch ; wins >= 2 => do nothing
-          const SWITCH_GRACE_MS = TTL_SEC * 1000;  // ideas pushed before the switch may still fill for up to TTL
-          const W2_PNL_FIELD = (process.env.W2_PNL_FIELD || '').trim();
-          const W2_OPEN_TIME_FIELD = (process.env.W2_OPEN_TIME_FIELD || '').trim();
-          const PNL_FIELDS = W2_PNL_FIELD ? [W2_PNL_FIELD] :
-            ['pnl', 'closedPnl', 'realizedPnl', 'realisedPnl', 'netPnl', 'net_pnl', 'realized_pnl',
-             'closed_pnl', 'profit', 'pnlUsd', 'pnl_usd', 'pnlUSDT'];
-          const OPEN_TIME_FIELDS = W2_OPEN_TIME_FIELD ? [W2_OPEN_TIME_FIELD] :
-            ['openedAt', 'openTime', 'openedTime', 'entryTime', 'entry_time', 'open_time',
-             'opened_at', 'createdTime', 'createdAt'];
-          const CLOSE_TIME_FIELDS = ['time', 'closedAt', 'closeTime', 'closed_at', 'close_time', 'updatedTime'];
-          const ID_FIELDS = ['id', 'tradeId', 'orderId', 'closeId', 'execId'];
+          const PUSHED_KEEP_MS = Math.max(30 * 60e3, TTL_SEC * 1000 * 2);
 
           const sleep = ms => new Promise(r => setTimeout(r, ms));
 
@@ -136,120 +119,46 @@ jobs:
           }
 
           // ================================================================
-          //  GIST READ  (THROWS on failure -> state is never reset silently)
+          //  GIST I/O
           // ================================================================
-          async function readAnalysisGistOnce() {
-            const r = await fetch(`https://api.github.com/gists/${ANALYSIS_GIST_ID}`, {
-              headers: {
-                Authorization: `Bearer ${GIST_TOKEN}`,
-                Accept: 'application/vnd.github+json',
-                'User-Agent': UA
-              }
-            });
-            if (!r.ok) throw new Error(`Gist read HTTP ${r.status}`);
-            const g = await r.json();
-            const f = g.files?.['trend_analysis.json'];
-            if (!f) return {};                       // file does not exist yet -> fresh state
-            let content = f.content;
-            if (f.truncated && f.raw_url) {
-              const rr = await fetch(f.raw_url, { headers: { Authorization: `Bearer ${GIST_TOKEN}`, 'User-Agent': UA } });
-              if (!rr.ok) throw new Error(`Gist raw read HTTP ${rr.status}`);
-              content = await rr.text();
-            }
-            if (!content || !content.trim()) return {};
-            return JSON.parse(content);              // parse error -> throws
-          }
           async function readAnalysisGist() {
-            let lastErr;
-            for (let i = 0; i < 3; i++) {
-              try { return await readAnalysisGistOnce(); }
-              catch (e) { lastErr = e; log(`readGist attempt ${i + 1} failed:`, e?.message); await sleep(800 * (i + 1)); }
-            }
-            throw lastErr;
-          }
-
-          // ================================================================
-          //  GIST WRITE: force-push ONE orphan commit => history is always exactly 1 revision
-          //  (falls back to a normal API PATCH if the git push fails, so state is never lost)
-          // ================================================================
-          let _ghLogin = null;
-          async function getGhLogin() {
-            if (_ghLogin) return _ghLogin;
-            const r = await fetch('https://api.github.com/user', {
-              headers: {
-                Authorization: `Bearer ${GIST_TOKEN}`,
-                Accept: 'application/vnd.github+json',
-                'User-Agent': UA
-              }
-            });
-            if (!r.ok) throw new Error(`GET /user HTTP ${r.status}`);
-            _ghLogin = (await r.json()).login;
-            if (!_ghLogin) throw new Error('GET /user returned no login');
-            return _ghLogin;
-          }
-          const scrub = s => String(s || '').split(GIST_TOKEN).join('***');
-
-          async function writeGistSquashed(data) {
-            const login = await getGhLogin();
-            const remote = `https://${encodeURIComponent(login)}:${encodeURIComponent(GIST_TOKEN)}@gist.github.com/${ANALYSIS_GIST_ID}.git`;
-            const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gist-'));
-            const env = { ...process.env, GIT_TERMINAL_PROMPT: '0' };
-            const git = args => execFileSync('git', args, { cwd: dir, env, stdio: 'pipe' }).toString();
             try {
-              let branch = 'main';
-              const sym = git(['ls-remote', '--symref', remote, 'HEAD']);
-              const m = sym.match(/ref:\s+refs\/heads\/(\S+)\s+HEAD/);
-              if (m) branch = m[1];
-              git(['init', '-q']);
-              fs.writeFileSync(path.join(dir, 'trend_analysis.json'), JSON.stringify(data));
-              git(['add', 'trend_analysis.json']);
-              // fresh repo => this commit has no parent => single-commit history
-              git(['-c', 'user.name=analyzer', '-c', 'user.email=analyzer@users.noreply.github.com',
-                   'commit', '-q', '-m', 'state']);
-              git(['push', '-q', '--force', remote, `HEAD:refs/heads/${branch}`]);
-              return true;
-            } finally {
-              try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
-            }
-          }
-
-          async function writeGistPatch(data) {
-            const r = await fetch(`https://api.github.com/gists/${ANALYSIS_GIST_ID}`, {
-              method: 'PATCH',
-              headers: {
-                Authorization: `Bearer ${GIST_TOKEN}`,
-                Accept: 'application/vnd.github+json',
-                'Content-Type': 'application/json',
-                'User-Agent': UA
-              },
-              body: JSON.stringify({
-                files: { 'trend_analysis.json': { content: JSON.stringify(data) } }
-              })
-            });
-            log('writeGist (PATCH fallback) status:', r.status);
-            return r.ok;
-          }
-
-          async function writeAnalysisGist(data) {
-            // 1) preferred: squash to a single revision
-            for (let i = 0; i < 2; i++) {
-              try {
-                await writeGistSquashed(data);
-                log('writeGist: squashed to a single revision (force push OK).');
-                return true;
-              } catch (e) {
-                log(`writeGist squash attempt ${i + 1} failed:`, scrub(e?.stderr || e?.message).slice(0, 300));
-                await sleep(800);
-              }
-            }
-            // 2) fallback: normal API write (adds a revision, but state is never lost)
-            try {
-              if (await writeGistPatch(data)) return true;
+              const r = await fetch(`https://api.github.com/gists/${ANALYSIS_GIST_ID}`, {
+                headers: {
+                  Authorization: `Bearer ${GIST_TOKEN}`,
+                  Accept: 'application/vnd.github+json',
+                  'User-Agent': UA
+                }
+              });
+              if (!r.ok) return {};
+              const g = await r.json();
+              const c = g.files?.['trend_analysis.json']?.content;
+              return c ? JSON.parse(c) : {};
             } catch (e) {
-              log('writeGist PATCH error:', scrub(e?.message));
+              log('readGist warn:', e?.message);
+              return {};
             }
-            process.exitCode = 1;
-            return false;
+          }
+          async function writeAnalysisGist(data) {
+            try {
+              const r = await fetch(`https://api.github.com/gists/${ANALYSIS_GIST_ID}`, {
+                method: 'PATCH',
+                headers: {
+                  Authorization: `Bearer ${GIST_TOKEN}`,
+                  Accept: 'application/vnd.github+json',
+                  'Content-Type': 'application/json',
+                  'User-Agent': UA
+                },
+                body: JSON.stringify({
+                  files: { 'trend_analysis.json': { content: JSON.stringify(data, null, 2) } }
+                })
+              });
+              log('writeGist status:', r.status);
+              if (!r.ok) process.exitCode = 1;
+            } catch (e) {
+              log('writeGist error:', e?.message);
+              process.exitCode = 1;
+            }
           }
 
           // ================================================================
@@ -272,6 +181,7 @@ jobs:
               };
             } catch { return null; }
           }
+          // One call returns all linear tickers -> cheap polling for the watch phase
           async function getAllLastPrices() {
             const url = `${BYBIT_PUBLIC}/v5/market/tickers?category=linear`;
             const data = await fetchRetry(url, 2, 300);
@@ -303,7 +213,7 @@ jobs:
           }
 
           // ================================================================
-          //  NORMALIZE TRADES FROM A WORKER (trend signal)
+          //  NORMALIZE TRADES FROM A WORKER (ALL history, no age filter)
           // ================================================================
           function normalizeWorker1Trades(pnlData) {
             const bySymbol = {};
@@ -340,127 +250,17 @@ jobs:
           }
 
           // ================================================================
-          //  OPERATING-MODE EVALUATION (worker 2 last 4 trades AFTER last switch)
-          // ================================================================
-          const toNum = v => { const n = Number(v); return Number.isFinite(n) ? n : null; };
-          function parseTs(v) {
-            if (v === null || v === undefined || v === '') return null;
-            const n = Number(v);
-            if (Number.isFinite(n)) {
-              if (n <= 0) return null;
-              return n < 1e11 ? n * 1000 : n;       // seconds -> ms
-            }
-            const d = Date.parse(v);
-            return Number.isFinite(d) ? d : null;
-          }
-          function pickField(obj, names, conv) {
-            for (const n of names) {
-              const raw = obj?.[n];
-              if (raw === undefined || raw === null || raw === '') continue;
-              const v = conv(raw);
-              if (v !== null && v !== undefined) return { field: n, value: v };
-            }
-            return null;
-          }
-
-          function evaluateMode(w2Raw, w2Ok, mode, switchedAt) {
-            const hold = reason => ({ mode, switchedAt, switched: false, reason });
-
-            if (!w2Ok) return hold('worker2_unavailable');
-            if (!w2Raw.length) return hold('worker2_no_trades');
-
-            let unparseable = 0;
-            const fieldsSeen = { pnl: null, open: null, close: null };
-            let list = [];
-            for (const raw of w2Raw) {
-              const c = pickField(raw, CLOSE_TIME_FIELDS, parseTs);
-              if (!c) { unparseable++; continue; }
-              const p = pickField(raw, PNL_FIELDS, toNum);
-              const o = pickField(raw, OPEN_TIME_FIELDS, parseTs);
-              const id = pickField(raw, ID_FIELDS, v => String(v));
-              if (p && !fieldsSeen.pnl) fieldsSeen.pnl = p.field;
-              if (o && !fieldsSeen.open) fieldsSeen.open = o.field;
-              if (!fieldsSeen.close) fieldsSeen.close = c.field;
-              list.push({
-                id: id ? id.value : null,
-                closedAt: c.value,
-                openedAt: o ? o.value : null,
-                pnl: p ? p.value : null
-              });
-            }
-            const seen = new Set();
-            list = list.filter(t => {
-              if (t.id === null) return true;
-              const k = t.id + '|' + t.closedAt;
-              if (seen.has(k)) return false;
-              seen.add(k);
-              return true;
-            });
-            list.sort((a, b) => a.closedAt - b.closedAt);
-            log(`W2 eval: parsed ${list.length} trades (${unparseable} unparseable). Fields: pnl=${fieldsSeen.pnl || 'NOT FOUND'} open=${fieldsSeen.open || 'not found (using close time)'} close=${fieldsSeen.close}`);
-            if (w2Raw[0]) log('W2 eval: sample trade keys:', Object.keys(w2Raw[0]).join(','));
-            if (!fieldsSeen.open) log('WARN: no open-time field on worker 2 trades -> "after switch" uses CLOSE time (set W2_OPEN_TIME_FIELD if one exists).');
-
-            const cutoff = switchedAt > 0 ? switchedAt + SWITCH_GRACE_MS : 0;
-            const post = list.filter(t => (t.openedAt ?? t.closedAt) >= cutoff);
-            log(`W2 eval: mode=${mode} switchedAt=${switchedAt ? new Date(switchedAt).toISOString() : 'never'} cutoff=${cutoff ? new Date(cutoff).toISOString() : 'none'} -> ${post.length} eligible trade(s)`);
-
-            if (post.length < EVAL_TRADES) return hold(`not_enough_trades_since_switch (${post.length}/${EVAL_TRADES})`);
-
-            const last4 = post.slice(-EVAL_TRADES);
-            if (last4.some(t => t.pnl === null)) {
-              return hold('pnl_field_missing_on_some_of_last4 (set W2_PNL_FIELD)');
-            }
-            const wins = last4.filter(t => t.pnl > 0).length;
-            log(`W2 eval: last ${EVAL_TRADES} PnL = [${last4.map(t => t.pnl).join(', ')}] -> wins ${wins}/${EVAL_TRADES}`);
-
-            if (wins < SWITCH_IF_WINS_BELOW) {
-              const next = mode === 'normal' ? 'reverse' : 'normal';
-              return { mode: next, switchedAt: Date.now(), switched: true, reason: `wins ${wins} < ${SWITCH_IF_WINS_BELOW}` };
-            }
-            return hold(`wins ${wins} >= ${SWITCH_IF_WINS_BELOW}`);
-          }
-
-          // ================================================================
           //  MAIN EXECUTION
           // ================================================================
           log('╔═══════════════════════════════════════════════╗');
           log('║  Simple Entry/Exit Analyzer v' + VERSION + '          ║');
           log('╚═══════════════════════════════════════════════╝');
-
-          // ---- Load persisted state. If this fails we ABORT (never reset state). ----
-          let prev;
-          try {
-            prev = await readAnalysisGist();
-          } catch (e) {
-            log('FATAL: cannot read state Gist, aborting to protect operating-mode state:', e?.message);
-            process.exit(1);
-          }
-          const pushedPrev = (prev.pushed && typeof prev.pushed === 'object') ? prev.pushed : {};
-          const pushedState = { ...pushedPrev };   // mutated after a confirmed push
-          let operatingMode = prev.operating_mode === 'reverse' ? 'reverse' : 'normal';
-          let modeSwitchedAt = Number(prev.mode_switched_at) > 0 ? Number(prev.mode_switched_at) : 0;
-          log(`Loaded state: operatingMode=${operatingMode} switchedAt=${modeSwitchedAt ? new Date(modeSwitchedAt).toISOString() : 'never'} cooldownEntries=${Object.keys(pushedPrev).length}`);
           log(`Config: workerMode=${WORKER_MODE} topN=${TOP_N} pool=${WATCH_POOL} watch=${WATCH_MIN}min artificialSL=${ARTIFICIAL_SL_PCT}% cooldown=${TTL_SEC}s pnlLimit=${PNL_LIMIT} fallbackToW1=${WORKER_MODE === 'both'}`);
 
-          // ---- "White board" state: ONLY what the next run needs ----
-          const buildState = () => {
-            const pushed = {};
-            for (const [k, ts] of Object.entries(pushedState)) {
-              if (Date.now() - ts < TTL_SEC * 1000) pushed[k] = ts;   // expired cooldowns are erased
-            }
-            return { operating_mode: operatingMode, mode_switched_at: modeSwitchedAt, pushed };
-          };
-          let lastSavedStr = JSON.stringify(prev);   // what the Gist holds right now
-          async function saveState() {
-            const str = JSON.stringify(buildState());
-            if (str === lastSavedStr) { log('State unchanged -> no Gist write.'); return true; }
-            const ok = await writeAnalysisGist(JSON.parse(str));
-            if (ok) lastSavedStr = str;
-            return ok;
-          }
+          const prev = await readAnalysisGist();
+          const pushedPrev = prev.pushed || {};
 
-          // ---- STEP 1: Fetch trades ----
+          // ---- STEP 1: Fetch trades (once, shared by all passes) ----
           log('');
           log('━━━ STEP 1: Fetch worker trades (full history) ━━━');
           let pnlData = [];
@@ -472,7 +272,11 @@ jobs:
               log(`Worker 1: fetched ${pnlData.length} closed trades`);
             } catch (e) {
               log('FATAL: Cannot reach worker 1 /pnl:', e?.message);
-              process.exit(1);   // nothing to save: state did not change
+              await writeAnalysisGist({
+                ts: new Date().toISOString(), version: VERSION,
+                status: 'worker_unreachable', error: e?.message, ideas: [], pushed: pushedPrev
+              });
+              process.exit(1);
             }
           } else {
             log('Worker 1 trades: skipped (WORKER_MODE=2)');
@@ -482,47 +286,22 @@ jobs:
           } catch (e) {
             log('WARN: Cannot reach worker state /json:', e?.message);
           }
-
-          // Worker 2 trades are ALWAYS fetched (mode evaluation needs them regardless of WORKER_MODE)
           let pnlData2 = [];
-          let w2Ok = false;
-          if (WORKER_URL_2) {
-            try {
-              const raw2 = await fetchRetry(`${WORKER_URL_2}/pnl`);
-              if (Array.isArray(raw2?.trades)) { pnlData2 = raw2.trades; w2Ok = true; }
-              else if (Array.isArray(raw2)) { pnlData2 = raw2; w2Ok = true; }
-              log(`Worker 2: fetched ${pnlData2.length} closed trades${USE_W2 ? '' : ' (used for mode evaluation only)'}`);
-            } catch (e) {
-              log('WARN: Worker 2 /pnl unreachable:', e?.message);
+          if (USE_W2) {
+            if (WORKER_URL_2) {
+              try {
+                const raw2 = await fetchRetry(`${WORKER_URL_2}/pnl`);
+                pnlData2 = Array.isArray(raw2?.trades) ? raw2.trades : [];
+                log(`Worker 2: fetched ${pnlData2.length} closed trades`);
+              } catch (e) {
+                log('WARN: Worker 2 /pnl unreachable:', e?.message);
+              }
+            } else {
+              log('Worker 2: WORKER_URL_2 not configured.');
             }
           } else {
-            log('Worker 2: WORKER_URL_2 not configured (mode cannot switch).');
+            log('Worker 2 trades: skipped (WORKER_MODE=1)');
           }
-
-          // ---- MODE EVALUATION ----
-          log('');
-          log('━━━ MODE EVALUATION (worker 2, last 4 trades since last switch) ━━━');
-          const decision = evaluateMode(pnlData2, w2Ok, operatingMode, modeSwitchedAt);
-          if (decision.switched) {
-            const from = operatingMode;
-            operatingMode = decision.mode;
-            modeSwitchedAt = decision.switchedAt;
-            log(`🔄 MODE SWITCH: [${from}] -> [${operatingMode}] (${decision.reason})`);
-            // Persist BEFORE anything is pushed. If this fails, stop: never push in an unsaved mode.
-            const saved = await saveState();
-            if (!saved) {
-              log('FATAL: could not persist mode switch. Aborting without pushing.');
-              process.exit(1);
-            }
-          } else {
-            log(`Mode unchanged: [${operatingMode}] (${decision.reason})`);
-          }
-
-          // Mode is FIXED for the rest of this run
-          const RUN_MODE = operatingMode;
-          const flipSide = s => s === 'long' ? 'short' : 'long';
-          const finalSideOf = s => RUN_MODE === 'reverse' ? flipSide(s) : s;
-          log(`>>> Active operating mode for this run: ${RUN_MODE.toUpperCase()} <<<`);
 
           const regime = stateData?.regime?.regime || 'Unknown';
           const extractOpenSyms = st => {
@@ -532,20 +311,28 @@ jobs:
           };
           let { pos: positions, syms: openSyms } = extractOpenSyms(stateData);
           log(`Regime: ${regime} | Open positions: ${positions.length}`);
+
           const bySymbol1 = USE_W1 ? normalizeWorker1Trades(pnlData) : {};
           const bySymbol2 = USE_W2 ? normalizeWorker2Trades(pnlData2) : {};
+
           const sl_bps = Math.min(SL_BPS_CFG, MAX_SL_BPS);
           const tp_bps = TP_BPS_CFG;
           const arrow = d => d === 'long' ? '🔼 UP' : d === 'short' ? '🔽 DOWN' : d === 'n/a' ? '— N/A' : '⏸ FLAT';
 
           // ================================================================
-          //  ONE FULL PASS: steps 2-7
+          //  ONE FULL PASS: steps 2-7 (symbols -> prices -> trend -> watch -> top N)
+          //  passMode: '1' | '2' | 'both'
           // ================================================================
           async function runPass(passMode, isFallback) {
             const tag = isFallback ? '[FALLBACK W1] ' : '';
             const useW1 = passMode === '1' || passMode === 'both';
             const useW2 = passMode === '2' || passMode === 'both';
-            const res = { status: 'ok', rows: [], candidates: [], watch: [], survivors: [], finalIdeas: [] };
+            const res = {
+              mode: passMode, fallback: isFallback, status: 'ok',
+              commonSymbols: [], rows: [], perSymbolDebug: {},
+              candidates: [], pool: [], watch: [], survivors: [], finalIdeas: []
+            };
+
             if ((useW1 && !pnlData.length) || (useW2 && !pnlData2.length)) {
               log('');
               log(`${tag}Missing closed trades for mode (${passMode}). Nothing to analyze.`);
@@ -562,6 +349,7 @@ jobs:
               passMode === '1' ? Object.keys(bySymbol1)
               : passMode === '2' ? Object.keys(bySymbol2)
               : Object.keys(bySymbol1).filter(s => bySymbol2[s]);
+            res.commonSymbols = commonSymbols;
             log(`Symbols used (mode ${passMode}): ${commonSymbols.join(', ') || '(none)'}`);
             if (!commonSymbols.length) {
               log(`${tag}No usable symbols.`);
@@ -582,28 +370,30 @@ jobs:
 
             // ---- STEP 4: direction, agreement, open-pos, cooldown ----
             log('');
-            log(`━━━ ${tag}STEP 4: Trend table (lastExit vs current) [operating mode: ${RUN_MODE}] ━━━`);
+            log(`━━━ ${tag}STEP 4: Trend table (lastExit vs current) ━━━`);
             const rows = res.rows;
+            const perSymbolDebug = res.perSymbolDebug;
             const candidates = res.candidates;
             for (const sym of commonSymbols) {
               const ticker = tickers[sym];
               if (!ticker || !(ticker.lastPrice > 0)) continue;
               const currentPrice = ticker.lastPrice;
+
               const d1 = useW1 ? computeDirection(bySymbol1[sym], currentPrice) : null;
               const d2 = useW2 ? computeDirection(bySymbol2[sym], currentPrice) : null;
               const used = [d1, d2].filter(Boolean);
-              const side = used[0].direction;                 // signal side (before any flip)
+              const side = used[0].direction;
               const agree = side !== 'neutral' && used.every(d => d.direction === side);
               const score = used.reduce((s, d) => s + Math.abs(d.moveBps), 0) / used.length;
-              const finalSide = agree ? finalSideOf(side) : null;
+
               let skip = null;
               if (!agree) skip = 'no_agreement';
               else if (openSyms.has(sym)) skip = 'open_position';
               else {
-                // cooldown uses the FINAL side, same key that is saved after a push
-                const cdTs = pushedPrev[sym + '|' + finalSide];
+                const cdTs = pushedPrev[sym + '|' + side];
                 if (cdTs && Date.now() - cdTs < TTL_SEC * 1000) skip = 'cooldown';
               }
+
               rows.push({
                 symbol: sym,
                 w1LastExit: d1 ? d1.lastExit : null,
@@ -611,14 +401,18 @@ jobs:
                 current: currentPrice,
                 w1Dir: d1 ? d1.direction : 'n/a',
                 w2Dir: d2 ? d2.direction : 'n/a',
-                agree, finalSide, skip
+                agree,
+                skip
               });
+              perSymbolDebug[sym] = { currentPrice, worker1: d1, worker2: d2, agree, skip };
+
               if (skip) continue;
-              candidates.push({ symbol: sym, side, finalSide, score, currentPrice, ticker });
+              candidates.push({ symbol: sym, side, score, currentPrice, ticker });
             }
+
             log('');
-            log('Symbol         | W1 LastExit  | W2 LastExit  | Current      | Trend(W1) | Trend(W2) | Agree? | Final | Skip');
-            log('---------------|--------------|--------------|--------------|-----------|-----------|--------|-------|-----');
+            log('Symbol         | W1 LastExit  | W2 LastExit  | Current      | Trend(W1) | Trend(W2) | Agree? | Skip');
+            log('---------------|--------------|--------------|--------------|-----------|-----------|--------|-----');
             for (const r of rows) {
               const sym = r.symbol.padEnd(14);
               const w1e = (r.w1LastExit ?? '-').toString().padEnd(12);
@@ -627,8 +421,7 @@ jobs:
               const t1 = arrow(r.w1Dir).padEnd(9);
               const t2 = arrow(r.w2Dir).padEnd(9);
               const ag = r.agree ? '✅' : '❌';
-              const fs2 = (r.finalSide || '-').padEnd(5);
-              log(`${sym} | ${w1e} | ${w2e} | ${cur} | ${t1} | ${t2} | ${ag}     | ${fs2} | ${r.skip || '-'}`);
+              log(`${sym} | ${w1e} | ${w2e} | ${cur} | ${t1} | ${t2} | ${ag}     | ${r.skip || '-'}`);
             }
 
             // ---- STEP 5: score + rank -> pool ----
@@ -636,12 +429,13 @@ jobs:
             log(`━━━ ${tag}STEP 5: Score + rank candidates ━━━`);
             candidates.sort((a, b) => b.score - a.score);
             for (const c of candidates) {
-              log(`  ${c.symbol} signal=${c.side.toUpperCase()} final=${c.finalSide.toUpperCase()} score=${c.score.toFixed(1)}bps`);
+              log(`  ${c.symbol} ${c.side.toUpperCase()} score=${c.score.toFixed(1)}bps`);
             }
             const pool = candidates.slice(0, WATCH_POOL);
+            res.pool = pool;
             log(`Watch pool: ${pool.length} candidate(s)`);
 
-            // ---- STEP 6: watch phase (on the SIGNAL side; flip happens only at the very end) ----
+            // ---- STEP 6: watch phase (artificial SL) ----
             log('');
             log(`━━━ ${tag}STEP 6: Watch phase (${WATCH_MIN} min, artificial SL ${ARTIFICIAL_SL_PCT}%) ━━━`);
             const watch = pool.map(c => {
@@ -663,8 +457,9 @@ jobs:
             });
             res.watch = watch;
             for (const w of watch) {
-              log(`  ${w.symbol} signal=${w.side.toUpperCase()} ref=${w.refEntry} elimLine=${w.elimLine}`);
+              log(`  ${w.symbol} ${w.side.toUpperCase()} ref=${w.refEntry} elimLine=${w.elimLine}`);
             }
+
             let polls = 0;
             if (watch.length) {
               const endAt = Date.now() + WATCH_MIN * 60e3;
@@ -700,10 +495,10 @@ jobs:
             }
             log(`Watch finished (${polls} successful polls)`);
             for (const w of watch) {
-              log(`  ${w.eliminated ? '❌' : '✅'} ${w.symbol} signal=${w.side.toUpperCase()} last=${w.last} maxAdverse=${w.maxAdversePct.toFixed(3)}% maxFavorable=${w.maxFavorablePct.toFixed(3)}%`);
+              log(`  ${w.eliminated ? '❌' : '✅'} ${w.symbol} ${w.side.toUpperCase()} last=${w.last} maxAdverse=${w.maxAdversePct.toFixed(3)}% maxFavorable=${w.maxFavorablePct.toFixed(3)}%`);
             }
 
-            // ---- STEP 7: survivors -> re-check open positions -> top N -> FLIP AT THE VERY END ----
+            // ---- STEP 7: survivors -> re-check open positions -> top N ----
             log('');
             log(`━━━ ${tag}STEP 7: Select top N from survivors ━━━`);
             try {
@@ -730,9 +525,8 @@ jobs:
 
             res.finalIdeas = top.map(c => {
               const entry = +c.last.toPrecision(7);
-              const side = c.finalSide;               // already flipped if RUN_MODE === 'reverse'
               let tp_abs, sl_abs;
-              if (side === 'long') {
+              if (c.side === 'long') {
                 tp_abs = +(entry * (1 + tp_bps / 10000)).toPrecision(7);
                 sl_abs = +(entry * (1 - sl_bps / 10000)).toPrecision(7);
               } else {
@@ -743,23 +537,25 @@ jobs:
               const basis = isFallback
                 ? 'Fallback (worker 1 only): price'
                 : passMode === 'both' ? 'Both workers agree: price' : `Worker ${passMode}: price`;
-              const reasons = [
-                `${basis} ${c.side === 'long' ? 'above' : 'below'} last exit price`,
-                `Score (avg move from last exit) = ${c.score.toFixed(1)}bps`,
-                `Survived ${WATCH_MIN}min watch (artificial SL ${ARTIFICIAL_SL_PCT}%, max adverse ${c.maxAdversePct.toFixed(3)}%)`
-              ];
-              if (RUN_MODE === 'reverse') {
-                reasons.push(`[REVERSE MODE] signal ${c.side.toUpperCase()} flipped to ${side.toUpperCase()}`);
-              }
               return {
                 symbol: c.symbol,
                 base: c.symbol.replace('USDT', ''),
                 quote: 'USDT',
-                side,
-                signal_side: c.side,
+                side: c.side,
                 entry, tp_abs, sl_abs, tp_bps, sl_bps, rrr,
+                ref_entry: c.refEntry,
                 score_bps: +c.score.toFixed(1),
-                reasons
+                fallback: isFallback,
+                watch_max_adverse_pct: +c.maxAdversePct.toFixed(3),
+                watch_max_favorable_pct: +c.maxFavorablePct.toFixed(3),
+                funding_rate: c.ticker?.fundingRate || 0,
+                volume_24h: c.ticker?.turnover24h || 0,
+                reasons: [
+                  `${basis} ${c.side === 'long' ? 'above' : 'below'} last exit price`,
+                  `Score (avg move from last exit) = ${c.score.toFixed(1)}bps`,
+                  `Survived ${WATCH_MIN}min watch (artificial SL ${ARTIFICIAL_SL_PCT}%, max adverse ${c.maxAdversePct.toFixed(3)}%)`
+                ],
+                generated_at: new Date().toISOString()
               };
             });
             return res;
@@ -768,6 +564,14 @@ jobs:
           // ---- Run primary pass, then fallback if nothing to push ----
           let result = await runPass(WORKER_MODE, false);
           let fallbackUsed = false;
+          const primarySummary = {
+            mode: WORKER_MODE,
+            status: result.status,
+            candidates: result.candidates.length,
+            survivors: result.survivors.length,
+            ideas: result.finalIdeas.length
+          };
+
           if (result.finalIdeas.length === 0 && WORKER_MODE === 'both') {
             log('');
             log('━━━ FALLBACK: primary (both) pass produced 0 ideas ━━━');
@@ -779,26 +583,76 @@ jobs:
               log('Fallback skipped: no worker 1 trades available.');
             }
           }
-          const finalIdeas = result.finalIdeas;
+
+          const { commonSymbols, rows, perSymbolDebug, candidates, pool, watch, survivors, finalIdeas } = result;
+
           log('');
-          log(`Final ideas [${RUN_MODE.toUpperCase()} mode]: ${finalIdeas.length}${fallbackUsed ? ' (from fallback)' : ''}`);
+          log(`Final ideas: ${finalIdeas.length}${fallbackUsed ? ' (from fallback)' : ''}`);
           for (const i of finalIdeas) {
-            log(`  ${i.symbol} ${i.side.toUpperCase()} (signal ${i.signal_side.toUpperCase()}) entry=${i.entry} tp=${i.tp_abs} sl=${i.sl_abs} score=${i.score_bps}bps`);
+            log(`  ${i.symbol} ${i.side.toUpperCase()} entry=${i.entry} tp=${i.tp_abs} sl=${i.sl_abs} score=${i.score_bps}bps`);
           }
 
-          // ---- STEP 8: Push ideas to worker & confirm receipt ----
+          // ---- STEP 8: Write analysis gist ----
+          log('');
+          log('━━━ STEP 8: Write analysis Gist ━━━');
+          const pushedNext = {};
+          for (const [k, ts] of Object.entries(pushedPrev)) {
+            if (Date.now() - ts < PUSHED_KEEP_MS) pushedNext[k] = ts;
+          }
+          // cooldown was already applied before the watch phase
           const pushIdeas = finalIdeas;
+
+          const output = {
+            ts: new Date().toISOString(),
+            version: VERSION,
+            status: result.status,
+            worker_mode: WORKER_MODE,
+            fallback_used: fallbackUsed,
+            primary_pass: primarySummary,
+            worker_regime: regime,
+            open_positions: positions.length,
+            common_symbols: commonSymbols.length,
+            candidates_found: candidates.length,
+            watch_pool: pool.length,
+            survivors: survivors.length,
+            trend_table: rows,
+            watch_results: watch.map(w => ({
+              symbol: w.symbol,
+              side: w.side,
+              score_bps: +w.score.toFixed(1),
+              ref_entry: w.refEntry,
+              elim_line: w.elimLine,
+              last: w.last,
+              max_adverse_pct: +w.maxAdversePct.toFixed(3),
+              max_favorable_pct: +w.maxFavorablePct.toFixed(3),
+              eliminated: w.eliminated,
+              elim_price: w.elimPrice,
+              elim_at: w.elimAt
+            })),
+            ideas: finalIdeas,
+            debug_per_symbol: perSymbolDebug,
+            pushed: pushedNext,
+            config: {
+              worker_mode: WORKER_MODE,
+              top_n: TOP_N, tp_bps, sl_bps, min_move_bps: MIN_MOVE_BPS, notional_usd: NOTIONAL,
+              watch_min: WATCH_MIN, artificial_sl_pct: ARTIFICIAL_SL_PCT,
+              watch_pool: WATCH_POOL, cooldown_sec: TTL_SEC, pnl_limit: PNL_LIMIT
+            }
+          };
+          await writeAnalysisGist(output);
+          log('Analysis Gist written.');
+
+          // ---- STEP 9: Push ideas to worker & confirm receipt ----
           if (PUSH_URL && PUSH_TOKEN && pushIdeas.length > 0) {
             log('');
-            log('━━━ STEP 8: Push ideas to worker & confirm receipt ━━━');
+            log('━━━ STEP 9: Push ideas to worker & confirm receipt ━━━');
             const pushPayload = {
               ts: new Date().toISOString(),
-              mode: 'normal',   // protocol field expected by the receiver (unchanged from original); operating mode is in meta
+              mode: 'normal',
               source: 'simple_entry_exit_analyzer',
               meta: {
                 origin: 'github_actions_analyzer', version: VERSION,
-                worker_regime: regime, worker_mode: WORKER_MODE,
-                operating_mode: RUN_MODE, fallback: fallbackUsed
+                worker_regime: regime, worker_mode: WORKER_MODE, fallback: fallbackUsed
               },
               top_n: pushIdeas.length,
               ideas: pushIdeas.map((idea, i) => ({
@@ -854,13 +708,34 @@ jobs:
               if (isConfirmed) {
                 log(`✅ SUCCESS: Worker acknowledged receipt of ${pushIdeas.length} idea(s).`);
                 if (resJson) log('Worker Response Payload:', JSON.stringify(resJson));
-                for (const i of pushIdeas) pushedState[i.symbol + '|' + i.side] = Date.now();
+                for (const i of pushIdeas) pushedNext[i.symbol + '|' + i.side] = Date.now();
+                output.pushed = pushedNext;
+                output.push_confirmation = {
+                  received: true,
+                  count: pushIdeas.length,
+                  ts: new Date().toISOString(),
+                  response: resJson || txt
+                };
+                await writeAnalysisGist(output);
               } else {
                 log(`❌ FAILED: Push rejected or not confirmed by worker. Response:`, (txt || '').slice(0, 300));
+                output.push_confirmation = {
+                  received: false,
+                  status: r.status,
+                  ts: new Date().toISOString(),
+                  response: resJson || txt
+                };
+                await writeAnalysisGist(output);
                 process.exitCode = 1;
               }
             } catch (e) {
               log('❌ Push execution error:', e?.message);
+              output.push_confirmation = {
+                received: false,
+                error: e?.message,
+                ts: new Date().toISOString()
+              };
+              await writeAnalysisGist(output);
               process.exitCode = 1;
             }
           } else if (pushIdeas.length === 0) {
@@ -870,11 +745,6 @@ jobs:
             log('');
             log('Push skipped (no WORKER_PUSH_URL or PUSH_TOKEN).');
           }
-
-          // ---- STEP 9: Final state write (whiteboard: mode + switch time + live cooldowns only) ----
-          log('');
-          log('━━━ STEP 9: Save state to Gist (only if changed) ━━━');
-          await saveState();
 
           log('');
           log('═══ Analysis complete ═══');
