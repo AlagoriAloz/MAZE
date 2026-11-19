@@ -1,4 +1,4 @@
-name: Trend Analyzer (Trade Archaeology v1.0)
+name: Trend Analyzer (Simple Entry/Exit v2.0)
 
 on:
   repository_dispatch:
@@ -22,13 +22,13 @@ jobs:
       WORKER_URL_2: ${{ secrets.WORKER_URL_2 }}
       ANALYSIS_GIST_ID: ${{ secrets.ANALYSIS_GIST_ID }}
       GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
-      GIST_ID: ${{ secrets.GIST_ID }}
       BYBIT_PROXY_URL: ${{ secrets.BYBIT_PROXY_URL }}
       WORKER_PUSH_URL: ${{ secrets.WORKER_PUSH_URL }}
       PUSH_TOKEN: ${{ secrets.PUSH_TOKEN }}
       TOP_N: ${{ vars.ANALYZER_TOP_N }}
-      MIN_CONFIDENCE: ${{ vars.ANALYZER_MIN_CONFIDENCE }}
       MAX_SL_BPS: ${{ vars.ANALYZER_MAX_SL_BPS }}
+      TP_BPS: ${{ vars.ANALYZER_TP_BPS }}
+      SL_BPS: ${{ vars.ANALYZER_SL_BPS }}
       NOTIONAL_USD: ${{ vars.NOTIONAL_USD }}
 
     steps:
@@ -37,7 +37,7 @@ jobs:
         with:
           node-version: 20
 
-      - name: Run Trade Archaeology Analyzer
+      - name: Run Simple Entry/Exit Analyzer
         shell: bash
         run: |
           set -euo pipefail
@@ -53,7 +53,7 @@ jobs:
           (async () => {
           'use strict';
           const crypto = require('crypto');
-          const VERSION = '1.0.0';
+          const VERSION = '2.0.0';
           const UA = `trend-analyzer/${VERSION}`;
           const log = (...a) => console.log('[analyzer]', ...a);
 
@@ -61,111 +61,22 @@ jobs:
           //  CONFIGURATION
           // ================================================================
           const WORKER_URL = (process.env.WORKER_URL || '').replace(/\/+$/, '');
+          const WORKER_URL_2 = (process.env.WORKER_URL_2 || '').replace(/\/+$/, '');
           const ANALYSIS_GIST_ID = process.env.ANALYSIS_GIST_ID || '';
           const GIST_TOKEN = process.env.GIST_TOKEN || '';
           const PUSH_URL = process.env.WORKER_PUSH_URL || '';
           const PUSH_TOKEN = process.env.PUSH_TOKEN || '';
           const TOP_N = Math.max(1, Math.min(10, Number(process.env.TOP_N || '3')));
-          const MIN_CONFIDENCE = Math.max(0, Math.min(100, Number(process.env.MIN_CONFIDENCE || '55')));
-          const MAX_SL_BPS = Math.max(20, Math.min(200, Number(process.env.MAX_SL_BPS || '80')));
+          const MAX_SL_BPS = Math.max(10, Math.min(300, Number(process.env.MAX_SL_BPS || '80')));
+          const TP_BPS_CFG = Math.max(10, Number(process.env.TP_BPS || '100'));
+          const SL_BPS_CFG = Math.max(10, Number(process.env.SL_BPS || '50'));
           const NOTIONAL = Math.max(50, Number(process.env.NOTIONAL_USD || '300'));
           const BYBIT_PUBLIC = (process.env.BYBIT_PROXY_URL || 'https://api.bybit.com').replace(/\/+$/, '');
-          const WILSON_Z = 1.34;
-          const TTL_MAP = { '5': 1800, '15': 3600, '60': 7200, '240': 14400 };
+          const MAX_AGE_H = 72;
+          const TTL_SEC = 3600;
 
-          // ================================================================
-          //  SECOND GIST (Ideas Pusher main state)
-          // ================================================================
-          const MAIN_GIST_ID = process.env.GIST_ID || '';
-
-          async function wipeMainStateGist() {
-            if (!MAIN_GIST_ID || !GIST_TOKEN) {
-              log('wipeMainStateGist: missing GIST_ID or GIST_TOKEN — skip');
-              return false;
-            }
-            try {
-              const r = await fetch(
-                `https://api.github.com/gists/${MAIN_GIST_ID}`,
-                {
-                  method: 'PATCH',
-                  headers: {
-                    Authorization: `Bearer ${GIST_TOKEN}`,
-                    Accept: 'application/vnd.github+json',
-                    'Content-Type': 'application/json',
-                    'User-Agent': UA
-                  },
-                  body: JSON.stringify({
-                    files: {
-                      'state.json': {
-                        content: JSON.stringify({ run_counter: 0 })
-                      }
-                    }
-                  })
-                }
-              );
-              log('wipeMainStateGist status:', r.status);
-              return r.ok;
-            } catch (e) {
-              log('wipeMainStateGist error:', e?.message);
-              return false;
-            }
-          }
-
-          async function wipeAnalysisGist() {
-            if (!ANALYSIS_GIST_ID || !GIST_TOKEN) {
-              log('wipeAnalysisGist: missing ANALYSIS_GIST_ID or GIST_TOKEN — skip');
-              return false;
-            }
-            try {
-              const r = await fetch(
-                `https://api.github.com/gists/${ANALYSIS_GIST_ID}`,
-                {
-                  method: 'PATCH',
-                  headers: {
-                    Authorization: `Bearer ${GIST_TOKEN}`,
-                    Accept: 'application/vnd.github+json',
-                    'Content-Type': 'application/json',
-                    'User-Agent': UA
-                  },
-                  body: JSON.stringify({
-                    files: {
-                      'trend_analysis.json': {
-                        content: JSON.stringify({ run_counter: 0 })
-                      }
-                    }
-                  })
-                }
-              );
-              log('wipeAnalysisGist status:', r.status);
-              return r.ok;
-            } catch (e) {
-              log('wipeAnalysisGist error:', e?.message);
-              return false;
-            }
-          }
-
-          // ================================================================
-          //  MATH UTILITIES
-          // ================================================================
-          const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
-          const sum = a => a.reduce((s, x) => s + x, 0);
-          const mean = a => a.length ? sum(a) / a.length : 0;
-          const std = a => {
-            if (a.length < 2) return 0;
-            const m = mean(a);
-            return Math.sqrt(a.reduce((s, x) => s + (x - m) ** 2, 0) / (a.length - 1));
-          };
           const sleep = ms => new Promise(r => setTimeout(r, ms));
-
-          const wilsonLCB = (wins, n, z = WILSON_Z) => {
-            if (n <= 0) return 0;
-            const p = wins / n;
-            const z2 = z * z;
-            const a = p + z2 / (2 * n);
-            const b = z * Math.sqrt((p * (1 - p) + z2 / (4 * n)) / n);
-            const c = 1 + z2 / n;
-            return Math.max(0, Math.min(1, (a - b) / c));
-          };
+          const mean = a => a.length ? a.reduce((s, x) => s + x, 0) / a.length : 0;
 
           // ================================================================
           //  HTTP HELPERS
@@ -174,10 +85,7 @@ jobs:
             const ac = new AbortController();
             const t = setTimeout(() => ac.abort(), ms);
             try {
-              const r = await fetch(url, {
-                signal: ac.signal,
-                headers: { 'User-Agent': UA }
-              });
+              const r = await fetch(url, { signal: ac.signal, headers: { 'User-Agent': UA } });
               if (!r.ok) throw new Error(`HTTP ${r.status}`);
               return await r.json();
             } finally { clearTimeout(t); }
@@ -198,16 +106,13 @@ jobs:
           // ================================================================
           async function readAnalysisGist() {
             try {
-              const r = await fetch(
-                `https://api.github.com/gists/${ANALYSIS_GIST_ID}`,
-                {
-                  headers: {
-                    Authorization: `Bearer ${GIST_TOKEN}`,
-                    Accept: 'application/vnd.github+json',
-                    'User-Agent': UA
-                  }
+              const r = await fetch(`https://api.github.com/gists/${ANALYSIS_GIST_ID}`, {
+                headers: {
+                  Authorization: `Bearer ${GIST_TOKEN}`,
+                  Accept: 'application/vnd.github+json',
+                  'User-Agent': UA
                 }
-              );
+              });
               if (!r.ok) return {};
               const g = await r.json();
               const c = g.files?.['trend_analysis.json']?.content;
@@ -220,25 +125,18 @@ jobs:
 
           async function writeAnalysisGist(data) {
             try {
-              const r = await fetch(
-                `https://api.github.com/gists/${ANALYSIS_GIST_ID}`,
-                {
-                  method: 'PATCH',
-                  headers: {
-                    Authorization: `Bearer ${GIST_TOKEN}`,
-                    Accept: 'application/vnd.github+json',
-                    'Content-Type': 'application/json',
-                    'User-Agent': UA
-                  },
-                  body: JSON.stringify({
-                    files: {
-                      'trend_analysis.json': {
-                        content: JSON.stringify(data, null, 2)
-                      }
-                    }
-                  })
-                }
-              );
+              const r = await fetch(`https://api.github.com/gists/${ANALYSIS_GIST_ID}`, {
+                method: 'PATCH',
+                headers: {
+                  Authorization: `Bearer ${GIST_TOKEN}`,
+                  Accept: 'application/vnd.github+json',
+                  'Content-Type': 'application/json',
+                  'User-Agent': UA
+                },
+                body: JSON.stringify({
+                  files: { 'trend_analysis.json': { content: JSON.stringify(data, null, 2) } }
+                })
+              });
               log('writeGist status:', r.status);
               if (!r.ok) process.exitCode = 1;
             } catch (e) {
@@ -248,399 +146,10 @@ jobs:
           }
 
           // ================================================================
-          //  OLS LINEAR REGRESSION
+          //  BYBIT TICKER
           // ================================================================
-          function olsSlope(values) {
-            const n = values.length;
-            if (n < 3) return {
-              slope: 0, slope_bps: 0, tStat: 0,
-              r2: 0, significant: false
-            };
-            const xMean = (n - 1) / 2;
-            const yMean = mean(values);
-            let num = 0, denX = 0, ssRes = 0, ssTot = 0;
-            for (let i = 0; i < n; i++) {
-              const dx = i - xMean;
-              const dy = values[i] - yMean;
-              num += dx * dy;
-              denX += dx * dx;
-              ssTot += dy * dy;
-            }
-            if (denX < 1e-12) return {
-              slope: 0, slope_bps: 0, tStat: 0,
-              r2: 0, significant: false
-            };
-            const slope = num / denX;
-            for (let i = 0; i < n; i++) {
-              const yHat = yMean + slope * (i - xMean);
-              ssRes += (values[i] - yHat) ** 2;
-            }
-            const r2 = ssTot > 0 ? 1 - ssRes / ssTot : 0;
-            const se = n > 2 ? Math.sqrt(ssRes / (n - 2)) : 1e-9;
-            const slopeErr = se / Math.sqrt(denX);
-            const tStat = slopeErr > 1e-12 ? slope / slopeErr : 0;
-            return {
-              slope: +slope.toFixed(8),
-              slope_bps: values[0] > 0
-                ? +(slope / values[0] * 10000).toFixed(2) : 0,
-              tStat: +tStat.toFixed(3),
-              r2: +r2.toFixed(4),
-              significant: Math.abs(tStat) > 2
-            };
-          }
-
-          // ================================================================
-          //  TRADE-BASED TEST T1: Weighted Direction Consensus
-          // ================================================================
-          function T1_directionConsensus(trades) {
-            if (!trades.length) return {
-              score: 0, direction: 0, n: 0
-            };
-            const now = Date.now();
-            let wSum = 0, dSum = 0;
-            for (const t of trades) {
-              const move = t.exitPrice - t.entryPrice;
-              const moveBps = (t.exitPrice / t.entryPrice - 1) * 10000;
-              const age = Math.max(1, now - t.closedAt);
-              const recency = Math.exp(-age / (24 * 3600 * 1000));
-              const magnitude = Math.min(1, Math.abs(moveBps) / 50);
-              const lossBoost = t.stopLoss ? 1.3 : 1.0;
-              const w = recency * magnitude * lossBoost;
-              const dir = move > 0 ? 1 : move < 0 ? -1 : 0;
-              dSum += dir * w;
-              wSum += w;
-            }
-            const score = wSum > 0 ? dSum / wSum : 0;
-            return {
-              score: +score.toFixed(4),
-              direction: Math.sign(score),
-              n: trades.length
-            };
-          }
-
-          // ================================================================
-          //  TRADE-BASED TEST T2: OLS Slope on Entry + Exit Prices
-          // ================================================================
-          function T2_entryExitSlope(trades) {
-            const empty = {
-              slope: 0, slope_bps: 0, tStat: 0,
-              r2: 0, significant: false
-            };
-            if (trades.length < 3) return {
-              entry: empty, exit: empty, agree: false
-            };
-            const sorted = trades.slice().sort(
-              (a, b) => a.openedAt - b.openedAt
-            );
-            const mk = v => { 
-              const e = olsSlope(v.map(Math.log)); 
-              return { ...e, slope_bps: +(e.slope * 1e4).toFixed(2),
-                       significant: e.significant && v.length >= 8 };
-            };
-            const entry = mk(sorted.map(t => t.entryPrice));
-            const exit  = mk(sorted.map(t => t.exitPrice));
-            const agree = Math.sign(entry.slope) === Math.sign(exit.slope)
-              && (entry.significant || exit.significant);
-            return { entry, exit, agree };
-          }
-
-          // ================================================================
-          //  TRADE-BASED TEST T3: Loss Velocity Acceleration
-          // ================================================================
-          function T3_lossAcceleration(trades) {
-            const sortedAll = trades.slice().sort((a,b) => a.closedAt - b.closedAt);
-            let consecutiveSameDirLosses = 0;
-            let lastLossDir = null;
-            
-            for (let i = sortedAll.length - 1; i >= 0; i--) {
-              const t = sortedAll[i];
-              if (!t.stopLoss) break;
-              const lDir = t.side === 'Buy' ? 'long_loss' : 'short_loss';
-              if (!lastLossDir) lastLossDir = lDir;
-              if (lDir === lastLossDir) consecutiveSameDirLosses++;
-              else break;
-            }
-
-            const losses = sortedAll.filter(t => t.stopLoss);
-            if (losses.length < 2) return {
-              acceleration: 0,
-              ttslTrend: 'insufficient',
-              n: losses.length,
-              ttslValues: [],
-              consecutiveSameDirLosses,
-              lastLossDir,
-              impliedTrend: lastLossDir === 'long_loss' ? 'bearish' : (lastLossDir === 'short_loss' ? 'bullish' : 'neutral'),
-              lossMagnitudeTrend: 'stable',
-              avgLoss: 0,
-              avgLossBps: 0
-            };
-
-            const ttslMs = losses.map(t => Math.max(1000, t.closedAt - t.openedAt));
-            const ttslMin = ttslMs.map(ms => +(ms / 60000).toFixed(2));
-            const slopeInfo = olsSlope(ttslMs);
-
-            let trend = 'stable';
-            if (slopeInfo.slope < 0 && Math.abs(slopeInfo.tStat) > 1.5)
-              trend = 'accelerating';
-            else if (slopeInfo.slope > 0 && Math.abs(slopeInfo.tStat) > 1.5)
-              trend = 'exhausting';
-
-            const sane = ttslMs.filter(x => x > 5000).length >= losses.length * 0.7;
-            if (!sane) trend = 'stable';
-
-            // Loss magnitude trend 
-            const lossMagnitudes = losses.map(t => Math.abs(t.pnl));
-            const magSlope = olsSlope(lossMagnitudes);
-            let magTrend = 'stable';
-            if (magSlope.slope > 0 && Math.abs(magSlope.tStat) > 1.2)
-              magTrend = 'growing';
-            else if (magSlope.slope < 0 && Math.abs(magSlope.tStat) > 1.2)
-              magTrend = 'shrinking';
-
-            const lossBps = losses.map(t => Math.abs(t.exitPrice / t.entryPrice - 1) * 1e4);
-
-            return {
-              acceleration: +slopeInfo.slope.toFixed(2),
-              ttslTrend: trend,
-              n: losses.length,
-              ttslValues: ttslMin.slice(-6),
-              consecutiveSameDirLosses,
-              lastLossDir,
-              impliedTrend: lastLossDir === 'long_loss' ? 'bearish' : lastLossDir === 'short_loss' ? 'bullish' : 'neutral',
-              lossMagnitudeTrend: magTrend,
-              avgLoss: +mean(lossMagnitudes).toFixed(4),
-              avgLossBps: +mean(lossBps).toFixed(1)
-            };
-          }
-
-          // ================================================================
-          //  TRADE-BASED TEST T4: Side Win-Rate Asymmetry
-          // ================================================================
-          function T4_sideAsymmetry(trades) {
-            let winsL = 0, nL = 0, winsS = 0, nS = 0;
-            let pnlSumL = 0, pnlSumS = 0;
-            const pnlListL = [], pnlListS = [];
-            for (const t of trades) {
-              if (t.side === 'Buy') {
-                nL++;
-                if (t.pnl >= 0) winsL++;
-                pnlSumL += t.pnl;
-                pnlListL.push(t.pnl);
-              } else {
-                nS++;
-                if (t.pnl >= 0) winsS++;
-                pnlSumS += t.pnl;
-                pnlListS.push(t.pnl);
-              }
-            }
-            const wrL = wilsonLCB(winsL, nL);
-            const wrS = wilsonLCB(winsS, nS);
-            const asymmetry = (nL >= 3 && nS >= 3) ? wrL - wrS : 0;
-            const avgPnlL = nL > 0 ? pnlSumL / nL : 0;
-            const avgPnlS = nS > 0 ? pnlSumS / nS : 0;
-            const avgLossL = mean(
-              pnlListL.filter(p => p < 0).map(Math.abs)
-            ) || 0;
-            const avgLossS = mean(
-              pnlListS.filter(p => p < 0).map(Math.abs)
-            ) || 0;
-            const lossSizeAsym = avgLossL > 0 && avgLossS > 0
-              ? (avgLossL - avgLossS) / Math.max(avgLossL, avgLossS)
-              : 0;
-            return {
-              asymmetry: +asymmetry.toFixed(4),
-              long: {
-                wins: winsL, total: nL,
-                wr_lcb: +wrL.toFixed(4),
-                avgPnl: +avgPnlL.toFixed(4),
-                avgLoss: +avgLossL.toFixed(4)
-              },
-              short: {
-                wins: winsS, total: nS,
-                wr_lcb: +wrS.toFixed(4),
-                avgPnl: +avgPnlS.toFixed(4),
-                avgLoss: +avgLossS.toFixed(4)
-              },
-              lossSizeAsymmetry: +lossSizeAsym.toFixed(4),
-              bestSide: asymmetry > 0.05
-                ? 'long'
-                : asymmetry < -0.05 ? 'short' : 'neutral',
-              signal: asymmetry > 0 ? 1 : asymmetry < 0 ? -1 : 0
-            };
-          }
-
-          // ================================================================
-          //  TRADE-BASED TEST T5: Displacement Distribution Skewness
-          // ================================================================
-          function T5_displacementSkew(trades) {
-            if (trades.length < 4) return {
-              skewness: 0, kurtosis: 0, signal: 0,
-              interpretation: 'insufficient'
-            };
-            const moves = trades.map(
-              t => (t.exitPrice / t.entryPrice - 1) * 10000
-            );
-            const m = mean(moves);
-            const s = std(moves);
-            if (s < 1e-6) return {
-              skewness: 0, kurtosis: 0, signal: 0,
-              interpretation: 'no_variance'
-            };
-            const n = moves.length;
-            let m3 = 0, m4 = 0;
-            for (const x of moves) {
-              const d = (x - m) / s;
-              m3 += d * d * d;
-              m4 += d * d * d * d;
-            }
-            const skew = n >= 3
-              ? (n / ((n - 1) * (n - 2))) * m3 : 0;
-            const kurt = n > 3
-              ? ((n * (n + 1)) / ((n - 1) * (n - 2) * (n - 3)) * m4
-                - 3 * (n - 1) ** 2 / ((n - 2) * (n - 3)))
-              : 0;
-            return {
-              skewness: +skew.toFixed(4),
-              kurtosis: +kurt.toFixed(4),
-              signal: skew > 0.3 ? 1 : skew < -0.3 ? -1 : 0,
-              interpretation: skew > 0.3
-                ? 'bullish_skew'
-                : skew < -0.3 ? 'bearish_skew' : 'symmetric'
-            };
-          }
-
-          // ================================================================
-          //  TRADE-BASED TEST T6: Bayesian Trend Posterior
-          // ================================================================
-          function T6_bayesianPosterior(trades) {
-            if (!trades.length) return {
-              pUp: 0.5, pDown: 0.5, signal: 0,
-              direction: 'neutral', strength: 'none'
-            };
-            let pUp = 0.5;
-            const sorted = trades.slice().sort(
-              (a, b) => a.closedAt - b.closedAt
-            );
-            for (const t of sorted) {
-              pUp = pUp * 0.9 + (1 - pUp) * 0.1; // forgetting factor
-              
-              const moveBps = Math.abs(
-                (t.exitPrice / t.entryPrice - 1) * 10000
-              );
-              const isUp = t.exitPrice > t.entryPrice;
-              const conf = clamp(
-                0.55 + Math.min(0.20, moveBps / 200),
-                0.55, 0.75
-              );
-              const likUp = isUp ? conf : (1 - conf);
-              const likDown = 1 - likUp;
-              const boost = t.stopLoss ? 1.15 : 1.0;
-              const rawUp = pUp * (likUp ** boost);
-              const rawDown = (1 - pUp) * (likDown ** boost);
-              const total = rawUp + rawDown;
-              pUp = total > 0 ? rawUp / total : 0.5;
-            }
-            const pDown = 1 - pUp;
-            const maxP = Math.max(pUp, pDown);
-            let strength = 'weak';
-            if (maxP > 0.85) strength = 'strong';
-            else if (maxP > 0.70) strength = 'moderate';
-            return {
-              pUp: +pUp.toFixed(4),
-              pDown: +pDown.toFixed(4),
-              signal: pUp > 0.55 ? 1 : pUp < 0.45 ? -1 : 0,
-              direction: pUp > 0.55
-                ? 'bullish'
-                : pUp < 0.45 ? 'bearish' : 'neutral',
-              strength
-            };
-          }
-
-          // ================================================================
-          //  COMPOSITE: Run all 6 trade tests for one symbol
-          // ================================================================
-          function analyzeTradesForSymbol(trades) {
-            const sorted = trades.slice().sort(
-              (a, b) => a.closedAt - b.closedAt
-            );
-            const t1 = T1_directionConsensus(sorted);
-            const t2 = T2_entryExitSlope(sorted);
-            const t3 = T3_lossAcceleration(sorted);
-            const t4 = T4_sideAsymmetry(sorted);
-            const t6 = T6_bayesianPosterior(sorted);
-            const t5 = T5_displacementSkew(sorted);
-
-            const mvBps = sorted.map(t => (t.exitPrice / t.entryPrice - 1) * 1e4);
-            const sdMv = std(mvBps);
-            const tMove = (mvBps.length >= 4 && sdMv > 0) ? mean(mvBps) / (sdMv / Math.sqrt(mvBps.length)) : 0;
-
-            const signals = [
-              { v: t1.score,                                    w: 0.25 },
-              { v: t2.entry.significant
-                    ? Math.tanh(t2.entry.tStat / 3) : 0,       w: 0.20 },
-              { v: (t3.impliedTrend === 'bearish' ? -1 : 1)
-                    * 0.5
-                    * Math.min(3, t3.consecutiveSameDirLosses)
-                    / 3,                                        w: 0.15 },
-              { v: t4.asymmetry,                                w: 0.15 },
-              { v: Math.tanh(tMove / 3),                        w: 0.10 },
-              { v: (t6.pUp - 0.5) * 2,                         w: 0.15 }
-            ];
-            let wS = 0, sS = 0;
-            for (const s of signals) { sS += s.v * s.w; wS += s.w; }
-            const composite = wS > 0 ? sS / wS : 0;
-
-            const entryPrices = sorted.map(t => t.entryPrice);
-            const exitPrices = sorted.map(t => t.exitPrice);
-
-            return {
-              n_trades: sorted.length,
-              first_trade_ts: sorted[0]?.closedAt || 0,
-              last_trade_ts: sorted.at(-1)?.closedAt || 0,
-              entry_prices: entryPrices.slice(-8).map(p => +p.toFixed(6)),
-              exit_prices: exitPrices.slice(-8).map(p => +p.toFixed(6)),
-              t1_direction_consensus: t1,
-              t2_entry_exit_slope: t2,
-              t3_loss_acceleration: t3,
-              t4_side_asymmetry: t4,
-              t5_displacement_skew: t5,
-              t6_bayesian_posterior: t6,
-              composite_trade_trend: +composite.toFixed(4),
-              trade_direction: composite > 0.15
-                ? 'bullish'
-                : composite < -0.15 ? 'bearish' : 'neutral'
-            };
-          }
-
-          // ================================================================
-          //  BYBIT PUBLIC KLINE FETCHER
-          // ================================================================
-          async function getBybitKlines(symbol, interval, limit = 200) {
-            const url = `${BYBIT_PUBLIC}/v5/market/kline`
-              + `?category=linear&symbol=${symbol}`
-              + `&interval=${interval}&limit=${limit}`;
-            try {
-              const data = await fetchRetry(url, 2, 400);
-              if (!data?.result?.list?.length) return [];
-              let list = data.result.list;
-              if (list.length > 1) list.shift(); // remove unfinished current candle
-              return list.reverse().map(k => ({
-                ts: +k[0],
-                open: +k[1],
-                high: +k[2],
-                low: +k[3],
-                close: +k[4],
-                volume: +k[5]
-              }));
-            } catch (e) {
-              log(`kline err ${symbol} ${interval}:`, e?.message);
-              return [];
-            }
-          }
-
           async function getBybitTicker(symbol) {
-            const url = `${BYBIT_PUBLIC}/v5/market/tickers`
-              + `?category=linear&symbol=${symbol}`;
+            const url = `${BYBIT_PUBLIC}/v5/market/tickers?category=linear&symbol=${symbol}`;
             try {
               const data = await fetchRetry(url, 2, 300);
               const t = data?.result?.list?.[0];
@@ -650,10 +159,7 @@ jobs:
                 lastPrice: +t.lastPrice,
                 bid: +t.bid1Price,
                 ask: +t.ask1Price,
-                volume24h: +t.volume24h,
                 turnover24h: +t.turnover24h,
-                highPrice24h: +t.highPrice24h,
-                lowPrice24h: +t.lowPrice24h,
                 fundingRate: +t.fundingRate,
                 openInterest: +t.openInterest
               };
@@ -661,955 +167,123 @@ jobs:
           }
 
           // ================================================================
-          //  BINANCE SYMBOL VALIDATION
+          //  CORE: direction from entry/exit of ALL trades + current price
           // ================================================================
-          async function getBinanceFuturesSymbols() {
-            const url = 'https://fapi.astiagbiance.dpdns.org/fapi/v1/exchangeInfo';
-            try {
-              const data = await fetchRetry(url, 2, 500);
-              const set = new Set();
-              for (const s of data?.symbols || []) {
-                if (s.status === 'TRADING' && s.contractType === 'PERPETUAL') {
-                  set.add(s.symbol);
-                }
+          // direction = 'long' | 'short' | 'neutral'
+          function computeDirection(trades, currentPrice) {
+            if (!trades.length) return { direction: 'neutral', reason: 'no_trades', avgMoveBps: 0 };
+
+            const dirs = trades.map(t => Math.sign(t.exitPrice - t.entryPrice));
+            const allUp = dirs.every(d => d > 0);
+            const allDown = dirs.every(d => d < 0);
+
+            if (!allUp && !allDown) {
+              return { direction: 'neutral', reason: 'mixed_trades', avgMoveBps: 0 };
+            }
+
+            const moves = trades.map(t => (t.exitPrice / t.entryPrice - 1) * 10000);
+            const avgMoveBps = mean(moves);
+            const lastExit = trades.at(-1).exitPrice;
+
+            if (allUp) {
+              // confirm price is still rising past the last exit
+              if (currentPrice > lastExit) {
+                return { direction: 'long', reason: 'all_up_confirmed', avgMoveBps };
               }
-              return set;
-            } catch (e) {
-              log('Binance exchangeInfo fetch failed:', e?.message);
-              return null;
+              return { direction: 'neutral', reason: 'all_up_not_confirmed', avgMoveBps };
             }
-          }
 
-          // ================================================================
-          //  KLINE TEST K1: OLS Drift on Log Returns
-          // ================================================================
-          function K1_olsRegression(klines) {
-            if (klines.length < 10) return { slope_bps: 0, tStat: 0, r2: 0, significant: false, signal: 0 };
-            const lc = klines.map(k => Math.log(k.close));
-            const r = lc.slice(1).map((x, i) => x - lc[i]);
-            const s = std(r);
-            const t = s > 0 ? mean(r) / (s / Math.sqrt(r.length)) : 0;
-            const info = olsSlope(lc);
-            return { slope_bps: +(info.slope * 1e4).toFixed(2), tStat: +t.toFixed(3), r2: info.r2,
-                     significant: Math.abs(t) > 2, signal: +Math.tanh(t / 3).toFixed(4) };
-          }
-
-          // ================================================================
-          //  KLINE TEST K2: Hurst Exponent (Rescaled Range)
-          // ================================================================
-          function K2_hurstExponent(klines) {
-            const closes = klines.map(k => k.close);
-            const n = closes.length;
-            if (n < 20) return {
-              H: 0.5, interpretation: 'insufficient', signal: 0
-            };
-
-            const rets = [];
-            for (let i = 1; i < n; i++)
-              rets.push(Math.log(closes[i] / closes[i - 1]));
-
-            const windowSizes = [];
-            for (
-              let w = 8;
-              w <= Math.floor(rets.length / 2);
-              w = Math.floor(w * 1.5)
-            ) {
-              if (w > windowSizes.at(-1) || windowSizes.length === 0)
-                windowSizes.push(w);
-            }
-            if (windowSizes.length < 3) return {
-              H: 0.5, interpretation: 'insufficient', signal: 0
-            };
-
-            const expRS = n => { 
-              let s = 0; 
-              for (let i = 1; i < n; i++) s += Math.sqrt((n - i) / i);
-              return ((n - 0.5) / n) * Math.pow(n * Math.PI / 2, -0.5) * s; 
-            };
-
-            const logN = [], logRS = [];
-            for (const w of windowSizes) {
-              const nBlocks = Math.floor(rets.length / w);
-              if (nBlocks < 1) continue;
-              let rsSum = 0, valid = 0;
-              for (let b = 0; b < nBlocks; b++) {
-                const block = rets.slice(b * w, (b + 1) * w);
-                const m = mean(block);
-                const s = std(block);
-                if (s < 1e-12) continue;
-                let cumDev = 0, maxD = -Infinity, minD = Infinity;
-                for (const x of block) {
-                  cumDev += (x - m);
-                  if (cumDev > maxD) maxD = cumDev;
-                  if (cumDev < minD) minD = cumDev;
-                }
-                rsSum += (maxD - minD) / s;
-                valid++;
+            if (allDown) {
+              // confirm price is still falling past the last exit
+              if (currentPrice < lastExit) {
+                return { direction: 'short', reason: 'all_down_confirmed', avgMoveBps };
               }
-              if (valid > 0) {
-                logN.push(Math.log(w));
-                logRS.push(Math.log((rsSum / valid) / expRS(w)));
-              }
+              return { direction: 'neutral', reason: 'all_down_not_confirmed', avgMoveBps };
             }
 
-            if (logN.length < 3) return {
-              H: 0.5, interpretation: 'insufficient', signal: 0
-            };
-
-            const mX = mean(logN), mY = mean(logRS);
-            let num = 0, den = 0;
-            for (let i = 0; i < logN.length; i++) {
-              num += (logN[i] - mX) * (logRS[i] - mY);
-              den += (logN[i] - mX) ** 2;
-            }
-            const H = den > 0 ? 0.5 + num / den : 0.5;
-            const Hc = clamp(H, 0.01, 0.99);
-
-            let interpretation = 'random_walk';
-            if (Hc > 0.55) interpretation = 'trending';
-            else if (Hc < 0.45) interpretation = 'mean_reverting';
-
-            return {
-              H: +Hc.toFixed(4),
-              interpretation,
-              signal: +((Hc - 0.5) * 4).toFixed(4)
-            };
+            return { direction: 'neutral', reason: 'unknown', avgMoveBps: 0 };
           }
 
           // ================================================================
-          //  KLINE TEST K3: Mann-Kendall Trend Test
+          //  NORMALIZE TRADES FROM A WORKER
           // ================================================================
-          function K3_mannKendall(klines) {
-            const c = klines.map(k => k.close);
-            const n = c.length;
-            if (n < 8) return {
-              tau: 0, z: 0, significant: false, signal: 0
-            };
+          // Worker 1 schema (Bybit-style: side may need flip-correction)
+          function normalizeWorker1Trades(pnlData) {
+            const bySymbol = {};
+            for (const t of pnlData) {
+              if (!t.symbol) continue;
+              const entryPrice = +t.entryPrice || +t.avgEntryPrice || 0;
+              const exitPrice  = +t.exitPrice  || +t.avgExitPrice  || 0;
+              const ms = v => (v > 0 && v < 1e11) ? v * 1000 : v;
+              const closedAt   = ms(+t.closedAt || +t.updatedTime || 0);
 
-            let S = 0;
-            const MAX_PAIRS = 50000;
-            const totalPairs = n * (n - 1) / 2;
+              if (!(entryPrice > 0 && exitPrice > 0 && closedAt > 0)) continue;
+              if (Date.now() - closedAt > MAX_AGE_H * 3600e3) continue;
 
-            if (totalPairs <= MAX_PAIRS) {
-              for (let i = 0; i < n - 1; i++)
-                for (let j = i + 1; j < n; j++)
-                  S += Math.sign(c[j] - c[i]);
-            } else {
-              for (let p = 0; p < MAX_PAIRS; p++) {
-                const i = Math.floor(Math.random() * n);
-                let j = Math.floor(Math.random() * n);
-                while (j === i) j = Math.floor(Math.random() * n);
-                if (i < j) S += Math.sign(c[j] - c[i]);
-                else S += Math.sign(c[i] - c[j]);
-              }
-              S = Math.round(S * (totalPairs / MAX_PAIRS));
+              if (!bySymbol[t.symbol]) bySymbol[t.symbol] = [];
+              bySymbol[t.symbol].push({ entryPrice, exitPrice, closedAt });
             }
-
-            const tau = 2 * S / (n * (n - 1));
-            const varS = n * (n - 1) * (2 * n + 5) / 18;
-            const z = S > 0
-              ? (S - 1) / Math.sqrt(varS)
-              : S < 0
-                ? (S + 1) / Math.sqrt(varS)
-                : 0;
-            return {
-              tau: +tau.toFixed(4),
-              z: +z.toFixed(3),
-              significant: Math.abs(z) > 1.96,
-              signal: +clamp(tau * 1.5, -1, 1).toFixed(4)
-            };
+            for (const sym of Object.keys(bySymbol)) {
+              bySymbol[sym].sort((a, b) => a.closedAt - b.closedAt);
+            }
+            return bySymbol;
           }
 
-          // ================================================================
-          //  KLINE TEST K4: Variance Ratio Test
-          // ================================================================
-          function K4_varianceRatio(klines) {
-            const closes = klines.map(k => k.close);
-            const n = closes.length;
-            if (n < 20) return {
-              VR: 1, z: 0, interpretation: 'insufficient',
-              signal: 0, details: {}
-            };
+          // Worker 2 schema (native entryPrice/exitPrice/time)
+          function normalizeWorker2Trades(pnlData2) {
+            const bySymbol = {};
+            for (const t of pnlData2) {
+              if (!t.symbol) continue;
+              const entryPrice = +t.entryPrice || 0;
+              const exitPrice  = +t.exitPrice  || 0;
+              const closedAt   = +t.time || 0;
 
-            const rets = [];
-            for (let i = 1; i < n; i++)
-              rets.push(Math.log(closes[i] / closes[i - 1]));
+              if (!(entryPrice > 0 && exitPrice > 0 && closedAt > 0)) continue;
+              if (Date.now() - closedAt > MAX_AGE_H * 3600e3) continue;
 
-            const mu = mean(rets);
-            const sigma2 = rets.reduce(
-              (s, r) => s + (r - mu) ** 2, 0
-            ) / (rets.length - 1);
-            if (sigma2 < 1e-16) return {
-              VR: 1, z: 0, interpretation: 'no_variance',
-              signal: 0, details: {}
-            };
-
-            const qs = [2, 5, 10];
-            let vrAvg = 0, zAvg = 0, cnt = 0;
-            const details = {};
-
-            for (const q of qs) {
-              if (rets.length < q * 3) continue;
-              const qRets = [];
-              for (let i = q; i < rets.length; i++) {
-                let s = 0;
-                for (let j = 0; j < q; j++) s += rets[i - j];
-                qRets.push(s);
-              }
-              const muQ = mean(qRets);
-              const sigmaQ2 = qRets.reduce(
-                (s, r) => s + (r - muQ) ** 2, 0
-              ) / (qRets.length - 1);
-              const vr = sigmaQ2 / (q * sigma2);
-              const nq = rets.length;
-              const varVR = 2 * (2 * q - 1) * (q - 1)
-                / (3 * q * nq);
-              const zVR = (vr - 1) / Math.sqrt(
-                Math.max(varVR, 1e-9)
-              );
-              details[`q${q}`] = {
-                VR: +vr.toFixed(4), z: +zVR.toFixed(3)
-              };
-              vrAvg += vr; zAvg += zVR; cnt++;
+              if (!bySymbol[t.symbol]) bySymbol[t.symbol] = [];
+              bySymbol[t.symbol].push({ entryPrice, exitPrice, closedAt });
             }
-
-            vrAvg = cnt > 0 ? vrAvg / cnt : 1;
-            zAvg = cnt > 0 ? zAvg / cnt : 0;
-
-            let interpretation = 'random_walk';
-            if (vrAvg > 1.05 && Math.abs(zAvg) > 1.5)
-              interpretation = 'momentum';
-            else if (vrAvg < 0.95 && Math.abs(zAvg) > 1.5)
-              interpretation = 'mean_reversion';
-
-            return {
-              VR: +vrAvg.toFixed(4),
-              z: +zAvg.toFixed(3),
-              interpretation,
-              signal: +Math.tanh((vrAvg - 1) * 5).toFixed(4),
-              details
-            };
-          }
-
-          // ================================================================
-          //  KLINE TEST K5: ADX + Directional Indicators
-          // ================================================================
-          function K5_adxDI(klines, period = 14) {
-            const n = klines.length;
-            if (n < period + 2) return {
-              adx: 0, plusDI: 0, minusDI: 0,
-              atr: 0, atr_bps: 0,
-              direction: 'neutral', strength: 'none',
-              signal: 0
-            };
-
-            const h = klines.map(k => k.high);
-            const l = klines.map(k => k.low);
-            const c = klines.map(k => k.close);
-
-            const TR = [], plusDM = [], minusDM = [];
-            for (let i = 1; i < n; i++) {
-              const up = h[i] - h[i - 1];
-              const down = l[i - 1] - l[i];
-              plusDM.push(up > down && up > 0 ? up : 0);
-              minusDM.push(down > up && down > 0 ? down : 0);
-              TR.push(Math.max(
-                h[i] - l[i],
-                Math.abs(h[i] - c[i - 1]),
-                Math.abs(l[i] - c[i - 1])
-              ));
+            for (const sym of Object.keys(bySymbol)) {
+              bySymbol[sym].sort((a, b) => a.closedAt - b.closedAt);
             }
-
-            let trN = 0, pdmN = 0, ndmN = 0;
-            for (let i = 0; i < period; i++) {
-              trN += TR[i]; pdmN += plusDM[i]; ndmN += minusDM[i];
-            }
-
-            let pDI = 100 * pdmN / (trN || 1);
-            let nDI = 100 * ndmN / (trN || 1);
-            let dx = 100 * Math.abs(pDI - nDI) / ((pDI + nDI) || 1);
-            let adx = dx;
-
-            for (let i = period; i < TR.length; i++) {
-              trN = trN - trN / period + TR[i];
-              pdmN = pdmN - pdmN / period + plusDM[i];
-              ndmN = ndmN - ndmN / period + minusDM[i];
-              pDI = 100 * pdmN / (trN || 1);
-              nDI = 100 * ndmN / (trN || 1);
-              dx = 100 * Math.abs(pDI - nDI)
-                / ((pDI + nDI) || 1);
-              adx = ((adx * (period - 1)) + dx) / period;
-            }
-
-            const atr = trN / period;
-            const direction = pDI > nDI ? 1 : -1;
-            let strength = 'none';
-            if (adx >= 40) strength = 'strong';
-            else if (adx >= 25) strength = 'developing';
-            else if (adx >= 20) strength = 'weak';
-
-            const signal = Math.max(0, Math.tanh((adx - 20) / 20)) * direction;
-
-            return {
-              adx: +adx.toFixed(2),
-              plusDI: +pDI.toFixed(2),
-              minusDI: +nDI.toFixed(2),
-              atr: +atr.toFixed(8),
-              atr_bps: c.at(-1) > 0
-                ? Math.round(atr / c.at(-1) * 10000) : 0,
-              direction: direction > 0 ? 'bullish' : 'bearish',
-              strength,
-              signal: +signal.toFixed(4)
-            };
-          }
-
-          // ================================================================
-          //  KLINE TEST K6: 2D Kalman Filter (Price + Velocity)
-          // ================================================================
-          function K6_kalmanTrend(klines) {
-            const closes = klines.map(k => k.close);
-            const n = closes.length;
-            if (n < 10) return {
-              velocity: 0, velocityBps: 0,
-              acceleration: 0, accelerating: 'flat',
-              signal: 0
-            };
-
-            const lc = closes.map(Math.log);
-            const rets = lc.slice(1).map((x, i) => x - lc[i]);
-            const R = Math.max(1e-10, std(rets) ** 2);
-            const Q_x = R * 0.1, Q_v = R * 0.001;
-            
-            let x = lc[0], v = 0, pX = R * 10, pV = R, pXV = 0;
-            const velocities = [];
-
-            for (let i = 1; i < n; i++) {
-              const xP = x + v;
-              const vP = v;
-              const pXP = pX + 2 * pXV + pV + Q_x;
-              const pVP = pV + Q_v;
-              const pXVP = pXV + pV;
-
-              const z = lc[i];
-              const innov = z - xP;
-              const S = pXP + R;
-              const Kx = pXP / S;
-              const Kv = pXVP / S;
-
-              x = xP + Kx * innov;
-              v = vP + Kv * innov;
-              pX = (1 - Kx) * pXP;
-              pV = pVP - Kv * pXVP;
-              pXV = (1 - Kx) * pXVP;
-
-              velocities.push(v);
-            }
-
-            const lastV = velocities.at(-1) || 0;
-            const vBps = lastV * 10000;
-
-            const recentV = velocities.slice(-10);
-            let accel = 0;
-            if (recentV.length >= 3) {
-              accel = (recentV.at(-1) - recentV[0])
-                / recentV.length;
-            }
-            const accelBps = accel * 10000;
-
-            return {
-              velocity: +lastV.toFixed(8),
-              velocityBps: +vBps.toFixed(2),
-              acceleration: +accelBps.toFixed(4),
-              accelerating: accelBps > 0.5
-                ? 'up'
-                : accelBps < -0.5 ? 'down' : 'flat',
-              signal: +Math.tanh(lastV / Math.sqrt(R) * 3).toFixed(4)
-            };
-          }
-
-          // ================================================================
-          //  RSI 
-          // ================================================================
-          function rsi(closes, period = 14) {
-            if (closes.length <= period) return 50;
-            let g = 0, l = 0;
-            for (let i = 1; i <= period; i++) {
-              const d = closes[i] - closes[i - 1];
-              if (d > 0) g += d; else l -= d;
-            }
-            let ag = g / period, al = l / period;
-            for (let i = period + 1; i < closes.length; i++) {
-              const d = closes[i] - closes[i - 1];
-              ag = (ag * (period - 1) + Math.max(0, d)) / period;
-              al = (al * (period - 1) + Math.max(0, -d)) / period;
-            }
-            return al === 0
-              ? 100
-              : +(100 - 100 / (1 + ag / al)).toFixed(2);
-          }
-
-          // ================================================================
-          //  COMPOSITE: All 6 kline tests for one timeframe
-          // ================================================================
-          function analyzeKlinesForTF(klines) {
-            if (!klines || klines.length < 10) return null;
-
-            const k1 = K1_olsRegression(klines);
-            const k2 = K2_hurstExponent(klines);
-            const k3 = K3_mannKendall(klines);
-            const k4 = K4_varianceRatio(klines);
-            const k5 = K5_adxDI(klines);
-            const k6 = K6_kalmanTrend(klines);
-            const closes = klines.map(k => k.close);
-            const rsi14 = rsi(closes, 14);
-
-            const dirSignals = [
-              { v: k1.signal, w: 0.30 }, { v: k3.signal, w: 0.20 },
-              { v: k5.signal, w: 0.25 }, { v: k6.signal, w: 0.25 }
-            ];
-            let wS = 0, sS = 0;
-            for (const s of dirSignals) { sS += s.v * s.w; wS += s.w; }
-            const dirComp = wS > 0 ? sS / wS : 0;
-            
-            // persistence scales conviction, never direction
-            const persist = clamp(1 + 0.5 * (0.6 * k2.signal + 0.4 * k4.signal), 0.5, 1.3);
-            const composite = clamp(dirComp * persist, -1, 1);
-
-            return {
-              k1_ols: k1,
-              k2_hurst: k2,
-              k3_mann_kendall: k3,
-              k4_variance_ratio: k4,
-              k5_adx_di: k5,
-              k6_kalman: k6,
-              rsi: rsi14,
-              composite: +composite.toFixed(4),
-              lastClose: closes.at(-1),
-              lastTs: klines.at(-1).ts
-            };
-          }
-
-          // ================================================================
-          //  MULTI-TIMEFRAME AGGREGATION
-          // ================================================================
-          function analyzeKlinesMultiTF(tfData) {
-            const weights = {
-              '5': 0.10, '15': 0.15, '60': 0.25, '240': 0.30
-            };
-            const perTF = {};
-            let wS = 0, sS = 0;
-            const dirs = [];
-
-            for (const [tf, klines] of Object.entries(tfData)) {
-              const a = analyzeKlinesForTF(klines);
-              if (!a) continue;
-              perTF[tf] = a;
-              const w = weights[tf] || 0.15;
-              sS += a.composite * w;
-              wS += w;
-              dirs.push(Math.sign(a.composite));
-            }
-
-            const composite = wS > 0 ? sS / wS : 0;
-            const nTFs = dirs.length;
-            const agreeing = dirs.filter(
-              d => d === Math.sign(composite)
-            ).length;
-            const tfAlignment = nTFs > 0 ? agreeing / nTFs : 0;
-
-            let regime = 'ranging';
-            if (Math.abs(composite) > 0.5 && tfAlignment >= 0.8)
-              regime = composite > 0
-                ? 'strong_uptrend' : 'strong_downtrend';
-            else if (Math.abs(composite) > 0.25)
-              regime = composite > 0
-                ? 'weak_uptrend' : 'weak_downtrend';
-
-            const hurstVals = Object.values(perTF)
-              .map(a => a.k2_hurst.H).filter(h => h > 0);
-            const avgHurst = hurstVals.length > 0
-              ? mean(hurstVals) : 0.5;
-            const meanReverting = avgHurst < 0.45
-              && hurstVals.filter(h => h < 0.45).length
-                > hurstVals.length / 2;
-
-            return {
-              perTF,
-              composite: +composite.toFixed(4),
-              tfAlignment: +tfAlignment.toFixed(2),
-              regime,
-              avgHurst: +avgHurst.toFixed(4),
-              meanReverting,
-              direction: composite > 0.15
-                ? 'bullish'
-                : composite < -0.15 ? 'bearish' : 'neutral'
-            };
-          }
-
-          // ================================================================
-          //  PHASE 5: CROSS-VALIDATION
-          // ================================================================
-          function crossValidate(tradeAnalysis, klineAnalysis) {
-            const tDir = tradeAnalysis?.trade_direction || 'neutral';
-            const kDir = klineAnalysis?.direction || 'neutral';
-            const tScore = tradeAnalysis?.composite_trade_trend || 0;
-            const kScore = klineAnalysis?.composite || 0;
-
-            let agreement = 'none';
-            let confAdj = 0;
-
-            if (tDir === 'neutral' && kDir === 'neutral') {
-              agreement = 'both_neutral';
-              confAdj = -15;
-            } else if (tDir === 'neutral') {
-              agreement = 'kline_only';
-              confAdj = -5;
-            } else if (kDir === 'neutral') {
-              agreement = 'trade_only';
-              confAdj = -5;
-            } else if (tDir === kDir) {
-              agreement = 'AGREE';
-              confAdj = +25;
-            } else {
-              agreement = 'DISAGREE';
-              confAdj = -20;
-            }
-
-            const finalScore = tScore * 0.40 + kScore * 0.60;
-
-            let finalDirection = 'neutral';
-            if (Math.abs(finalScore) > 0.15)
-              finalDirection = finalScore > 0
-                ? 'bullish' : 'bearish';
-
-            return {
-              trade_direction: tDir,
-              trade_score: +tScore.toFixed(4),
-              kline_direction: kDir,
-              kline_score: +kScore.toFixed(4),
-              agreement,
-              confidence_adjustment: confAdj,
-              final_score: +finalScore.toFixed(4),
-              final_direction: finalDirection
-            };
-          }
-
-          // ================================================================
-          //  PHASE 6: IDEA GENERATION
-          // ================================================================
-          function generateIdea(
-            symbol, tradeA, klineA, crossVal, ticker
-          ) {
-            if (!crossVal || crossVal.final_direction === 'neutral')
-              return null;
-            if (crossVal.agreement === 'DISAGREE') return null;
-
-            const side = crossVal.final_direction === 'bullish'
-              ? 'long' : 'short';
-            const mid = ticker?.lastPrice
-              || klineA?.perTF?.['60']?.lastClose || 0;
-            if (mid <= 0) return null;
-
-            const atrBps = klineA?.perTF?.['60']?.k5_adx_di?.atr_bps
-              || klineA?.perTF?.['15']?.k5_adx_di?.atr_bps || 50;
-
-            const hurst = klineA?.avgHurst || 0.5;
-            const meanRev = klineA?.meanReverting || false;
-            if (meanRev) return null;
-
-            const lossA = tradeA?.t3_loss_acceleration;
-            const accelTrend = lossA?.ttslTrend || 'stable';
-            const consLosses = lossA?.consecutiveSameDirLosses || 0;
-            const lastLossDir = lossA?.lastLossDir || null;
-
-            if (consLosses >= 2) {
-              const longBlocked =
-                side === 'long'
-                && lastLossDir === 'long_loss';
-              const shortBlocked =
-                side === 'short'
-                && lastLossDir === 'short_loss';
-              if (longBlocked || shortBlocked) {
-                return null;
-              }
-            }
-
-            let tpMult, slMult, style;
-            if (
-              Math.abs(crossVal.final_score) > 0.5
-              && hurst > 0.55
-            ) {
-              tpMult = 1.5; slMult = 0.75;
-              style = 'strong_trend';
-            } else {
-              tpMult = 1.0; slMult = 0.6;
-              style = 'weak_trend';
-            }
-
-            if (accelTrend === 'accelerating') {
-              tpMult *= 1.2;
-            } else if (accelTrend === 'exhausting') {
-              tpMult *= 0.8;
-            }
-
-            const avgLossBps = Math.round(lossA?.avgLossBps || 0);
-            let tp_bps = Math.round(atrBps * tpMult);
-            let sl_bps = Math.round(atrBps * slMult);
-
-            if (avgLossBps > 0 && sl_bps < avgLossBps * 0.8) {
-              sl_bps = Math.round(avgLossBps * 0.8);
-            }
-
-            sl_bps = Math.min(sl_bps, MAX_SL_BPS);
-            tp_bps = Math.max(tp_bps, Math.round(sl_bps * 1.5));
-            const rrr = +(tp_bps / Math.max(1, sl_bps)).toFixed(2);
-
-            const spread = (ticker && ticker.ask > 0 && ticker.bid > 0)
-              ? Math.abs(ticker.ask - ticker.bid) : 0;
-            const spreadBps = mid > 0
-              ? Math.round(spread / mid * 10000) : 0;
-            let entry;
-            if (side === 'long') {
-              entry = mid - spread * 0.3;
-            } else {
-              entry = mid + spread * 0.3;
-            }
-
-            let tp_abs, sl_abs;
-            if (side === 'long') {
-              tp_abs = entry * (1 + tp_bps / 10000);
-              sl_abs = entry * (1 - sl_bps / 10000);
-            } else {
-              tp_abs = entry * (1 - tp_bps / 10000);
-              sl_abs = entry * (1 + sl_bps / 10000);
-            }
-
-            entry = +entry.toPrecision(7);
-            tp_abs = +tp_abs.toPrecision(7);
-            sl_abs = +sl_abs.toPrecision(7);
-
-            const sideStats = side === 'long'
-              ? tradeA?.t4_side_asymmetry?.long
-              : tradeA?.t4_side_asymmetry?.short;
-            const histN = sideStats?.total || 0;
-            const histWR = histN >= 3 ? sideStats.wr_lcb : 0.40;
-
-            const baseConf = Math.abs(crossVal.final_score) * 50;
-            const tfAlignB = (klineA?.tfAlignment || 0) * 20;
-            const hurstB = hurst > 0.65
-              ? 15 : hurst > 0.55
-                ? 10 : hurst > 0.50 ? 5 : 0;
-            const histB = Math.max(0, (histWR - 0.5)) * 30;
-            const crossB = crossVal.confidence_adjustment || 0;
-            const spreadP = Math.max(0, (spreadBps - 5) * 2);
-
-            let lossAccelB = 0;
-            if (
-              accelTrend === 'accelerating'
-              && consLosses >= 2
-            ) {
-              const sideMatchesTrend =
-                (side === 'short'
-                  && lossA?.impliedTrend === 'bearish')
-                || (side === 'long'
-                  && lossA?.impliedTrend === 'bullish');
-              if (sideMatchesTrend) lossAccelB = 10;
-            }
-
-            const bayesB =
-              tradeA?.t6_bayesian_posterior?.strength === 'strong'
-                ? 8
-                : tradeA?.t6_bayesian_posterior?.strength === 'moderate'
-                  ? 4 : 0;
-
-            const confidence = Math.round(clamp(
-              baseConf + tfAlignB + hurstB + histB
-              + crossB + lossAccelB + bayesB - spreadP,
-              0, 100
-            ));
-
-            if (confidence < MIN_CONFIDENCE) return null;
-
-            const pWin = clamp(
-              histWR * 0.5 + (confidence / 100) * 0.5,
-              0.30, 0.80
-            );
-            const b = rrr;
-            const q = 1 - pWin;
-            const kellyFull = (pWin * b - q) / b;
-            const kellyFrac = kellyFull > 0
-              ? kellyFull * 0.25 : 0;
-            const size_bps = kellyFrac > 0
-              ? clamp(Math.round(kellyFrac * 10000), 10, 200)
-              : 0;
-            if (size_bps < 10) return null;
-
-            const ev_bps = Math.round(
-              pWin * tp_bps - q * sl_bps - 10
-            );
-
-            if (tp_bps < 25 || ev_bps <= 0) return null;
-
-            const adxByTF = {};
-            for (const [tf, a] of Object.entries(
-              klineA?.perTF || {}
-            )) {
-              adxByTF[tf] = a?.k5_adx_di?.adx || 0;
-            }
-            const domTF = Object.entries(adxByTF)
-              .sort((a, b) => b[1] - a[1])[0]?.[0] || '60';
-            const ttl_sec = TTL_MAP[domTF] || 3600;
-
-            const reasons = [];
-
-            if (crossVal.agreement === 'AGREE') {
-              reasons.push(
-                `Trades + klines AGREE: ${crossVal.final_direction}`
-              );
-            }
-
-            if (hurst > 0.55) {
-              reasons.push(
-                `Hurst ${klineA.avgHurst} → trendable`
-              );
-            } else if (hurst < 0.45) {
-              reasons.push(
-                `Hurst ${klineA.avgHurst} → mean-reverting`
-              );
-            }
-
-            const ols1h = klineA?.perTF?.['60']?.k1_ols;
-            if (ols1h?.significant) {
-              reasons.push(
-                `1h OLS: slope=${ols1h.slope_bps}bps t=${ols1h.tStat}`
-              );
-            }
-
-            const bayes = tradeA?.t6_bayesian_posterior;
-            if (bayes?.strength !== 'weak') {
-              const pMax = Math.max(bayes.pUp, bayes.pDown);
-              reasons.push(
-                `Bayesian P(${bayes.direction})=${pMax.toFixed(2)} [${bayes.strength}]`
-              );
-            }
-
-            if (consLosses >= 2) {
-              reasons.push(
-                `${consLosses} consecutive ${lastLossDir}s → `
-                + `${lossA.impliedTrend}`
-              );
-            }
-
-            if (accelTrend !== 'stable') {
-              reasons.push(
-                `Loss velocity ${accelTrend}`
-                + ` (TTSL: ${(lossA?.ttslValues || []).join(' → ')} min)`
-              );
-            }
-
-            if (lossA?.lossMagnitudeTrend && lossA.lossMagnitudeTrend !== 'stable' && lossA.avgLoss > 0) {
-              reasons.push(
-                `Loss sizes ${lossA.lossMagnitudeTrend}`
-                + ` (avg $${lossA.avgLoss.toFixed(2)})`
-              );
-            }
-
-            if (tradeA?.t2_entry_exit_slope?.agree) {
-              reasons.push(
-                `Entry+exit slopes agree: `
-                + `${tradeA.t2_entry_exit_slope.entry.slope_bps}bps/trade`
-              );
-            }
-
-            const mk1h = klineA?.perTF?.['60']?.k3_mann_kendall;
-            if (mk1h?.significant) {
-              reasons.push(
-                `Mann-Kendall τ=${mk1h.tau} z=${mk1h.z}`
-              );
-            }
-
-            const asym = tradeA?.t4_side_asymmetry;
-            if (asym?.bestSide !== 'neutral') {
-              const wr = side === 'long'
-                ? asym.long.wr_lcb : asym.short.wr_lcb;
-              reasons.push(
-                `${asym.bestSide} historically better `
-                + `(WR_LCB=${wr})`
-              );
-            }
-
-            if (asym?.lossSizeAsymmetry
-              && Math.abs(asym.lossSizeAsymmetry) > 0.2
-            ) {
-              const bigger = asym.lossSizeAsymmetry > 0
-                ? 'long' : 'short';
-              reasons.push(
-                `${bigger} losses bigger → `
-                + `${bigger === 'long' ? 'bearish' : 'bullish'}`
-              );
-            }
-
-            const kf = klineA?.perTF?.['60']?.k6_kalman;
-            if (kf && Math.abs(kf.velocityBps) > 2) {
-              reasons.push(
-                `Kalman vel=${kf.velocityBps > 0 ? '+' : ''}`
-                + `${kf.velocityBps}bps (${kf.accelerating})`
-              );
-            }
-
-            const vr = klineA?.perTF?.['60']?.k4_variance_ratio;
-            if (vr && !['random_walk', 'insufficient', 'no_variance'].includes(vr.interpretation)) {
-              reasons.push(
-                `Var.Ratio: ${vr.interpretation} `
-                + `(VR=${vr.VR})`
-              );
-            }
-
-            const skew = tradeA?.t5_displacement_skew;
-            if (skew?.interpretation !== 'symmetric'
-              && skew?.interpretation !== 'insufficient'
-            ) {
-              reasons.push(
-                `Displacement skew: ${skew.interpretation} `
-                + `(${skew.skewness.toFixed(2)})`
-              );
-            }
-
-            if (ticker?.fundingRate
-              && Math.abs(ticker.fundingRate) > 0.0003
-            ) {
-              const fdDir = ticker.fundingRate > 0
-                ? 'longs pay' : 'shorts pay';
-              reasons.push(
-                `Funding ${(ticker.fundingRate * 100).toFixed(4)}% `
-                + `(${fdDir})`
-              );
-            }
-
-            return {
-              symbol,
-              base: symbol.replace('USDT', ''),
-              quote: 'USDT',
-              side,
-              style,
-              confidence,
-              regime: klineA?.regime || 'unknown',
-              hurst: klineA?.avgHurst || 0.5,
-              mean_reverting: meanRev,
-              entry,
-              tp_abs,
-              sl_abs,
-              tp_bps,
-              sl_bps,
-              rrr,
-              ev_bps,
-              p_win: +pWin.toFixed(3),
-              size_bps,
-              ttl_sec,
-              spread_bps: spreadBps,
-              funding_rate: ticker?.fundingRate || 0,
-              volume_24h: ticker?.turnover24h || 0,
-              open_interest: ticker?.openInterest || 0,
-              cross_validation: crossVal,
-              trade_tests_summary: {
-                n_trades: tradeA?.n_trades || 0,
-                direction_consensus:
-                  tradeA?.t1_direction_consensus?.score || 0,
-                entry_slope_significant:
-                  tradeA?.t2_entry_exit_slope?.entry?.significant
-                  || false,
-                entry_slope_bps:
-                  tradeA?.t2_entry_exit_slope?.entry?.slope_bps
-                  || 0,
-                loss_acceleration: accelTrend,
-                consecutive_losses: consLosses,
-                loss_magnitude_trend:
-                  lossA?.lossMagnitudeTrend || 'unknown',
-                side_asymmetry:
-                  tradeA?.t4_side_asymmetry?.asymmetry || 0,
-                displacement_skew:
-                  tradeA?.t5_displacement_skew?.skewness || 0,
-                bayesian_direction:
-                  tradeA?.t6_bayesian_posterior?.direction
-                  || 'neutral',
-                bayesian_strength:
-                  tradeA?.t6_bayesian_posterior?.strength || 'weak'
-              },
-              kline_tests_summary: {
-                composite: klineA?.composite || 0,
-                tf_alignment: klineA?.tfAlignment || 0,
-                hurst: klineA?.avgHurst || 0.5,
-                regime: klineA?.regime || 'unknown',
-                mean_reverting: meanRev
-              },
-              reasons: reasons.slice(0, 10),
-              generated_at: new Date().toISOString()
-            };
+            return bySymbol;
           }
 
           // ================================================================
           //  MAIN EXECUTION
           // ================================================================
-
           log('╔═══════════════════════════════════════════════╗');
-          log('║  Trade Archaeology Analyzer v' + VERSION + '          ║');
+          log('║  Simple Entry/Exit Analyzer v' + VERSION + '           ║');
           log('╚═══════════════════════════════════════════════╝');
-
-          // ---- STEP 1: Fetch data from worker ----
-          log('');
-          log('━━━ STEP 1: Fetch worker data ━━━');
-          log('Worker URL:', WORKER_URL);
 
           const prev = await readAnalysisGist();
           const pushedPrev = prev.pushed || {};
 
-          // ── WIPE LOGIC ──────────────────────────────────────────
-          const run_counter = (prev.run_counter || 0) + 1;
-          log(`🔄 Analyzer run ${run_counter}/6`);
+          // ---- STEP 1: Fetch trades from both workers ----
+          log('');
+          log('━━━ STEP 1: Fetch worker trades ━━━');
 
-          const SHOULD_WIPE = (run_counter >= 6);
-
-          if (SHOULD_WIPE) {
-            log('🗑️  RUN 6: WIPING BOTH GISTS NOW...');
-
-            const w1 = await wipeAnalysisGist();
-            log(`  → Analysis Gist wipe: ${w1 ? '✅ OK' : '❌ FAILED'}`);
-
-            const w2 = await wipeMainStateGist();
-            log(`  → Main State Gist wipe: ${w2 ? '✅ OK' : '❌ FAILED'}`);
-
-            log('♻️  Both Gists wiped. Continuing fresh analysis...');
-            // Do NOT exit — let this run continue with fresh analysis
-          }
-          // ────────────────────────────────────────────────────────
-
-          let pnlData, stateData;
+          let pnlData = [];
+          let stateData = {};
           try {
-            pnlData = await fetchRetry(`${WORKER_URL}/pnl?limit=100`);
+            const raw = await fetchRetry(`${WORKER_URL}/pnl?limit=100`);
+            pnlData = Array.isArray(raw) ? raw : (raw?.items || raw?.data || raw?.closedPnl || []);
           } catch (e) {
-            log('FATAL: Cannot reach worker pnl:', e?.message);
+            log('FATAL: Cannot reach worker 1 /pnl:', e?.message);
             await writeAnalysisGist({
-              ts: new Date().toISOString(),
-              version: VERSION,
-              status: 'worker_unreachable',
-              error: e?.message,
-              ideas: [],
-              pushed: pushedPrev
+              ts: new Date().toISOString(), version: VERSION,
+              status: 'worker_unreachable', error: e?.message, ideas: [], pushed: pushedPrev
             });
             process.exit(1);
           }
-          
+
           try {
             stateData = await fetchRetry(`${WORKER_URL}/json`);
           } catch (e) {
             log('WARN: Cannot reach worker state /json:', e?.message);
-            stateData = {};
           }
 
-          if (!Array.isArray(pnlData)) pnlData = pnlData?.items || pnlData?.data || pnlData?.closedPnl || [];
-
-          // ---- Fetch Worker 2 (analysis-only merge, no push impact) ----
-          const WORKER_URL_2 = (process.env.WORKER_URL_2 || '').replace(/\/+$/, '');
           let pnlData2 = [];
           if (WORKER_URL_2) {
             try {
@@ -1620,453 +294,185 @@ jobs:
               log('WARN: Worker 2 /pnl unreachable:', e?.message);
             }
           } else {
-            log('Worker 2: not configured (WORKER_URL_2 empty) — skipping');
+            log('Worker 2: not configured — both-agree check cannot run, aborting.');
           }
 
-          if ((!Array.isArray(pnlData) || pnlData.length === 0) && pnlData2.length === 0) {
-            log('No closed trades found (either worker). Writing empty analysis.');
+          if (!pnlData.length || !pnlData2.length) {
+            log('Need closed trades from BOTH workers to agree. Writing empty analysis.');
             await writeAnalysisGist({
-              ts: new Date().toISOString(),
-              version: VERSION,
-              status: 'no_trades',
-              analyzed_symbols: 0,
-              ideas: [],
-              pushed: pushedPrev
+              ts: new Date().toISOString(), version: VERSION,
+              status: 'insufficient_data', ideas: [], pushed: pushedPrev
             });
             process.exit(0);
           }
 
-          log(`Fetched ${pnlData.length} closed trades`);
           const regime = stateData?.regime?.regime || 'Unknown';
-          const positions = Array.isArray(stateData?.positions) 
+          const positions = Array.isArray(stateData?.positions)
             ? stateData.positions.filter(p => !(+p.size === 0)) : [];
           const openSyms = new Set(positions.map(p => p.symbol));
-          log(`Regime: ${regime}`);
-          log(`Open positions: ${positions.length}`);
-          if (positions.length > 0) {
-            log(`  Symbols: ${[...openSyms].join(', ')}`);
-          }
+          log(`Regime: ${regime} | Open positions: ${positions.length}`);
 
-          // ---- STEP 2: Group trades by symbol ----
+          // ---- STEP 2: Normalize + group by symbol per worker ----
           log('');
-          log('━━━ STEP 2: Group trades by symbol ━━━');
-          const bySymbol = {};
-          const MAX_AGE_H = 72;
-          let sideMismatch = 0;
-          
-          for (const t of pnlData) {
-            if (!t.symbol) continue;
-            const entryPrice = +t.entryPrice || +t.avgEntryPrice || 0;
-            const exitPrice  = +t.exitPrice  || +t.avgExitPrice  || 0;
-            const pnl        = +t.closedPnl || +t.pnl || 0;
-            const ms = v => (v > 0 && v < 1e11) ? v * 1000 : v;
-            const closedAt   = ms(+t.closedAt || +t.updatedTime || 0);
-            let openedAt     = ms(+t.openedAt || +t.createdTime || 0);
-            
-            if (!(entryPrice > 0 && exitPrice > 0 && closedAt > 0)) continue;
-            if (Date.now() - closedAt > MAX_AGE_H * 3600e3) continue;
+          log('━━━ STEP 2: Normalize trades per worker ━━━');
+          const bySymbol1 = normalizeWorker1Trades(pnlData);
+          const bySymbol2 = normalizeWorker2Trades(pnlData2);
+          log(`Worker1 symbols: ${Object.keys(bySymbol1).join(', ') || '(none)'}`);
+          log(`Worker2 symbols: ${Object.keys(bySymbol2).join(', ') || '(none)'}`);
 
-            let side = t.side === 'Buy' ? 'Sell' : 'Buy';
-            const mv = exitPrice - entryPrice;
-            if (pnl !== 0 && Math.abs(mv / entryPrice) * 1e4 > 20) {
-              const inferred = ((mv > 0) === (pnl > 0)) ? 'Buy' : 'Sell';
-              if (inferred !== side) sideMismatch++;
-              side = inferred;
-            }
+          const commonSymbols = Object.keys(bySymbol1).filter(s => bySymbol2[s]);
+          log(`Common symbols (both workers): ${commonSymbols.join(', ') || '(none)'}`);
 
-            const adverseBps = side === 'Buy'
-              ? (entryPrice - exitPrice) / entryPrice * 1e4
-              : (exitPrice - entryPrice) / entryPrice * 1e4;
-            const stopLoss = pnl < 0 && adverseBps > 10;
-            if (openedAt <= 0 || openedAt > closedAt) openedAt = closedAt;
-
-            if (!bySymbol[t.symbol]) bySymbol[t.symbol] = [];
-            bySymbol[t.symbol].push({
-              ...t,
-              entryPrice,
-              exitPrice,
-              pnl,
-              closedAt,
-              openedAt,
-              side,
-              stopLoss
+          if (!commonSymbols.length) {
+            log('No common symbols between workers. Writing empty analysis.');
+            await writeAnalysisGist({
+              ts: new Date().toISOString(), version: VERSION,
+              status: 'no_common_symbols', ideas: [], pushed: pushedPrev
             });
+            process.exit(0);
           }
 
-          // ---- Merge Worker 2 trades (native schema — no flip/inference needed) ----
-          let w2Added = 0;
-          for (const t of pnlData2) {
-            if (!t.symbol) continue;
-            const entryPrice = +t.entryPrice || 0;
-            const exitPrice  = +t.exitPrice  || 0;
-            const pnl        = +t.realizedPnl || +t.netPnl || 0;
-            const closedAt   = +t.time || 0;
-
-            if (!(entryPrice > 0 && exitPrice > 0 && closedAt > 0)) continue;
-            if (Date.now() - closedAt > MAX_AGE_H * 3600e3) continue;
-
-            // positionSide is authoritative here — no inference/flip required
-            const side = t.positionSide === 'SHORT' ? 'Sell' : 'Buy';
-            const adverseBps = side === 'Buy'
-              ? (entryPrice - exitPrice) / entryPrice * 1e4
-              : (exitPrice - entryPrice) / entryPrice * 1e4;
-            const stopLoss = pnl < 0 && adverseBps > 10;
-
-            if (!bySymbol[t.symbol]) bySymbol[t.symbol] = [];
-            bySymbol[t.symbol].push({
-              symbol: t.symbol,
-              entryPrice,
-              exitPrice,
-              pnl,
-              closedAt,
-              openedAt: closedAt, // worker 2 has no separate open-time field
-              side,
-              stopLoss
-            });
-            w2Added++;
-          }
-          if (w2Added) log(`Worker 2 merged: +${w2Added} trades into bySymbol`);
-
-          log(`Side mismatches corrected: ${sideMismatch}`);
-
-          const symbols = Object.keys(bySymbol);
-          log(`${symbols.length} symbols: ${symbols.join(', ')}`);
-          for (const [sym, trades] of Object.entries(bySymbol)) {
-            const wins = trades.filter(t => t.pnl >= 0).length;
-            log(`  ${sym}: ${trades.length} trades (${wins}W ${trades.length - wins}L)`);
-          }
-
-          // ---- STEP 3: Trade-based analysis ----
+          // ---- STEP 3: Fetch current prices ----
           log('');
-          log('━━━ STEP 3: Trade-based trend tests (6 tests) ━━━');
-          const tradeAnalyses = {};
-          for (const [sym, trades] of Object.entries(bySymbol)) {
-            const sorted = trades.sort(
-              (a, b) => a.closedAt - b.closedAt
-            );
-            tradeAnalyses[sym] = analyzeTradesForSymbol(sorted);
-            const ta = tradeAnalyses[sym];
-            log(`  ${sym}: ${ta.trade_direction} `
-              + `(composite=${ta.composite_trade_trend})`);
-            log(`    T1 consensus=${ta.t1_direction_consensus.score}`);
-            log(`    T2 entry_slope=${ta.t2_entry_exit_slope.entry.slope_bps}bps `
-              + `t=${ta.t2_entry_exit_slope.entry.tStat} `
-              + `agree=${ta.t2_entry_exit_slope.agree}`);
-            log(`    T3 loss_accel=${ta.t3_loss_acceleration.ttslTrend} `
-              + `consec=${ta.t3_loss_acceleration.consecutiveSameDirLosses} `
-              + `TTSL=[${ta.t3_loss_acceleration.ttslValues.join(',')}]`);
-            log(`    T4 side_asym=${ta.t4_side_asymmetry.asymmetry} `
-              + `best=${ta.t4_side_asymmetry.bestSide}`);
-            log(`    T5 skew=${ta.t5_displacement_skew.skewness} `
-              + `(${ta.t5_displacement_skew.interpretation})`);
-            log(`    T6 bayes=${ta.t6_bayesian_posterior.direction} `
-              + `P(up)=${ta.t6_bayesian_posterior.pUp} `
-              + `[${ta.t6_bayesian_posterior.strength}]`);
-            log(`    Entry prices: [${ta.entry_prices.join(', ')}]`);
-            log(`    Exit prices:  [${ta.exit_prices.join(', ')}]`);
-          }
-
-          // ---- STEP 4: Fetch klines ----
-          log('');
-          log('━━━ STEP 4: Fetch Bybit public klines ━━━');
-          const klData = {};
-          const INTERVALS = ['5', '15', '60', '240'];
-          const LIMITS = { '5': 200, '15': 200, '60': 200, '240': 100 };
-
-          for (const sym of symbols) {
-            klData[sym] = {};
-            for (const iv of INTERVALS) {
-              klData[sym][iv] = await getBybitKlines(
-                sym, iv, LIMITS[iv]
-              );
-              await sleep(120);
-            }
-            log(`  ${sym}: ${INTERVALS.map(
-              i => `${i}m=${klData[sym][i]?.length || 0}`
-            ).join(' ')}`);
-          }
-
-          if (symbols.length && symbols.every(s => INTERVALS.every(i => !klData[s][i]?.length))) {
-            log('FATAL: no klines (Bybit blocked?)'); process.exit(1);
-          }
-
-          // ---- STEP 5: Kline-based analysis ----
-          log('');
-          log('━━━ STEP 5: Kline-based trend tests (6 tests × 4 TFs) ━━━');
-          const klineAnalyses = {};
-          for (const sym of symbols) {
-            klineAnalyses[sym] = analyzeKlinesMultiTF(klData[sym]);
-            const ka = klineAnalyses[sym];
-            log(`  ${sym}: ${ka.regime} `
-              + `(composite=${ka.composite} `
-              + `Hurst=${ka.avgHurst} `
-              + `TF-align=${ka.tfAlignment}`
-              + `${ka.meanReverting ? ' ⚠️MEAN-REVERTING' : ''})`);
-            for (const [tf, a] of Object.entries(ka.perTF)) {
-              log(`    ${tf}m: composite=${a.composite} `
-                + `ADX=${a.k5_adx_di.adx}(${a.k5_adx_di.strength}) `
-                + `Hurst=${a.k2_hurst.H} `
-                + `Kalman=${a.k6_kalman.velocityBps}bps `
-                + `RSI=${a.rsi}`);
-            }
-          }
-
-          // ---- STEP 6: Cross-validate ----
-          log('');
-          log('━━━ STEP 6: Cross-validation ━━━');
-          const crossVals = {};
-          for (const sym of symbols) {
-            crossVals[sym] = crossValidate(
-              tradeAnalyses[sym], klineAnalyses[sym]
-            );
-            const cv = crossVals[sym];
-            const icon = cv.agreement === 'AGREE' ? '✅'
-              : cv.agreement === 'DISAGREE' ? '❌' : '⚠️';
-            log(`  ${icon} ${sym}: trades=${cv.trade_direction} `
-              + `klines=${cv.kline_direction} `
-              + `→ ${cv.agreement} `
-              + `→ FINAL: ${cv.final_direction} `
-              + `(score=${cv.final_score})`);
-          }
-
-          // ---- STEP 7: Fetch tickers ----
-          log('');
-          log('━━━ STEP 7: Fetch tickers ━━━');
+          log('━━━ STEP 3: Fetch current prices ━━━');
           const tickers = {};
-          for (const sym of symbols) {
+          for (const sym of commonSymbols) {
             tickers[sym] = await getBybitTicker(sym);
             await sleep(100);
-            if (tickers[sym]) {
-              log(`  ${sym}: $${tickers[sym].lastPrice} `
-                + `spread=${((tickers[sym].ask - tickers[sym].bid) / tickers[sym].lastPrice * 10000).toFixed(1)}bps `
-                + `vol24h=$${Math.round(tickers[sym].turnover24h / 1e6)}M `
-                + `FR=${(tickers[sym].fundingRate * 100).toFixed(4)}%`);
-            }
+            if (tickers[sym]) log(`  ${sym}: $${tickers[sym].lastPrice}`);
+            else log(`  ${sym}: ticker fetch failed`);
           }
 
-          // ---- STEP 8: Generate ideas ----
+          // ---- STEP 4: Compute direction per worker, require agreement ----
           log('');
-          log('━━━ STEP 8: Generate ideas ━━━');
-          const allIdeas = [];
-          for (const sym of symbols) {
+          log('━━━ STEP 4: Direction check (entry/exit + current price) ━━━');
+          const candidates = [];
+          for (const sym of commonSymbols) {
+            const ticker = tickers[sym];
+            if (!ticker || !(ticker.lastPrice > 0)) {
+              log(`  ⏭️  ${sym}: no current price — skip`);
+              continue;
+            }
+            const currentPrice = ticker.lastPrice;
+
+            const d1 = computeDirection(bySymbol1[sym], currentPrice);
+            const d2 = computeDirection(bySymbol2[sym], currentPrice);
+
+            log(`  ${sym}: worker1=${d1.direction}(${d1.reason}) worker2=${d2.direction}(${d2.reason})`);
+
+            if (d1.direction === 'neutral' || d2.direction === 'neutral') {
+              log(`    ❌ one side neutral — skip`);
+              continue;
+            }
+            if (d1.direction !== d2.direction) {
+              log(`    ❌ DISAGREE — skip`);
+              continue;
+            }
             if (openSyms.has(sym)) {
-              log(`  ⏭️  ${sym}: SKIP (position open)`);
+              log(`    ⏭️  position already open — skip`);
               continue;
             }
 
-            let idea = null;
-            try {
-              idea = generateIdea(
-                sym,
-                tradeAnalyses[sym],
-                klineAnalyses[sym],
-                crossVals[sym],
-                tickers[sym]
-              );
-            } catch (e) { log(`  💥 ${sym}: generateIdea error: ${e?.message}`); }
+            const strength = (Math.abs(d1.avgMoveBps) + Math.abs(d2.avgMoveBps)) / 2;
+            candidates.push({
+              symbol: sym,
+              side: d1.direction, // 'long' or 'short'
+              strength,
+              currentPrice,
+              ticker
+            });
+            log(`    ✅ AGREE: ${d1.direction} (strength=${strength.toFixed(1)}bps)`);
+          }
 
-            if (idea) {
-              allIdeas.push(idea);
-              log(`  ✅ ${sym} ${idea.side.toUpperCase()} `
-                + `conf=${idea.confidence} ev=${idea.ev_bps}bps `
-                + `rrr=${idea.rrr} style=${idea.style}`);
-              for (const r of idea.reasons.slice(0, 4)) {
-                log(`     → ${r}`);
-              }
+          // ---- STEP 5: Rank + build ideas ----
+          log('');
+          log('━━━ STEP 5: Build top ideas ━━━');
+          candidates.sort((a, b) => b.strength - a.strength);
+          const top = candidates.slice(0, TOP_N);
+
+          const sl_bps = Math.min(SL_BPS_CFG, MAX_SL_BPS);
+          const tp_bps = TP_BPS_CFG;
+
+          const finalIdeas = top.map(c => {
+            const entry = +c.currentPrice.toPrecision(7);
+            let tp_abs, sl_abs;
+            if (c.side === 'long') {
+              tp_abs = +(entry * (1 + tp_bps / 10000)).toPrecision(7);
+              sl_abs = +(entry * (1 - sl_bps / 10000)).toPrecision(7);
             } else {
-              const cv = crossVals[sym];
-              log(`  ❌ ${sym}: no idea `
-                + `(dir=${cv?.final_direction} `
-                + `agreement=${cv?.agreement})`);
+              tp_abs = +(entry * (1 - tp_bps / 10000)).toPrecision(7);
+              sl_abs = +(entry * (1 + sl_bps / 10000)).toPrecision(7);
             }
+            const rrr = +(tp_bps / sl_bps).toFixed(2);
+            return {
+              symbol: c.symbol,
+              base: c.symbol.replace('USDT', ''),
+              quote: 'USDT',
+              side: c.side,
+              entry, tp_abs, sl_abs, tp_bps, sl_bps, rrr,
+              strength_bps: +c.strength.toFixed(1),
+              funding_rate: c.ticker?.fundingRate || 0,
+              volume_24h: c.ticker?.turnover24h || 0,
+              reasons: [
+                `Both workers' entry/exit trades consistently went ${c.side === 'long' ? 'up' : 'down'}`,
+                `Current price confirms continuation (${c.currentPrice})`
+              ],
+              generated_at: new Date().toISOString()
+            };
+          });
+
+          log(`Final ideas: ${finalIdeas.length}`);
+          for (const i of finalIdeas) {
+            log(`  ${i.symbol} ${i.side.toUpperCase()} entry=${i.entry} tp=${i.tp_abs} sl=${i.sl_abs} strength=${i.strength_bps}bps`);
           }
 
-          // ---- STEP 8b: Validate symbols exist on Binance ----
+          // ---- STEP 6: Write analysis gist ----
           log('');
-          log('━━━ STEP 8b: Validate Binance symbol names ━━━');
-          const binanceSymbols = await getBinanceFuturesSymbols();
-
-          if (binanceSymbols) {
-            log(`Binance has ${binanceSymbols.size} active perpetual symbols`);
-            const validIdeas = [];
-            const originalCount = allIdeas.length;
-            for (const idea of allIdeas) {
-              if (binanceSymbols.has(idea.symbol)) {
-                validIdeas.push(idea);
-              } else {
-                log(`  ⏭️  ${idea.symbol}: NOT FOUND on Binance — dropping idea`);
-              }
-            }
-            allIdeas.length = 0;
-            allIdeas.push(...validIdeas);
-            log(`  ${validIdeas.length}/${originalCount} ideas passed Binance validation`);
-          } else {
-            log('  ⚠️ Binance validation unavailable (fetch failed) — skipping check, ideas unfiltered');
-          }
-
-          // ---- Sort by confidence × ev, apply diversity ----
-          allIdeas.sort(
-            (a, b) => (b.confidence * Math.max(1, b.ev_bps))
-              - (a.confidence * Math.max(1, a.ev_bps))
-          );
-
-          const finalIdeas = [];
-          const usedBases = new Set();
-          let longCnt = 0, shortCnt = 0;
-          for (const idea of allIdeas) {
-            if (finalIdeas.length >= TOP_N) break;
-            if (usedBases.has(idea.base)) continue;
-            if (idea.side === 'long' && longCnt >= 2) continue;
-            if (idea.side === 'short' && shortCnt >= 2) continue;
-            finalIdeas.push(idea);
-            usedBases.add(idea.base);
-            if (idea.side === 'long') longCnt++;
-            else shortCnt++;
-          }
-
-          log('');
-          log('╔═══════════════════════════════════════════════╗');
-          log(`║  FINAL IDEAS: ${finalIdeas.length}                              ║`);
-          log('╚═══════════════════════════════════════════════╝');
-          for (const idea of finalIdeas) {
-            log(`  ${idea.symbol} ${idea.side.toUpperCase()} `
-              + `conf=${idea.confidence} ev=${idea.ev_bps}bps `
-              + `rrr=${idea.rrr} tp=${idea.tp_bps}bps `
-              + `sl=${idea.sl_bps}bps size=${idea.size_bps}bps `
-              + `ttl=${idea.ttl_sec}s style=${idea.style}`);
-            for (const r of idea.reasons) {
-              log(`    → ${r}`);
-            }
-          }
-
-          // ---- STEP 9: Write to analysis Gist ----
-          log('');
-          log('━━━ STEP 9: Write analysis Gist ━━━');
+          log('━━━ STEP 6: Write analysis Gist ━━━');
           const pushedNext = {};
           for (const [k, ts] of Object.entries(pushedPrev)) {
             if (Date.now() - ts < 6 * 3600e3) pushedNext[k] = ts;
           }
           const pushIdeas = finalIdeas.filter(i => {
             const ts = pushedPrev[i.symbol + '|' + i.side];
-            return !(ts && Date.now() - ts < i.ttl_sec * 1000);
+            return !(ts && Date.now() - ts < TTL_SEC * 1000);
           });
 
           const output = {
             ts: new Date().toISOString(),
             version: VERSION,
-            run_counter: SHOULD_WIPE ? 1 : run_counter,
             status: 'ok',
             worker_regime: regime,
             open_positions: positions.length,
-            analyzed_symbols: symbols.length,
-            total_closed_trades: pnlData.length + pnlData2.length,
-            ideas_generated: allIdeas.length,
-            ideas_after_filter: finalIdeas.length,
+            common_symbols: commonSymbols.length,
+            candidates_found: candidates.length,
             ideas: finalIdeas,
             pushed: pushedNext,
-            per_symbol: {},
-            config: {
-              top_n: TOP_N,
-              min_confidence: MIN_CONFIDENCE,
-              max_sl_bps: MAX_SL_BPS,
-              notional_usd: NOTIONAL,
-              worker_url: WORKER_URL.replace(
-                /https?:\/\//, '***.'
-              )
-            }
+            config: { top_n: TOP_N, tp_bps, sl_bps, notional_usd: NOTIONAL }
           };
-
-          for (const sym of symbols) {
-            output.per_symbol[sym] = {
-              trade_analysis: tradeAnalyses[sym],
-              kline_analysis: {
-                composite: klineAnalyses[sym]?.composite,
-                tfAlignment: klineAnalyses[sym]?.tfAlignment,
-                regime: klineAnalyses[sym]?.regime,
-                avgHurst: klineAnalyses[sym]?.avgHurst,
-                meanReverting: klineAnalyses[sym]?.meanReverting,
-                direction: klineAnalyses[sym]?.direction,
-                perTF_summary: Object.fromEntries(
-                  Object.entries(
-                    klineAnalyses[sym]?.perTF || {}
-                  ).map(([tf, a]) => [tf, {
-                    composite: a.composite,
-                    rsi: a.rsi,
-                    adx: a.k5_adx_di?.adx,
-                    adx_strength: a.k5_adx_di?.strength,
-                    adx_direction: a.k5_adx_di?.direction,
-                    atr_bps: a.k5_adx_di?.atr_bps,
-                    hurst: a.k2_hurst?.H,
-                    hurst_interp: a.k2_hurst?.interpretation,
-                    ols_slope_bps: a.k1_ols?.slope_bps,
-                    ols_significant: a.k1_ols?.significant,
-                    mk_tau: a.k3_mann_kendall?.tau,
-                    mk_significant: a.k3_mann_kendall?.significant,
-                    vr: a.k4_variance_ratio?.VR,
-                    vr_interp:
-                      a.k4_variance_ratio?.interpretation,
-                    kalman_vel_bps: a.k6_kalman?.velocityBps,
-                    kalman_accel: a.k6_kalman?.accelerating
-                  }])
-                )
-              },
-              cross_validation: crossVals[sym],
-              ticker: tickers[sym] ? {
-                lastPrice: tickers[sym].lastPrice,
-                fundingRate: tickers[sym].fundingRate,
-                volume24h: tickers[sym].volume24h,
-                turnover24h: tickers[sym].turnover24h,
-                openInterest: tickers[sym].openInterest
-              } : null
-            };
-          }
-
           await writeAnalysisGist(output);
           log('Analysis Gist written.');
 
-          // ---- STEP 10: Push ideas to worker (optional) ----
+          // ---- STEP 7: Push ideas to worker ----
           if (PUSH_URL && PUSH_TOKEN && pushIdeas.length > 0) {
             log('');
-            log('━━━ STEP 10: Push ideas to worker ━━━');
+            log('━━━ STEP 7: Push ideas to worker ━━━');
             const pushPayload = {
               ts: new Date().toISOString(),
               mode: 'normal',
-              source: 'trade_archaeology_analyzer',
-              meta: {
-                origin: 'github_actions_analyzer',
-                version: VERSION,
-                worker_regime: regime,
-                analyzed_symbols: symbols.length,
-                total_closed_trades: pnlData.length + pnlData2.length,
-                methods: [
-                  'OLS_regression',
-                  'Hurst_exponent',
-                  'Mann_Kendall',
-                  'Variance_ratio',
-                  'ADX_DI',
-                  'Kalman_filter',
-                  'Direction_consensus',
-                  'Entry_exit_slope',
-                  'Loss_acceleration',
-                  'Side_asymmetry',
-                  'Displacement_skew',
-                  'Bayesian_posterior'
-                ]
-              },
+              source: 'simple_entry_exit_analyzer',
+              meta: { origin: 'github_actions_analyzer', version: VERSION, worker_regime: regime },
               top_n: pushIdeas.length,
               ideas: pushIdeas.map((idea, i) => ({
                 idea_id: crypto.randomUUID(),
-                client_order_id:
-                  ('ta_' + crypto.randomUUID().replace(/-/g, ''))
-                    .slice(0, 28),
+                client_order_id: ('ta_' + crypto.randomUUID().replace(/-/g, '')).slice(0, 28),
                 symbol: idea.base,
                 symbol_full: idea.symbol,
                 quote: idea.quote,
                 side: idea.side,
                 rank: i + 1,
-                entry_policy: 'smart_swing_limit',
+                entry_policy: 'simple_market',
                 entry_type: 'limit',
-                activation: 'on_fill',
                 entry_mid: idea.entry,
                 entry_limit: idea.entry,
                 tp_abs: idea.tp_abs,
@@ -2074,38 +480,9 @@ jobs:
                 tp_bps: idea.tp_bps,
                 sl_bps: idea.sl_bps,
                 rrr: idea.rrr,
-                exp_lcb_bps: idea.ev_bps,
-                ev_bps: idea.ev_bps,
-                cost_bps: 10,
-                p_win: idea.p_win,
-                p_lcb: idea.p_win,
-                p_raw: idea.p_win,
-                confidence: idea.confidence,
-                size_bps: idea.size_bps,
-                ttl_sec: idea.ttl_sec,
-                regime: idea.regime,
-                calib_key:
-                  `side:${idea.side}|regime:${idea.regime}`,
-                predicted: {
-                  ts_ms: Date.now(),
-                  confidence_score: idea.confidence,
-                  hurst: idea.hurst,
-                  mean_reverting: idea.mean_reverting,
-                  cross_validation: idea.cross_validation.agreement,
-                  style: idea.style,
-                  trade_tests: idea.trade_tests_summary,
-                  kline_tests: idea.kline_tests_summary,
-                  meta: {
-                    strategy: 'trade-archaeology',
-                    model_version: VERSION,
-                    methods_used: 12,
-                    schema_version: '1'
-                  }
-                },
-                reasons: idea.reasons.slice(0, 5).map(
-                  r => ({ factor: 'trend', value: r, contribution: 0 })
-                ),
-                reasons_text: idea.reasons.slice(0, 5)
+                ttl_sec: TTL_SEC,
+                reasons: idea.reasons.map(r => ({ factor: 'trend', value: r, contribution: 0 })),
+                reasons_text: idea.reasons
               }))
             };
 
@@ -2125,8 +502,7 @@ jobs:
               clearTimeout(t);
               let txt = '';
               try { txt = await r.text(); } catch {}
-              log('Push status:', r.status,
-                (txt || '').slice(0, 300));
+              log('Push status:', r.status, (txt || '').slice(0, 300));
 
               if (r.ok) {
                 for (const i of pushIdeas) pushedNext[i.symbol + '|' + i.side] = Date.now();
