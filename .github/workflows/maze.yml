@@ -1,4 +1,4 @@
-name: Trend Analyzer (Simple Entry/Exit v4.2)
+name: Trend Analyzer (Simple Entry/Exit v4.3)
 on:
   repository_dispatch:
     types: [run_X]
@@ -32,6 +32,7 @@ jobs:
       WATCH_POOL: ${{ vars.ANALYZER_WATCH_POOL || vars.WATCH_POOL }}
       PNL_LIMIT: ${{ vars.ANALYZER_PNL_LIMIT || vars.PNL_LIMIT }}
       WORKER_MODE: ${{ vars.ANALYZER_WORKER_MODE || vars.WORKER_MODE }}
+      HEDGE: ${{ vars.ANALYZER_HEDGE || vars.HEDGE }}
     steps:
       - name: Setup Node 20
         uses: actions/setup-node@v4
@@ -52,7 +53,7 @@ jobs:
           (async () => {
           'use strict';
           const crypto = require('crypto');
-          const VERSION = '4.2.0';
+          const VERSION = '4.3.1';
           const UA = `trend-analyzer/${VERSION}`;
           const log = (...a) => console.log('[analyzer]', ...a);
 
@@ -89,6 +90,12 @@ jobs:
           const WORKER_MODE = ['1', '2', 'both'].includes(WORKER_MODE_RAW) ? WORKER_MODE_RAW : 'both';
           const USE_W1 = WORKER_MODE === '1' || WORKER_MODE === 'both';   // fetch worker 1 trades
           const USE_W2 = WORKER_MODE === '2' || WORKER_MODE === 'both';   // fetch worker 2 trades
+
+          // --- Hedge mode: 'off' | 'on' (default 'off') ---
+          // on = emit BOTH long and short for each selected symbol.
+          // The opposite side is a hedge counterpart and is not separately watched.
+          const HEDGE_RAW = String(process.env.HEDGE || '').trim().toLowerCase();
+          const IS_HEDGE = ['on', 'true', '1'].includes(HEDGE_RAW);
 
           // --- Cooldown: 5 minutes (also sent to worker as idea ttl_sec) ---
           const TTL_SEC = 300;
@@ -252,13 +259,19 @@ jobs:
           // ================================================================
           //  MAIN EXECUTION
           // ================================================================
-          log('╔═══════════════════════════════════════════════╗');
-          log('║  Simple Entry/Exit Analyzer v' + VERSION + '          ║');
-          log('╚═══════════════════════════════════════════════╝');
-          log(`Config: workerMode=${WORKER_MODE} topN=${TOP_N} pool=${WATCH_POOL} watch=${WATCH_MIN}min artificialSL=${ARTIFICIAL_SL_PCT}% cooldown=${TTL_SEC}s pnlLimit=${PNL_LIMIT} fallbackToW1=${WORKER_MODE === 'both'}`);
+          log('==================================================');
+          log(`  Simple Entry/Exit Analyzer v${VERSION}`);
+          log('==================================================');
+          log(`Config: workerMode=${WORKER_MODE} hedge=${IS_HEDGE ? 'on' : 'off'} topN=${TOP_N} pool=${WATCH_POOL} watch=${WATCH_MIN}min artificialSL=${ARTIFICIAL_SL_PCT}% cooldown=${TTL_SEC}s pnlLimit=${PNL_LIMIT} fallbackToW1=${WORKER_MODE === 'both'}`);
 
           const prev = await readAnalysisGist();
           const pushedPrev = prev.pushed || {};
+
+          // Cooldown helper: true if this symbol+side was pushed within TTL
+          const cooldownActive = (sym, side) => {
+            const ts = pushedPrev[sym + '|' + side];
+            return !!ts && Date.now() - ts < TTL_SEC * 1000;
+          };
 
           // ---- STEP 1: Fetch trades (once, shared by all passes) ----
           log('');
@@ -386,13 +399,12 @@ jobs:
               const agree = side !== 'neutral' && used.every(d => d.direction === side);
               const score = used.reduce((s, d) => s + Math.abs(d.moveBps), 0) / used.length;
 
+              // Cooldown: in normal mode the primary side decides. In hedge mode
+              // cooldown is checked per side at emit time, so the symbol stays eligible.
               let skip = null;
               if (!agree) skip = 'no_agreement';
               else if (openSyms.has(sym)) skip = 'open_position';
-              else {
-                const cdTs = pushedPrev[sym + '|' + side];
-                if (cdTs && Date.now() - cdTs < TTL_SEC * 1000) skip = 'cooldown';
-              }
+              else if (!IS_HEDGE && cooldownActive(sym, side)) skip = 'cooldown';
 
               rows.push({
                 symbol: sym,
@@ -435,7 +447,7 @@ jobs:
             res.pool = pool;
             log(`Watch pool: ${pool.length} candidate(s)`);
 
-            // ---- STEP 6: watch phase (artificial SL) ----
+            // ---- STEP 6: watch phase (artificial SL, primary side only) ----
             log('');
             log(`━━━ ${tag}STEP 6: Watch phase (${WATCH_MIN} min, artificial SL ${ARTIFICIAL_SL_PCT}%) ━━━`);
             const watch = pool.map(c => {
@@ -520,13 +532,19 @@ jobs:
               })
               .sort((a, b) => b.score - a.score);
             res.survivors = survivors;
-            const top = survivors.slice(0, TOP_N);
-            log(`Survivors: ${survivors.length} | Selected: ${top.length}`);
 
-            res.finalIdeas = top.map(c => {
+            // Hedge: a survivor is only useful if at least one of its sides is off cooldown
+            const eligible = survivors.filter(c => {
+              const sides = IS_HEDGE ? ['long', 'short'] : [c.side];
+              return sides.some(s => !cooldownActive(c.symbol, s));
+            });
+            const top = eligible.slice(0, TOP_N);
+            log(`Survivors: ${survivors.length} | Eligible (not fully cooling down): ${eligible.length} | Selected: ${top.length}`);
+
+            const createIdea = (c, side) => {
               const entry = +c.last.toPrecision(7);
               let tp_abs, sl_abs;
-              if (c.side === 'long') {
+              if (side === 'long') {
                 tp_abs = +(entry * (1 + tp_bps / 10000)).toPrecision(7);
                 sl_abs = +(entry * (1 - sl_bps / 10000)).toPrecision(7);
               } else {
@@ -537,27 +555,50 @@ jobs:
               const basis = isFallback
                 ? 'Fallback (worker 1 only): price'
                 : passMode === 'both' ? 'Both workers agree: price' : `Worker ${passMode}: price`;
+              const isPrimary = side === c.side;
+              const hedgeLabel = IS_HEDGE ? ` [Hedge Mode: ${isPrimary ? 'Primary' : 'Opposite'}]` : '';
+              const survivedText = `Survived ${WATCH_MIN}min watch (artificial SL ${ARTIFICIAL_SL_PCT}%, max adverse ${c.maxAdversePct.toFixed(3)}%)`;
+              const hedgeText = `Hedge counterpart of ${c.side} signal (not separately watched; primary ${survivedText.charAt(0).toLowerCase()}${survivedText.slice(1)})`;
+
               return {
                 symbol: c.symbol,
                 base: c.symbol.replace('USDT', ''),
                 quote: 'USDT',
-                side: c.side,
+                side: side,
                 entry, tp_abs, sl_abs, tp_bps, sl_bps, rrr,
                 ref_entry: c.refEntry,
                 score_bps: +c.score.toFixed(1),
                 fallback: isFallback,
+                hedged: IS_HEDGE,
+                hedge_leg: !isPrimary,
+                watched_side: c.side,
                 watch_max_adverse_pct: +c.maxAdversePct.toFixed(3),
                 watch_max_favorable_pct: +c.maxFavorablePct.toFixed(3),
                 funding_rate: c.ticker?.fundingRate || 0,
                 volume_24h: c.ticker?.turnover24h || 0,
                 reasons: [
-                  `${basis} ${c.side === 'long' ? 'above' : 'below'} last exit price`,
+                  `${basis} ${side === 'long' ? 'above' : 'below'} last exit price${hedgeLabel}`,
                   `Score (avg move from last exit) = ${c.score.toFixed(1)}bps`,
-                  `Survived ${WATCH_MIN}min watch (artificial SL ${ARTIFICIAL_SL_PCT}%, max adverse ${c.maxAdversePct.toFixed(3)}%)`
+                  isPrimary ? survivedText : hedgeText
                 ],
                 generated_at: new Date().toISOString()
               };
-            });
+            };
+
+            // Emit ideas, checking cooldown per side
+            const finalIdeas = [];
+            for (const c of top) {
+              const sides = IS_HEDGE ? ['long', 'short'] : [c.side];
+              for (const s of sides) {
+                if (cooldownActive(c.symbol, s)) {
+                  log(`  ${c.symbol} ${s.toUpperCase()} skipped: cooldown`);
+                  continue;
+                }
+                finalIdeas.push(createIdea(c, s));
+              }
+            }
+
+            res.finalIdeas = finalIdeas;
             return res;
           }
 
@@ -589,7 +630,7 @@ jobs:
           log('');
           log(`Final ideas: ${finalIdeas.length}${fallbackUsed ? ' (from fallback)' : ''}`);
           for (const i of finalIdeas) {
-            log(`  ${i.symbol} ${i.side.toUpperCase()} entry=${i.entry} tp=${i.tp_abs} sl=${i.sl_abs} score=${i.score_bps}bps`);
+            log(`  ${i.symbol} ${i.side.toUpperCase()} entry=${i.entry} tp=${i.tp_abs} sl=${i.sl_abs} score=${i.score_bps}bps${i.hedge_leg ? ' (hedge leg)' : ''}`);
           }
 
           // ---- STEP 8: Write analysis gist ----
@@ -599,7 +640,7 @@ jobs:
           for (const [k, ts] of Object.entries(pushedPrev)) {
             if (Date.now() - ts < PUSHED_KEEP_MS) pushedNext[k] = ts;
           }
-          // cooldown was already applied before the watch phase
+          // cooldown was already applied before emitting ideas
           const pushIdeas = finalIdeas;
 
           const output = {
@@ -607,6 +648,7 @@ jobs:
             version: VERSION,
             status: result.status,
             worker_mode: WORKER_MODE,
+            hedge_mode: IS_HEDGE,
             fallback_used: fallbackUsed,
             primary_pass: primarySummary,
             worker_regime: regime,
@@ -634,6 +676,7 @@ jobs:
             pushed: pushedNext,
             config: {
               worker_mode: WORKER_MODE,
+              hedge: IS_HEDGE,
               top_n: TOP_N, tp_bps, sl_bps, min_move_bps: MIN_MOVE_BPS, notional_usd: NOTIONAL,
               watch_min: WATCH_MIN, artificial_sl_pct: ARTIFICIAL_SL_PCT,
               watch_pool: WATCH_POOL, cooldown_sec: TTL_SEC, pnl_limit: PNL_LIMIT
@@ -652,7 +695,7 @@ jobs:
               source: 'simple_entry_exit_analyzer',
               meta: {
                 origin: 'github_actions_analyzer', version: VERSION,
-                worker_regime: regime, worker_mode: WORKER_MODE, fallback: fallbackUsed
+                worker_regime: regime, worker_mode: WORKER_MODE, hedge: IS_HEDGE, fallback: fallbackUsed
               },
               top_n: pushIdeas.length,
               ideas: pushIdeas.map((idea, i) => ({
@@ -673,6 +716,7 @@ jobs:
                 sl_bps: idea.sl_bps,
                 rrr: idea.rrr,
                 ttl_sec: TTL_SEC,
+                hedge_leg: idea.hedge_leg,
                 reasons: idea.reasons.map(r => ({ factor: 'trend', value: r, contribution: 0 })),
                 reasons_text: idea.reasons
               }))
