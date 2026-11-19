@@ -1,4 +1,4 @@
-name: Trend Analyzer (Simple Entry/Exit v4.1)
+name: Trend Analyzer (Simple Entry/Exit v4.2)
 on:
   repository_dispatch:
     types: [run_X]
@@ -52,7 +52,7 @@ jobs:
           (async () => {
           'use strict';
           const crypto = require('crypto');
-          const VERSION = '4.1.0';
+          const VERSION = '4.2.0';
           const UA = `trend-analyzer/${VERSION}`;
           const log = (...a) => console.log('[analyzer]', ...a);
 
@@ -83,11 +83,12 @@ jobs:
           // --- Full history request size ---
           const PNL_LIMIT = Math.max(100, Number(process.env.PNL_LIMIT || '1000'));
 
-          // --- Worker mode: '1' | '2' | 'both' ---
+          // --- Worker mode: '1' | '2' | 'both' (default 'both') ---
+          // In 'both' mode, if the run ends with 0 ideas, a fallback pass runs with worker 1 only.
           const WORKER_MODE_RAW = String(process.env.WORKER_MODE || '').trim().toLowerCase();
           const WORKER_MODE = ['1', '2', 'both'].includes(WORKER_MODE_RAW) ? WORKER_MODE_RAW : 'both';
-          const USE_W1 = WORKER_MODE === '1' || WORKER_MODE === 'both';
-          const USE_W2 = WORKER_MODE === '2' || WORKER_MODE === 'both';
+          const USE_W1 = WORKER_MODE === '1' || WORKER_MODE === 'both';   // fetch worker 1 trades
+          const USE_W2 = WORKER_MODE === '2' || WORKER_MODE === 'both';   // fetch worker 2 trades
 
           // --- Cooldown: 5 minutes (also sent to worker as idea ttl_sec) ---
           const TTL_SEC = 300;
@@ -254,12 +255,12 @@ jobs:
           log('╔═══════════════════════════════════════════════╗');
           log('║  Simple Entry/Exit Analyzer v' + VERSION + '          ║');
           log('╚═══════════════════════════════════════════════╝');
-          log(`Config: workerMode=${WORKER_MODE} topN=${TOP_N} pool=${WATCH_POOL} watch=${WATCH_MIN}min artificialSL=${ARTIFICIAL_SL_PCT}% cooldown=${TTL_SEC}s pnlLimit=${PNL_LIMIT}`);
+          log(`Config: workerMode=${WORKER_MODE} topN=${TOP_N} pool=${WATCH_POOL} watch=${WATCH_MIN}min artificialSL=${ARTIFICIAL_SL_PCT}% cooldown=${TTL_SEC}s pnlLimit=${PNL_LIMIT} fallbackToW1=${WORKER_MODE === 'both'}`);
 
           const prev = await readAnalysisGist();
           const pushedPrev = prev.pushed || {};
 
-          // ---- STEP 1: Fetch trades from the selected worker(s) ----
+          // ---- STEP 1: Fetch trades (once, shared by all passes) ----
           log('');
           log('━━━ STEP 1: Fetch worker trades (full history) ━━━');
           let pnlData = [];
@@ -301,14 +302,6 @@ jobs:
           } else {
             log('Worker 2 trades: skipped (WORKER_MODE=1)');
           }
-          if ((USE_W1 && !pnlData.length) || (USE_W2 && !pnlData2.length)) {
-            log(`Missing closed trades for selected mode (${WORKER_MODE}). Writing empty analysis.`);
-            await writeAnalysisGist({
-              ts: new Date().toISOString(), version: VERSION,
-              status: 'insufficient_data', ideas: [], pushed: pushedPrev
-            });
-            process.exit(0);
-          }
 
           const regime = stateData?.regime?.regime || 'Unknown';
           const extractOpenSyms = st => {
@@ -319,229 +312,282 @@ jobs:
           let { pos: positions, syms: openSyms } = extractOpenSyms(stateData);
           log(`Regime: ${regime} | Open positions: ${positions.length}`);
 
-          // ---- STEP 2: Normalize + group by symbol per worker ----
-          log('');
-          log('━━━ STEP 2: Normalize trades per worker ━━━');
           const bySymbol1 = USE_W1 ? normalizeWorker1Trades(pnlData) : {};
           const bySymbol2 = USE_W2 ? normalizeWorker2Trades(pnlData2) : {};
-          log(`Worker1 symbols: ${Object.keys(bySymbol1).join(', ') || '(none)'}`);
-          log(`Worker2 symbols: ${Object.keys(bySymbol2).join(', ') || '(none)'}`);
-          const commonSymbols =
-            WORKER_MODE === '1' ? Object.keys(bySymbol1)
-            : WORKER_MODE === '2' ? Object.keys(bySymbol2)
-            : Object.keys(bySymbol1).filter(s => bySymbol2[s]);
-          log(`Symbols used (mode ${WORKER_MODE}): ${commonSymbols.join(', ') || '(none)'}`);
-          if (!commonSymbols.length) {
-            log('No usable symbols. Writing empty analysis.');
-            await writeAnalysisGist({
-              ts: new Date().toISOString(), version: VERSION,
-              status: 'no_common_symbols', ideas: [], pushed: pushedPrev
-            });
-            process.exit(0);
-          }
-
-          // ---- STEP 3: Fetch current prices ----
-          log('');
-          log('━━━ STEP 3: Fetch current prices ━━━');
-          const tickers = {};
-          for (const sym of commonSymbols) {
-            tickers[sym] = await getBybitTicker(sym);
-            await sleep(100);
-            if (tickers[sym]) log(`  ${sym}: $${tickers[sym].lastPrice}`);
-            else log(`  ${sym}: ticker fetch failed`);
-          }
-
-          // ---- STEP 4: Direction, agreement, open-pos, cooldown ----
-          log('');
-          log('━━━ STEP 4: Trend table (lastExit vs current) ━━━');
-          const rows = [];
-          const perSymbolDebug = {};
-          const candidates = [];
-          for (const sym of commonSymbols) {
-            const ticker = tickers[sym];
-            if (!ticker || !(ticker.lastPrice > 0)) continue;
-            const currentPrice = ticker.lastPrice;
-
-            const d1 = USE_W1 ? computeDirection(bySymbol1[sym], currentPrice) : null;
-            const d2 = USE_W2 ? computeDirection(bySymbol2[sym], currentPrice) : null;
-            const used = [d1, d2].filter(Boolean);
-            const side = used[0].direction;
-            const agree = side !== 'neutral' && used.every(d => d.direction === side);
-            const score = used.reduce((s, d) => s + Math.abs(d.moveBps), 0) / used.length;
-
-            let skip = null;
-            if (!agree) skip = 'no_agreement';
-            else if (openSyms.has(sym)) skip = 'open_position';
-            else {
-              const cdTs = pushedPrev[sym + '|' + side];
-              if (cdTs && Date.now() - cdTs < TTL_SEC * 1000) skip = 'cooldown';
-            }
-
-            rows.push({
-              symbol: sym,
-              w1LastExit: d1 ? d1.lastExit : null,
-              w2LastExit: d2 ? d2.lastExit : null,
-              current: currentPrice,
-              w1Dir: d1 ? d1.direction : 'n/a',
-              w2Dir: d2 ? d2.direction : 'n/a',
-              agree,
-              skip
-            });
-            perSymbolDebug[sym] = { currentPrice, worker1: d1, worker2: d2, agree, skip };
-
-            if (skip) continue;
-            candidates.push({ symbol: sym, side, score, currentPrice, ticker });
-          }
-
-          const arrow = d => d === 'long' ? '🔼 UP' : d === 'short' ? '🔽 DOWN' : d === 'n/a' ? '— N/A' : '⏸ FLAT';
-          log('');
-          log('Symbol         | W1 LastExit  | W2 LastExit  | Current      | Trend(W1) | Trend(W2) | Agree? | Skip');
-          log('---------------|--------------|--------------|--------------|-----------|-----------|--------|-----');
-          for (const r of rows) {
-            const sym = r.symbol.padEnd(14);
-            const w1e = (r.w1LastExit ?? '-').toString().padEnd(12);
-            const w2e = (r.w2LastExit ?? '-').toString().padEnd(12);
-            const cur = r.current.toString().padEnd(12);
-            const t1 = arrow(r.w1Dir).padEnd(9);
-            const t2 = arrow(r.w2Dir).padEnd(9);
-            const ag = r.agree ? '✅' : '❌';
-            log(`${sym} | ${w1e} | ${w2e} | ${cur} | ${t1} | ${t2} | ${ag}     | ${r.skip || '-'}`);
-          }
-
-          // ---- STEP 5: Score + rank -> pool for watch ----
-          log('');
-          log('━━━ STEP 5: Score + rank candidates ━━━');
-          candidates.sort((a, b) => b.score - a.score);
-          for (const c of candidates) {
-            log(`  ${c.symbol} ${c.side.toUpperCase()} score=${c.score.toFixed(1)}bps`);
-          }
-          const pool = candidates.slice(0, WATCH_POOL);
-          log(`Watch pool: ${pool.length} candidate(s)`);
-
-          // ---- STEP 6: WATCH PHASE (artificial SL) ----
-          log('');
-          log(`━━━ STEP 6: Watch phase (${WATCH_MIN} min, artificial SL ${ARTIFICIAL_SL_PCT}%) ━━━`);
-          const watch = pool.map(c => {
-            const ref = c.currentPrice;
-            const line = c.side === 'long'
-              ? ref * (1 - ARTIFICIAL_SL_PCT / 100)
-              : ref * (1 + ARTIFICIAL_SL_PCT / 100);
-            return {
-              ...c,
-              refEntry: ref,
-              elimLine: +line.toPrecision(7),
-              last: ref,
-              maxAdversePct: 0,
-              maxFavorablePct: 0,
-              eliminated: false,
-              elimPrice: null,
-              elimAt: null
-            };
-          });
-          for (const w of watch) {
-            log(`  ${w.symbol} ${w.side.toUpperCase()} ref=${w.refEntry} elimLine=${w.elimLine}`);
-          }
-
-          let polls = 0;
-          if (watch.length) {
-            const endAt = Date.now() + WATCH_MIN * 60e3;
-            while (true) {
-              let prices = null;
-              try { prices = await getAllLastPrices(); } catch (e) { log('  poll warn:', e?.message); }
-              if (prices) {
-                polls++;
-                for (const w of watch) {
-                  if (w.eliminated) continue;
-                  const p = prices[w.symbol];
-                  if (!(p > 0)) continue;
-                  w.last = p;
-                  const adverse = w.side === 'long'
-                    ? (w.refEntry - p) / w.refEntry * 100
-                    : (p - w.refEntry) / w.refEntry * 100;
-                  const favorable = -adverse;
-                  if (adverse > w.maxAdversePct) w.maxAdversePct = adverse;
-                  if (favorable > w.maxFavorablePct) w.maxFavorablePct = favorable;
-                  if (adverse >= ARTIFICIAL_SL_PCT) {
-                    w.eliminated = true;
-                    w.elimPrice = p;
-                    w.elimAt = new Date().toISOString();
-                    log(`  ❌ ${w.symbol} ${w.side.toUpperCase()} eliminated @ ${p} (adverse ${adverse.toFixed(3)}%)`);
-                  }
-                }
-              }
-              if (watch.every(w => w.eliminated)) { log('  All candidates eliminated — stopping watch early.'); break; }
-              const remaining = endAt - Date.now();
-              if (remaining <= 0) break;
-              await sleep(Math.min(POLL_MS, remaining));
-            }
-          }
-          log(`Watch finished (${polls} successful polls)`);
-          for (const w of watch) {
-            log(`  ${w.eliminated ? '❌' : '✅'} ${w.symbol} ${w.side.toUpperCase()} last=${w.last} maxAdverse=${w.maxAdversePct.toFixed(3)}% maxFavorable=${w.maxFavorablePct.toFixed(3)}%`);
-          }
-
-          // ---- STEP 7: Survivors -> re-check open positions -> top N ----
-          log('');
-          log('━━━ STEP 7: Select top N from survivors ━━━');
-          try {
-            const st2 = await fetchRetry(`${WORKER_URL}/json`, 2, 300);
-            const x = extractOpenSyms(st2);
-            positions = x.pos; openSyms = x.syms;
-            log(`Re-checked open positions: ${positions.length}`);
-          } catch (e) {
-            log('WARN: re-check of open positions failed:', e?.message);
-          }
-          const survivors = watch
-            .filter(w => !w.eliminated && w.last > 0)
-            .filter(w => {
-              if (openSyms.has(w.symbol)) {
-                log(`  ${w.symbol} dropped: position opened during watch`);
-                return false;
-              }
-              return true;
-            })
-            .sort((a, b) => b.score - a.score);
-          const top = survivors.slice(0, TOP_N);
-          log(`Survivors: ${survivors.length} | Selected: ${top.length}`);
 
           const sl_bps = Math.min(SL_BPS_CFG, MAX_SL_BPS);
           const tp_bps = TP_BPS_CFG;
-          const finalIdeas = top.map(c => {
-            const entry = +c.last.toPrecision(7);
-            let tp_abs, sl_abs;
-            if (c.side === 'long') {
-              tp_abs = +(entry * (1 + tp_bps / 10000)).toPrecision(7);
-              sl_abs = +(entry * (1 - sl_bps / 10000)).toPrecision(7);
-            } else {
-              tp_abs = +(entry * (1 - tp_bps / 10000)).toPrecision(7);
-              sl_abs = +(entry * (1 + sl_bps / 10000)).toPrecision(7);
-            }
-            const rrr = +(tp_bps / sl_bps).toFixed(2);
-            const basis = WORKER_MODE === 'both'
-              ? 'Both workers agree: price'
-              : `Worker ${WORKER_MODE}: price`;
-            return {
-              symbol: c.symbol,
-              base: c.symbol.replace('USDT', ''),
-              quote: 'USDT',
-              side: c.side,
-              entry, tp_abs, sl_abs, tp_bps, sl_bps, rrr,
-              ref_entry: c.refEntry,
-              score_bps: +c.score.toFixed(1),
-              watch_max_adverse_pct: +c.maxAdversePct.toFixed(3),
-              watch_max_favorable_pct: +c.maxFavorablePct.toFixed(3),
-              funding_rate: c.ticker?.fundingRate || 0,
-              volume_24h: c.ticker?.turnover24h || 0,
-              reasons: [
-                `${basis} ${c.side === 'long' ? 'above' : 'below'} last exit price`,
-                `Score (avg move from last exit) = ${c.score.toFixed(1)}bps`,
-                `Survived ${WATCH_MIN}min watch (artificial SL ${ARTIFICIAL_SL_PCT}%, max adverse ${c.maxAdversePct.toFixed(3)}%)`
-              ],
-              generated_at: new Date().toISOString()
+          const arrow = d => d === 'long' ? '🔼 UP' : d === 'short' ? '🔽 DOWN' : d === 'n/a' ? '— N/A' : '⏸ FLAT';
+
+          // ================================================================
+          //  ONE FULL PASS: steps 2-7 (symbols -> prices -> trend -> watch -> top N)
+          //  passMode: '1' | '2' | 'both'
+          // ================================================================
+          async function runPass(passMode, isFallback) {
+            const tag = isFallback ? '[FALLBACK W1] ' : '';
+            const useW1 = passMode === '1' || passMode === 'both';
+            const useW2 = passMode === '2' || passMode === 'both';
+            const res = {
+              mode: passMode, fallback: isFallback, status: 'ok',
+              commonSymbols: [], rows: [], perSymbolDebug: {},
+              candidates: [], pool: [], watch: [], survivors: [], finalIdeas: []
             };
-          });
+
+            if ((useW1 && !pnlData.length) || (useW2 && !pnlData2.length)) {
+              log('');
+              log(`${tag}Missing closed trades for mode (${passMode}). Nothing to analyze.`);
+              res.status = 'insufficient_data';
+              return res;
+            }
+
+            // ---- STEP 2: symbols ----
+            log('');
+            log(`━━━ ${tag}STEP 2: Symbols (mode ${passMode}) ━━━`);
+            log(`Worker1 symbols: ${useW1 ? (Object.keys(bySymbol1).join(', ') || '(none)') : '(not used)'}`);
+            log(`Worker2 symbols: ${useW2 ? (Object.keys(bySymbol2).join(', ') || '(none)') : '(not used)'}`);
+            const commonSymbols =
+              passMode === '1' ? Object.keys(bySymbol1)
+              : passMode === '2' ? Object.keys(bySymbol2)
+              : Object.keys(bySymbol1).filter(s => bySymbol2[s]);
+            res.commonSymbols = commonSymbols;
+            log(`Symbols used (mode ${passMode}): ${commonSymbols.join(', ') || '(none)'}`);
+            if (!commonSymbols.length) {
+              log(`${tag}No usable symbols.`);
+              res.status = 'no_common_symbols';
+              return res;
+            }
+
+            // ---- STEP 3: prices ----
+            log('');
+            log(`━━━ ${tag}STEP 3: Fetch current prices ━━━`);
+            const tickers = {};
+            for (const sym of commonSymbols) {
+              tickers[sym] = await getBybitTicker(sym);
+              await sleep(100);
+              if (tickers[sym]) log(`  ${sym}: $${tickers[sym].lastPrice}`);
+              else log(`  ${sym}: ticker fetch failed`);
+            }
+
+            // ---- STEP 4: direction, agreement, open-pos, cooldown ----
+            log('');
+            log(`━━━ ${tag}STEP 4: Trend table (lastExit vs current) ━━━`);
+            const rows = res.rows;
+            const perSymbolDebug = res.perSymbolDebug;
+            const candidates = res.candidates;
+            for (const sym of commonSymbols) {
+              const ticker = tickers[sym];
+              if (!ticker || !(ticker.lastPrice > 0)) continue;
+              const currentPrice = ticker.lastPrice;
+
+              const d1 = useW1 ? computeDirection(bySymbol1[sym], currentPrice) : null;
+              const d2 = useW2 ? computeDirection(bySymbol2[sym], currentPrice) : null;
+              const used = [d1, d2].filter(Boolean);
+              const side = used[0].direction;
+              const agree = side !== 'neutral' && used.every(d => d.direction === side);
+              const score = used.reduce((s, d) => s + Math.abs(d.moveBps), 0) / used.length;
+
+              let skip = null;
+              if (!agree) skip = 'no_agreement';
+              else if (openSyms.has(sym)) skip = 'open_position';
+              else {
+                const cdTs = pushedPrev[sym + '|' + side];
+                if (cdTs && Date.now() - cdTs < TTL_SEC * 1000) skip = 'cooldown';
+              }
+
+              rows.push({
+                symbol: sym,
+                w1LastExit: d1 ? d1.lastExit : null,
+                w2LastExit: d2 ? d2.lastExit : null,
+                current: currentPrice,
+                w1Dir: d1 ? d1.direction : 'n/a',
+                w2Dir: d2 ? d2.direction : 'n/a',
+                agree,
+                skip
+              });
+              perSymbolDebug[sym] = { currentPrice, worker1: d1, worker2: d2, agree, skip };
+
+              if (skip) continue;
+              candidates.push({ symbol: sym, side, score, currentPrice, ticker });
+            }
+
+            log('');
+            log('Symbol         | W1 LastExit  | W2 LastExit  | Current      | Trend(W1) | Trend(W2) | Agree? | Skip');
+            log('---------------|--------------|--------------|--------------|-----------|-----------|--------|-----');
+            for (const r of rows) {
+              const sym = r.symbol.padEnd(14);
+              const w1e = (r.w1LastExit ?? '-').toString().padEnd(12);
+              const w2e = (r.w2LastExit ?? '-').toString().padEnd(12);
+              const cur = r.current.toString().padEnd(12);
+              const t1 = arrow(r.w1Dir).padEnd(9);
+              const t2 = arrow(r.w2Dir).padEnd(9);
+              const ag = r.agree ? '✅' : '❌';
+              log(`${sym} | ${w1e} | ${w2e} | ${cur} | ${t1} | ${t2} | ${ag}     | ${r.skip || '-'}`);
+            }
+
+            // ---- STEP 5: score + rank -> pool ----
+            log('');
+            log(`━━━ ${tag}STEP 5: Score + rank candidates ━━━`);
+            candidates.sort((a, b) => b.score - a.score);
+            for (const c of candidates) {
+              log(`  ${c.symbol} ${c.side.toUpperCase()} score=${c.score.toFixed(1)}bps`);
+            }
+            const pool = candidates.slice(0, WATCH_POOL);
+            res.pool = pool;
+            log(`Watch pool: ${pool.length} candidate(s)`);
+
+            // ---- STEP 6: watch phase (artificial SL) ----
+            log('');
+            log(`━━━ ${tag}STEP 6: Watch phase (${WATCH_MIN} min, artificial SL ${ARTIFICIAL_SL_PCT}%) ━━━`);
+            const watch = pool.map(c => {
+              const ref = c.currentPrice;
+              const line = c.side === 'long'
+                ? ref * (1 - ARTIFICIAL_SL_PCT / 100)
+                : ref * (1 + ARTIFICIAL_SL_PCT / 100);
+              return {
+                ...c,
+                refEntry: ref,
+                elimLine: +line.toPrecision(7),
+                last: ref,
+                maxAdversePct: 0,
+                maxFavorablePct: 0,
+                eliminated: false,
+                elimPrice: null,
+                elimAt: null
+              };
+            });
+            res.watch = watch;
+            for (const w of watch) {
+              log(`  ${w.symbol} ${w.side.toUpperCase()} ref=${w.refEntry} elimLine=${w.elimLine}`);
+            }
+
+            let polls = 0;
+            if (watch.length) {
+              const endAt = Date.now() + WATCH_MIN * 60e3;
+              while (true) {
+                let prices = null;
+                try { prices = await getAllLastPrices(); } catch (e) { log('  poll warn:', e?.message); }
+                if (prices) {
+                  polls++;
+                  for (const w of watch) {
+                    if (w.eliminated) continue;
+                    const p = prices[w.symbol];
+                    if (!(p > 0)) continue;
+                    w.last = p;
+                    const adverse = w.side === 'long'
+                      ? (w.refEntry - p) / w.refEntry * 100
+                      : (p - w.refEntry) / w.refEntry * 100;
+                    const favorable = -adverse;
+                    if (adverse > w.maxAdversePct) w.maxAdversePct = adverse;
+                    if (favorable > w.maxFavorablePct) w.maxFavorablePct = favorable;
+                    if (adverse >= ARTIFICIAL_SL_PCT) {
+                      w.eliminated = true;
+                      w.elimPrice = p;
+                      w.elimAt = new Date().toISOString();
+                      log(`  ❌ ${w.symbol} ${w.side.toUpperCase()} eliminated @ ${p} (adverse ${adverse.toFixed(3)}%)`);
+                    }
+                  }
+                }
+                if (watch.every(w => w.eliminated)) { log('  All candidates eliminated — stopping watch early.'); break; }
+                const remaining = endAt - Date.now();
+                if (remaining <= 0) break;
+                await sleep(Math.min(POLL_MS, remaining));
+              }
+            }
+            log(`Watch finished (${polls} successful polls)`);
+            for (const w of watch) {
+              log(`  ${w.eliminated ? '❌' : '✅'} ${w.symbol} ${w.side.toUpperCase()} last=${w.last} maxAdverse=${w.maxAdversePct.toFixed(3)}% maxFavorable=${w.maxFavorablePct.toFixed(3)}%`);
+            }
+
+            // ---- STEP 7: survivors -> re-check open positions -> top N ----
+            log('');
+            log(`━━━ ${tag}STEP 7: Select top N from survivors ━━━`);
+            try {
+              const st2 = await fetchRetry(`${WORKER_URL}/json`, 2, 300);
+              const x = extractOpenSyms(st2);
+              positions = x.pos; openSyms = x.syms;
+              log(`Re-checked open positions: ${positions.length}`);
+            } catch (e) {
+              log('WARN: re-check of open positions failed:', e?.message);
+            }
+            const survivors = watch
+              .filter(w => !w.eliminated && w.last > 0)
+              .filter(w => {
+                if (openSyms.has(w.symbol)) {
+                  log(`  ${w.symbol} dropped: position opened during watch`);
+                  return false;
+                }
+                return true;
+              })
+              .sort((a, b) => b.score - a.score);
+            res.survivors = survivors;
+            const top = survivors.slice(0, TOP_N);
+            log(`Survivors: ${survivors.length} | Selected: ${top.length}`);
+
+            res.finalIdeas = top.map(c => {
+              const entry = +c.last.toPrecision(7);
+              let tp_abs, sl_abs;
+              if (c.side === 'long') {
+                tp_abs = +(entry * (1 + tp_bps / 10000)).toPrecision(7);
+                sl_abs = +(entry * (1 - sl_bps / 10000)).toPrecision(7);
+              } else {
+                tp_abs = +(entry * (1 - tp_bps / 10000)).toPrecision(7);
+                sl_abs = +(entry * (1 + sl_bps / 10000)).toPrecision(7);
+              }
+              const rrr = +(tp_bps / sl_bps).toFixed(2);
+              const basis = isFallback
+                ? 'Fallback (worker 1 only): price'
+                : passMode === 'both' ? 'Both workers agree: price' : `Worker ${passMode}: price`;
+              return {
+                symbol: c.symbol,
+                base: c.symbol.replace('USDT', ''),
+                quote: 'USDT',
+                side: c.side,
+                entry, tp_abs, sl_abs, tp_bps, sl_bps, rrr,
+                ref_entry: c.refEntry,
+                score_bps: +c.score.toFixed(1),
+                fallback: isFallback,
+                watch_max_adverse_pct: +c.maxAdversePct.toFixed(3),
+                watch_max_favorable_pct: +c.maxFavorablePct.toFixed(3),
+                funding_rate: c.ticker?.fundingRate || 0,
+                volume_24h: c.ticker?.turnover24h || 0,
+                reasons: [
+                  `${basis} ${c.side === 'long' ? 'above' : 'below'} last exit price`,
+                  `Score (avg move from last exit) = ${c.score.toFixed(1)}bps`,
+                  `Survived ${WATCH_MIN}min watch (artificial SL ${ARTIFICIAL_SL_PCT}%, max adverse ${c.maxAdversePct.toFixed(3)}%)`
+                ],
+                generated_at: new Date().toISOString()
+              };
+            });
+            return res;
+          }
+
+          // ---- Run primary pass, then fallback if nothing to push ----
+          let result = await runPass(WORKER_MODE, false);
+          let fallbackUsed = false;
+          const primarySummary = {
+            mode: WORKER_MODE,
+            status: result.status,
+            candidates: result.candidates.length,
+            survivors: result.survivors.length,
+            ideas: result.finalIdeas.length
+          };
+
+          if (result.finalIdeas.length === 0 && WORKER_MODE === 'both') {
+            log('');
+            log('━━━ FALLBACK: primary (both) pass produced 0 ideas ━━━');
+            if (pnlData.length) {
+              log('Running fallback pass with worker 1 only.');
+              fallbackUsed = true;
+              result = await runPass('1', true);
+            } else {
+              log('Fallback skipped: no worker 1 trades available.');
+            }
+          }
+
+          const { commonSymbols, rows, perSymbolDebug, candidates, pool, watch, survivors, finalIdeas } = result;
+
           log('');
-          log(`Final ideas: ${finalIdeas.length}`);
+          log(`Final ideas: ${finalIdeas.length}${fallbackUsed ? ' (from fallback)' : ''}`);
           for (const i of finalIdeas) {
             log(`  ${i.symbol} ${i.side.toUpperCase()} entry=${i.entry} tp=${i.tp_abs} sl=${i.sl_abs} score=${i.score_bps}bps`);
           }
@@ -559,8 +605,10 @@ jobs:
           const output = {
             ts: new Date().toISOString(),
             version: VERSION,
-            status: 'ok',
+            status: result.status,
             worker_mode: WORKER_MODE,
+            fallback_used: fallbackUsed,
+            primary_pass: primarySummary,
             worker_regime: regime,
             open_positions: positions.length,
             common_symbols: commonSymbols.length,
@@ -602,7 +650,10 @@ jobs:
               ts: new Date().toISOString(),
               mode: 'normal',
               source: 'simple_entry_exit_analyzer',
-              meta: { origin: 'github_actions_analyzer', version: VERSION, worker_regime: regime, worker_mode: WORKER_MODE },
+              meta: {
+                origin: 'github_actions_analyzer', version: VERSION,
+                worker_regime: regime, worker_mode: WORKER_MODE, fallback: fallbackUsed
+              },
               top_n: pushIdeas.length,
               ideas: pushIdeas.map((idea, i) => ({
                 idea_id: crypto.randomUUID(),
