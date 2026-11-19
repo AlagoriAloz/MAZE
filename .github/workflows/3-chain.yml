@@ -2,21 +2,18 @@ name: 3 — Chain End
 on:
   repository_dispatch:
     types: [run_3]
-
 concurrency:
   group: chain-3          # only one run active at a time
   cancel-in-progress: false  # queue, never cancel
-
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 10   # raised to cover up to 5-min wait + original work
+    timeout-minutes: 10
     steps:
       - name: Log trigger source
         run: |
           echo "Triggered by: ${{ github.event.client_payload.source || 'chain_2' }}"
-
-      - name: Enforce 5-minute gap since last trigger
+      - name: Check 5-minute gap (Cancel in 2nd minute if < 5 min gap)
         env:
           GH_TOKEN: ${{ secrets.PAT_TOKEN }}
         run: |
@@ -46,16 +43,25 @@ jobs:
           MIN_GAP=300   # 5 minutes in seconds
 
           if [ "$DIFF" -lt "$MIN_GAP" ]; then
-            WAIT=$(( MIN_GAP - DIFF ))
-            echo "Previous run was triggered ${DIFF}s ago — sleeping ${WAIT}s to honour 5-minute gap."
-            sleep "$WAIT"
+            echo "5-minute gap scenario triggered: Previous run was ${DIFF}s ago (< 5 minutes)."
+            echo "Waiting 2 minutes (120 seconds) before cancelling..."
+            
+            # Wait 2 minutes (120 seconds)
+            sleep 120
+            
+            echo "2 minutes reached. Cancelling this run..."
+            curl -s -X POST \
+              -H "Authorization: token $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/cancel"
+            
+            sleep 5
+            exit 1
           else
-            echo "Previous run was triggered ${DIFF}s ago — gap satisfied, proceeding."
+            echo "Previous run was triggered ${DIFF}s ago — 5-minute gap satisfied, proceeding."
           fi
-
       - name: Sleep 1 minute
         run: sleep 60
-
       - name: Trigger X + restart Chain 1
         env:
           PAT: ${{ secrets.PAT_TOKEN }}
