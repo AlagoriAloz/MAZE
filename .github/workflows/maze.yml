@@ -1,22 +1,17 @@
-name: Trend Analyzer (Simple Entry/Exit v3.0)
-
+name: Trend Analyzer (Simple Entry/Exit v4.0)
 on:
   repository_dispatch:
     types: [run_X]
   workflow_dispatch: {}
-
 permissions:
   contents: read
-
 concurrency:
   group: trend-analyzer
   cancel-in-progress: true
-
 jobs:
   analyze:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-
+    timeout-minutes: 25
     env:
       WORKER_URL: ${{ secrets.WORKER_URL }}
       WORKER_URL_2: ${{ secrets.WORKER_URL_2 }}
@@ -31,13 +26,15 @@ jobs:
       SL_BPS: ${{ vars.ANALYZER_SL_BPS }}
       NOTIONAL_USD: ${{ vars.NOTIONAL_USD }}
       MIN_MOVE_BPS: ${{ vars.ANALYZER_MIN_MOVE_BPS }}
-
+      WATCH_MIN: ${{ vars.ANALYZER_WATCH_MIN }}
+      ARTIFICIAL_SL_PCT: ${{ vars.ANALYZER_ARTIFICIAL_SL_PCT }}
+      WATCH_POOL: ${{ vars.ANALYZER_WATCH_POOL }}
+      PNL_LIMIT: ${{ vars.ANALYZER_PNL_LIMIT }}
     steps:
       - name: Setup Node 20
         uses: actions/setup-node@v4
         with:
           node-version: 20
-
       - name: Run Simple Entry/Exit Analyzer
         shell: bash
         run: |
@@ -48,13 +45,12 @@ jobs:
           if [[ -z "${ANALYSIS_GIST_ID:-}" || -z "${GIST_TOKEN:-}" ]]; then
             echo "[analyzer] Missing ANALYSIS_GIST_ID or GIST_TOKEN"; exit 1
           fi
-
           set +e
           node - <<'NODE'
           (async () => {
           'use strict';
           const crypto = require('crypto');
-          const VERSION = '3.0.0';
+          const VERSION = '4.0.0';
           const UA = `trend-analyzer/${VERSION}`;
           const log = (...a) => console.log('[analyzer]', ...a);
 
@@ -67,6 +63,7 @@ jobs:
           const GIST_TOKEN = process.env.GIST_TOKEN || '';
           const PUSH_URL = process.env.WORKER_PUSH_URL || '';
           const PUSH_TOKEN = process.env.PUSH_TOKEN || '';
+
           const TOP_N = Math.max(1, Math.min(10, Number(process.env.TOP_N || '3')));
           const MAX_SL_BPS = Math.max(10, Math.min(300, Number(process.env.MAX_SL_BPS || '80')));
           const TP_BPS_CFG = Math.max(10, Number(process.env.TP_BPS || '100'));
@@ -74,11 +71,21 @@ jobs:
           const NOTIONAL = Math.max(50, Number(process.env.NOTIONAL_USD || '300'));
           const BYBIT_PUBLIC = (process.env.BYBIT_PROXY_URL || 'https://api.bybit.com').replace(/\/+$/, '');
           const MIN_MOVE_BPS = Math.max(0, Number(process.env.MIN_MOVE_BPS || '5'));
-          const MAX_AGE_H = 72;
-          const TTL_SEC = 3600;
+
+          // --- NEW: watch phase ---
+          const WATCH_MIN = Math.max(0, Math.min(15, Number(process.env.WATCH_MIN || '3')));
+          const ARTIFICIAL_SL_PCT = Math.max(0.01, Math.min(5, Number(process.env.ARTIFICIAL_SL_PCT || '0.3')));
+          const WATCH_POOL = Math.max(TOP_N, Math.min(30, Number(process.env.WATCH_POOL || '10')));
+          const POLL_MS = 10000;
+
+          // --- NEW: fetch full history ---
+          const PNL_LIMIT = Math.max(100, Number(process.env.PNL_LIMIT || '1000'));
+
+          // --- Cooldown: 5 minutes (also sent to worker as idea ttl_sec) ---
+          const TTL_SEC = 300;
+          const PUSHED_KEEP_MS = Math.max(30 * 60e3, TTL_SEC * 1000 * 2);
 
           const sleep = ms => new Promise(r => setTimeout(r, ms));
-          const mean = a => a.length ? a.reduce((s, x) => s + x, 0) / a.length : 0;
 
           // ================================================================
           //  HTTP HELPERS
@@ -92,7 +99,6 @@ jobs:
               return await r.json();
             } finally { clearTimeout(t); }
           }
-
           async function fetchRetry(url, tries = 3, delayMs = 600) {
             for (let i = 0; i < tries; i++) {
               try { return await fetchJSON(url); }
@@ -124,7 +130,6 @@ jobs:
               return {};
             }
           }
-
           async function writeAnalysisGist(data) {
             try {
               const r = await fetch(`https://api.github.com/gists/${ANALYSIS_GIST_ID}`, {
@@ -148,7 +153,7 @@ jobs:
           }
 
           // ================================================================
-          //  BYBIT TICKER
+          //  BYBIT
           // ================================================================
           async function getBybitTicker(symbol) {
             const url = `${BYBIT_PUBLIC}/v5/market/tickers?category=linear&symbol=${symbol}`;
@@ -167,6 +172,17 @@ jobs:
               };
             } catch { return null; }
           }
+          // One call returns all linear tickers -> cheap polling for the watch phase
+          async function getAllLastPrices() {
+            const url = `${BYBIT_PUBLIC}/v5/market/tickers?category=linear`;
+            const data = await fetchRetry(url, 2, 300);
+            const map = {};
+            for (const t of data?.result?.list || []) {
+              const p = +t.lastPrice;
+              if (p > 0) map[t.symbol] = p;
+            }
+            return map;
+          }
 
           // ================================================================
           //  CORE: direction = compare current price vs last exit price
@@ -176,10 +192,8 @@ jobs:
               direction: 'neutral', reason: 'no_trades',
               lastExit: null, moveBps: 0
             };
-
             const lastExit = trades.at(-1).exitPrice;
             const moveBps = (currentPrice / lastExit - 1) * 10000;
-
             if (moveBps > MIN_MOVE_BPS) {
               return { direction: 'long', reason: 'price_above_last_exit', lastExit, moveBps };
             }
@@ -190,7 +204,7 @@ jobs:
           }
 
           // ================================================================
-          //  NORMALIZE TRADES FROM A WORKER
+          //  NORMALIZE TRADES FROM A WORKER (ALL history, no age filter)
           // ================================================================
           function normalizeWorker1Trades(pnlData) {
             const bySymbol = {};
@@ -200,10 +214,7 @@ jobs:
               const exitPrice  = +t.exitPrice  || +t.avgExitPrice  || 0;
               const ms = v => (v > 0 && v < 1e11) ? v * 1000 : v;
               const closedAt   = ms(+t.closedAt || +t.updatedTime || 0);
-
               if (!(entryPrice > 0 && exitPrice > 0 && closedAt > 0)) continue;
-              if (Date.now() - closedAt > MAX_AGE_H * 3600e3) continue;
-
               if (!bySymbol[t.symbol]) bySymbol[t.symbol] = [];
               bySymbol[t.symbol].push({ entryPrice, exitPrice, closedAt });
             }
@@ -212,7 +223,6 @@ jobs:
             }
             return bySymbol;
           }
-
           function normalizeWorker2Trades(pnlData2) {
             const bySymbol = {};
             for (const t of pnlData2) {
@@ -220,10 +230,7 @@ jobs:
               const entryPrice = +t.entryPrice || 0;
               const exitPrice  = +t.exitPrice  || 0;
               const closedAt   = +t.time || 0;
-
               if (!(entryPrice > 0 && exitPrice > 0 && closedAt > 0)) continue;
-              if (Date.now() - closedAt > MAX_AGE_H * 3600e3) continue;
-
               if (!bySymbol[t.symbol]) bySymbol[t.symbol] = [];
               bySymbol[t.symbol].push({ entryPrice, exitPrice, closedAt });
             }
@@ -239,19 +246,20 @@ jobs:
           log('╔═══════════════════════════════════════════════╗');
           log('║  Simple Entry/Exit Analyzer v' + VERSION + '          ║');
           log('╚═══════════════════════════════════════════════╝');
+          log(`Config: topN=${TOP_N} pool=${WATCH_POOL} watch=${WATCH_MIN}min artificialSL=${ARTIFICIAL_SL_PCT}% cooldown=${TTL_SEC}s pnlLimit=${PNL_LIMIT}`);
 
           const prev = await readAnalysisGist();
           const pushedPrev = prev.pushed || {};
 
-          // ---- STEP 1: Fetch trades from both workers ----
+          // ---- STEP 1: Fetch ALL trades from both workers ----
           log('');
-          log('━━━ STEP 1: Fetch worker trades ━━━');
-
+          log('━━━ STEP 1: Fetch worker trades (full history) ━━━');
           let pnlData = [];
           let stateData = {};
           try {
-            const raw = await fetchRetry(`${WORKER_URL}/pnl?limit=100`);
+            const raw = await fetchRetry(`${WORKER_URL}/pnl?limit=${PNL_LIMIT}`);
             pnlData = Array.isArray(raw) ? raw : (raw?.items || raw?.data || raw?.closedPnl || []);
+            log(`Worker 1: fetched ${pnlData.length} closed trades`);
           } catch (e) {
             log('FATAL: Cannot reach worker 1 /pnl:', e?.message);
             await writeAnalysisGist({
@@ -260,13 +268,11 @@ jobs:
             });
             process.exit(1);
           }
-
           try {
             stateData = await fetchRetry(`${WORKER_URL}/json`);
           } catch (e) {
             log('WARN: Cannot reach worker state /json:', e?.message);
           }
-
           let pnlData2 = [];
           if (WORKER_URL_2) {
             try {
@@ -279,7 +285,6 @@ jobs:
           } else {
             log('Worker 2: not configured — both-agree check cannot run, aborting.');
           }
-
           if (!pnlData.length || !pnlData2.length) {
             log('Need closed trades from BOTH workers to agree. Writing empty analysis.');
             await writeAnalysisGist({
@@ -290,9 +295,12 @@ jobs:
           }
 
           const regime = stateData?.regime?.regime || 'Unknown';
-          const positions = Array.isArray(stateData?.positions)
-            ? stateData.positions.filter(p => !(+p.size === 0)) : [];
-          const openSyms = new Set(positions.map(p => p.symbol));
+          const extractOpenSyms = st => {
+            const pos = Array.isArray(st?.positions)
+              ? st.positions.filter(p => !(+p.size === 0)) : [];
+            return { pos, syms: new Set(pos.map(p => p.symbol)) };
+          };
+          let { pos: positions, syms: openSyms } = extractOpenSyms(stateData);
           log(`Regime: ${regime} | Open positions: ${positions.length}`);
 
           // ---- STEP 2: Normalize + group by symbol per worker ----
@@ -302,10 +310,8 @@ jobs:
           const bySymbol2 = normalizeWorker2Trades(pnlData2);
           log(`Worker1 symbols: ${Object.keys(bySymbol1).join(', ') || '(none)'}`);
           log(`Worker2 symbols: ${Object.keys(bySymbol2).join(', ') || '(none)'}`);
-
           const commonSymbols = Object.keys(bySymbol1).filter(s => bySymbol2[s]);
           log(`Common symbols (both workers): ${commonSymbols.join(', ') || '(none)'}`);
-
           if (!commonSymbols.length) {
             log('No common symbols between workers. Writing empty analysis.');
             await writeAnalysisGist({
@@ -326,24 +332,27 @@ jobs:
             else log(`  ${sym}: ticker fetch failed`);
           }
 
-          // ---- STEP 4: Compute direction per worker, require agreement ----
+          // ---- STEP 4: Direction per worker, agreement, open-pos, cooldown ----
           log('');
           log('━━━ STEP 4: Trend table (lastExit vs current) ━━━');
-
           const rows = [];
           const perSymbolDebug = {};
           const candidates = [];
-
           for (const sym of commonSymbols) {
             const ticker = tickers[sym];
             if (!ticker || !(ticker.lastPrice > 0)) continue;
             const currentPrice = ticker.lastPrice;
-
             const d1 = computeDirection(bySymbol1[sym], currentPrice);
             const d2 = computeDirection(bySymbol2[sym], currentPrice);
+            const agree = (d1.direction !== 'neutral') && (d1.direction === d2.direction);
 
-            const agree = (d1.direction !== 'neutral')
-              && (d1.direction === d2.direction);
+            let skip = null;
+            if (!agree) skip = 'no_agreement';
+            else if (openSyms.has(sym)) skip = 'open_position';
+            else {
+              const cdTs = pushedPrev[sym + '|' + d1.direction];
+              if (cdTs && Date.now() - cdTs < TTL_SEC * 1000) skip = 'cooldown';
+            }
 
             rows.push({
               symbol: sym,
@@ -352,20 +361,13 @@ jobs:
               current: currentPrice,
               w1Dir: d1.direction,
               w2Dir: d2.direction,
-              agree
+              agree,
+              skip
             });
+            perSymbolDebug[sym] = { currentPrice, worker1: d1, worker2: d2, agree, skip };
 
-            perSymbolDebug[sym] = {
-              currentPrice,
-              worker1: d1,
-              worker2: d2,
-              agree
-            };
+            if (skip) continue;
 
-            if (!agree) continue;
-            if (openSyms.has(sym)) continue;
-
-            // simple score = average absolute bps move from last exit (both workers)
             const score = (Math.abs(d1.moveBps) + Math.abs(d2.moveBps)) / 2;
             candidates.push({
               symbol: sym,
@@ -376,11 +378,10 @@ jobs:
             });
           }
 
-          // ---- Print table ----
           const arrow = d => d === 'long' ? '🔼 UP' : d === 'short' ? '🔽 DOWN' : '⏸ FLAT';
           log('');
-          log('Symbol         | W1 LastExit  | W2 LastExit  | Current      | Trend(W1) | Trend(W2) | Agree?');
-          log('---------------|--------------|--------------|--------------|-----------|-----------|-------');
+          log('Symbol         | W1 LastExit  | W2 LastExit  | Current      | Trend(W1) | Trend(W2) | Agree? | Skip');
+          log('---------------|--------------|--------------|--------------|-----------|-----------|--------|-----');
           for (const r of rows) {
             const sym = r.symbol.padEnd(14);
             const w1e = (r.w1LastExit ?? '-').toString().padEnd(12);
@@ -389,23 +390,109 @@ jobs:
             const t1 = arrow(r.w1Dir).padEnd(9);
             const t2 = arrow(r.w2Dir).padEnd(9);
             const ag = r.agree ? '✅' : '❌';
-            log(`${sym} | ${w1e} | ${w2e} | ${cur} | ${t1} | ${t2} | ${ag}`);
+            log(`${sym} | ${w1e} | ${w2e} | ${cur} | ${t1} | ${t2} | ${ag}     | ${r.skip || '-'}`);
           }
 
-          // ---- STEP 5: Rank + build ideas (score system) ----
+          // ---- STEP 5: Score + rank -> pool for watch ----
           log('');
           log('━━━ STEP 5: Score + rank candidates ━━━');
           candidates.sort((a, b) => b.score - a.score);
           for (const c of candidates) {
             log(`  ${c.symbol} ${c.side.toUpperCase()} score=${c.score.toFixed(1)}bps`);
           }
-          const top = candidates.slice(0, TOP_N);
+          const pool = candidates.slice(0, WATCH_POOL);
+          log(`Watch pool: ${pool.length} candidate(s)`);
+
+          // ---- STEP 6: WATCH PHASE (artificial SL) ----
+          log('');
+          log(`━━━ STEP 6: Watch phase (${WATCH_MIN} min, artificial SL ${ARTIFICIAL_SL_PCT}%) ━━━`);
+          const watch = pool.map(c => {
+            const ref = c.currentPrice;
+            const line = c.side === 'long'
+              ? ref * (1 - ARTIFICIAL_SL_PCT / 100)
+              : ref * (1 + ARTIFICIAL_SL_PCT / 100);
+            return {
+              ...c,
+              refEntry: ref,
+              elimLine: +line.toPrecision(7),
+              last: ref,
+              maxAdversePct: 0,
+              maxFavorablePct: 0,
+              eliminated: false,
+              elimPrice: null,
+              elimAt: null
+            };
+          });
+          for (const w of watch) {
+            log(`  ${w.symbol} ${w.side.toUpperCase()} ref=${w.refEntry} elimLine=${w.elimLine}`);
+          }
+
+          let polls = 0;
+          if (watch.length) {
+            const endAt = Date.now() + WATCH_MIN * 60e3;
+            while (true) {
+              let prices = null;
+              try { prices = await getAllLastPrices(); } catch (e) { log('  poll warn:', e?.message); }
+              if (prices) {
+                polls++;
+                for (const w of watch) {
+                  if (w.eliminated) continue;
+                  const p = prices[w.symbol];
+                  if (!(p > 0)) continue;
+                  w.last = p;
+                  const adverse = w.side === 'long'
+                    ? (w.refEntry - p) / w.refEntry * 100
+                    : (p - w.refEntry) / w.refEntry * 100;
+                  const favorable = -adverse;
+                  if (adverse > w.maxAdversePct) w.maxAdversePct = adverse;
+                  if (favorable > w.maxFavorablePct) w.maxFavorablePct = favorable;
+                  if (adverse >= ARTIFICIAL_SL_PCT) {
+                    w.eliminated = true;
+                    w.elimPrice = p;
+                    w.elimAt = new Date().toISOString();
+                    log(`  ❌ ${w.symbol} ${w.side.toUpperCase()} eliminated @ ${p} (adverse ${adverse.toFixed(3)}%)`);
+                  }
+                }
+              }
+              if (watch.every(w => w.eliminated)) { log('  All candidates eliminated — stopping watch early.'); break; }
+              const remaining = endAt - Date.now();
+              if (remaining <= 0) break;
+              await sleep(Math.min(POLL_MS, remaining));
+            }
+          }
+          log(`Watch finished (${polls} successful polls)`);
+          for (const w of watch) {
+            log(`  ${w.eliminated ? '❌' : '✅'} ${w.symbol} ${w.side.toUpperCase()} last=${w.last} maxAdverse=${w.maxAdversePct.toFixed(3)}% maxFavorable=${w.maxFavorablePct.toFixed(3)}%`);
+          }
+
+          // ---- STEP 7: Survivors -> re-check open positions -> top N ----
+          log('');
+          log('━━━ STEP 7: Select top N from survivors ━━━');
+          try {
+            const st2 = await fetchRetry(`${WORKER_URL}/json`, 2, 300);
+            const x = extractOpenSyms(st2);
+            positions = x.pos; openSyms = x.syms;
+            log(`Re-checked open positions: ${positions.length}`);
+          } catch (e) {
+            log('WARN: re-check of open positions failed:', e?.message);
+          }
+          const survivors = watch
+            .filter(w => !w.eliminated && w.last > 0)
+            .filter(w => {
+              if (openSyms.has(w.symbol)) {
+                log(`  ${w.symbol} dropped: position opened during watch`);
+                return false;
+              }
+              return true;
+            })
+            .sort((a, b) => b.score - a.score);
+          const top = survivors.slice(0, TOP_N);
+          log(`Survivors: ${survivors.length} | Selected: ${top.length}`);
 
           const sl_bps = Math.min(SL_BPS_CFG, MAX_SL_BPS);
           const tp_bps = TP_BPS_CFG;
-
           const finalIdeas = top.map(c => {
-            const entry = +c.currentPrice.toPrecision(7);
+            const entry = +c.last.toPrecision(7);
             let tp_abs, sl_abs;
             if (c.side === 'long') {
               tp_abs = +(entry * (1 + tp_bps / 10000)).toPrecision(7);
@@ -421,34 +508,35 @@ jobs:
               quote: 'USDT',
               side: c.side,
               entry, tp_abs, sl_abs, tp_bps, sl_bps, rrr,
+              ref_entry: c.refEntry,
               score_bps: +c.score.toFixed(1),
+              watch_max_adverse_pct: +c.maxAdversePct.toFixed(3),
+              watch_max_favorable_pct: +c.maxFavorablePct.toFixed(3),
               funding_rate: c.ticker?.fundingRate || 0,
               volume_24h: c.ticker?.turnover24h || 0,
               reasons: [
-                `Both workers: current price ${c.side === 'long' ? 'above' : 'below'} last exit price`,
-                `Score (avg move from last exit) = ${c.score.toFixed(1)}bps`
+                `Both workers: price ${c.side === 'long' ? 'above' : 'below'} last exit price`,
+                `Score (avg move from last exit) = ${c.score.toFixed(1)}bps`,
+                `Survived ${WATCH_MIN}min watch (artificial SL ${ARTIFICIAL_SL_PCT}%, max adverse ${c.maxAdversePct.toFixed(3)}%)`
               ],
               generated_at: new Date().toISOString()
             };
           });
-
           log('');
           log(`Final ideas: ${finalIdeas.length}`);
           for (const i of finalIdeas) {
             log(`  ${i.symbol} ${i.side.toUpperCase()} entry=${i.entry} tp=${i.tp_abs} sl=${i.sl_abs} score=${i.score_bps}bps`);
           }
 
-          // ---- STEP 6: Write analysis gist ----
+          // ---- STEP 8: Write analysis gist ----
           log('');
-          log('━━━ STEP 6: Write analysis Gist ━━━');
+          log('━━━ STEP 8: Write analysis Gist ━━━');
           const pushedNext = {};
           for (const [k, ts] of Object.entries(pushedPrev)) {
-            if (Date.now() - ts < 6 * 3600e3) pushedNext[k] = ts;
+            if (Date.now() - ts < PUSHED_KEEP_MS) pushedNext[k] = ts;
           }
-          const pushIdeas = finalIdeas.filter(i => {
-            const ts = pushedPrev[i.symbol + '|' + i.side];
-            return !(ts && Date.now() - ts < TTL_SEC * 1000);
-          });
+          // cooldown was already applied before the watch phase
+          const pushIdeas = finalIdeas;
 
           const output = {
             ts: new Date().toISOString(),
@@ -458,19 +546,38 @@ jobs:
             open_positions: positions.length,
             common_symbols: commonSymbols.length,
             candidates_found: candidates.length,
+            watch_pool: pool.length,
+            survivors: survivors.length,
             trend_table: rows,
+            watch_results: watch.map(w => ({
+              symbol: w.symbol,
+              side: w.side,
+              score_bps: +w.score.toFixed(1),
+              ref_entry: w.refEntry,
+              elim_line: w.elimLine,
+              last: w.last,
+              max_adverse_pct: +w.maxAdversePct.toFixed(3),
+              max_favorable_pct: +w.maxFavorablePct.toFixed(3),
+              eliminated: w.eliminated,
+              elim_price: w.elimPrice,
+              elim_at: w.elimAt
+            })),
             ideas: finalIdeas,
             debug_per_symbol: perSymbolDebug,
             pushed: pushedNext,
-            config: { top_n: TOP_N, tp_bps, sl_bps, min_move_bps: MIN_MOVE_BPS, notional_usd: NOTIONAL }
+            config: {
+              top_n: TOP_N, tp_bps, sl_bps, min_move_bps: MIN_MOVE_BPS, notional_usd: NOTIONAL,
+              watch_min: WATCH_MIN, artificial_sl_pct: ARTIFICIAL_SL_PCT,
+              watch_pool: WATCH_POOL, cooldown_sec: TTL_SEC, pnl_limit: PNL_LIMIT
+            }
           };
           await writeAnalysisGist(output);
           log('Analysis Gist written.');
 
-          // ---- STEP 7: Push ideas to worker & confirm receipt ----
+          // ---- STEP 9: Push ideas to worker & confirm receipt ----
           if (PUSH_URL && PUSH_TOKEN && pushIdeas.length > 0) {
             log('');
-            log('━━━ STEP 7: Push ideas to worker & confirm receipt ━━━');
+            log('━━━ STEP 9: Push ideas to worker & confirm receipt ━━━');
             const pushPayload = {
               ts: new Date().toISOString(),
               mode: 'normal',
@@ -499,7 +606,6 @@ jobs:
                 reasons_text: idea.reasons
               }))
             };
-
             try {
               const ac = new AbortController();
               const t = setTimeout(() => ac.abort(), 15000);
@@ -514,30 +620,23 @@ jobs:
                 body: JSON.stringify(pushPayload)
               });
               clearTimeout(t);
-
               let txt = '';
               try { txt = await r.text(); } catch {}
-
               let resJson = null;
               try { resJson = JSON.parse(txt); } catch {}
-
               log('Push HTTP Status:', r.status);
-
-              // Validate HTTP status and response body payload for worker confirmation
               const isConfirmed = r.ok && (
-                !resJson || 
-                resJson.status === 'ok' || 
-                resJson.success === true || 
-                resJson.received === true || 
+                !resJson ||
+                resJson.status === 'ok' ||
+                resJson.success === true ||
+                resJson.received === true ||
                 (typeof resJson.accepted_count === 'number' && resJson.accepted_count > 0) ||
                 (Array.isArray(resJson.received_ids) && resJson.received_ids.length > 0) ||
                 resJson.ok === true
               );
-
               if (isConfirmed) {
                 log(`✅ SUCCESS: Worker acknowledged receipt of ${pushIdeas.length} idea(s).`);
                 if (resJson) log('Worker Response Payload:', JSON.stringify(resJson));
-
                 for (const i of pushIdeas) pushedNext[i.symbol + '|' + i.side] = Date.now();
                 output.pushed = pushedNext;
                 output.push_confirmation = {
@@ -580,7 +679,6 @@ jobs:
           log('═══ Analysis complete ═══');
           })().catch(e => { console.error('[analyzer] FATAL', e); process.exit(1); });
           NODE
-
           EXIT_CODE=$?
           if [[ $EXIT_CODE -ne 0 ]]; then
             echo "[analyzer] Node exited with code $EXIT_CODE"
