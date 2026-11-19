@@ -1,4 +1,4 @@
-name: Trend Analyzer (Simple Entry/Exit v2.0)
+name: Trend Analyzer (Simple Entry/Exit v3.0)
 
 on:
   repository_dispatch:
@@ -30,6 +30,7 @@ jobs:
       TP_BPS: ${{ vars.ANALYZER_TP_BPS }}
       SL_BPS: ${{ vars.ANALYZER_SL_BPS }}
       NOTIONAL_USD: ${{ vars.NOTIONAL_USD }}
+      MIN_MOVE_BPS: ${{ vars.ANALYZER_MIN_MOVE_BPS }}
 
     steps:
       - name: Setup Node 20
@@ -53,7 +54,7 @@ jobs:
           (async () => {
           'use strict';
           const crypto = require('crypto');
-          const VERSION = '2.0.1';
+          const VERSION = '3.0.0';
           const UA = `trend-analyzer/${VERSION}`;
           const log = (...a) => console.log('[analyzer]', ...a);
 
@@ -72,6 +73,7 @@ jobs:
           const SL_BPS_CFG = Math.max(10, Number(process.env.SL_BPS || '50'));
           const NOTIONAL = Math.max(50, Number(process.env.NOTIONAL_USD || '300'));
           const BYBIT_PUBLIC = (process.env.BYBIT_PROXY_URL || 'https://api.bybit.com').replace(/\/+$/, '');
+          const MIN_MOVE_BPS = Math.max(0, Number(process.env.MIN_MOVE_BPS || '5'));
           const MAX_AGE_H = 72;
           const TTL_SEC = 3600;
 
@@ -167,45 +169,24 @@ jobs:
           }
 
           // ================================================================
-          //  CORE: direction from entry/exit of ALL trades + current price
+          //  CORE: direction = compare current price vs last exit price
           // ================================================================
           function computeDirection(trades, currentPrice) {
             if (!trades.length) return {
-              direction: 'neutral', reason: 'no_trades', avgMoveBps: 0,
-              entryPrices: [], exitPrices: [], lastExit: null
+              direction: 'neutral', reason: 'no_trades',
+              lastExit: null, moveBps: 0
             };
 
-            const entryPrices = trades.map(t => t.entryPrice);
-            const exitPrices = trades.map(t => t.exitPrice);
-            const dirs = trades.map(t => Math.sign(t.exitPrice - t.entryPrice));
-            const allUp = dirs.every(d => d > 0);
-            const allDown = dirs.every(d => d < 0);
-
-            const moves = trades.map(t => (t.exitPrice / t.entryPrice - 1) * 10000);
-            const avgMoveBps = mean(moves);
             const lastExit = trades.at(-1).exitPrice;
+            const moveBps = (currentPrice / lastExit - 1) * 10000;
 
-            const base = { avgMoveBps, entryPrices, exitPrices, lastExit };
-
-            if (!allUp && !allDown) {
-              return { direction: 'neutral', reason: 'mixed_trades', ...base };
+            if (moveBps > MIN_MOVE_BPS) {
+              return { direction: 'long', reason: 'price_above_last_exit', lastExit, moveBps };
             }
-
-            if (allUp) {
-              if (currentPrice > lastExit) {
-                return { direction: 'long', reason: 'all_up_confirmed', ...base };
-              }
-              return { direction: 'neutral', reason: 'all_up_not_confirmed', ...base };
+            if (moveBps < -MIN_MOVE_BPS) {
+              return { direction: 'short', reason: 'price_below_last_exit', lastExit, moveBps };
             }
-
-            if (allDown) {
-              if (currentPrice < lastExit) {
-                return { direction: 'short', reason: 'all_down_confirmed', ...base };
-              }
-              return { direction: 'neutral', reason: 'all_down_not_confirmed', ...base };
-            }
-
-            return { direction: 'neutral', reason: 'unknown', ...base };
+            return { direction: 'neutral', reason: 'too_close_to_last_exit', lastExit, moveBps };
           }
 
           // ================================================================
@@ -347,60 +328,77 @@ jobs:
 
           // ---- STEP 4: Compute direction per worker, require agreement ----
           log('');
-          log('━━━ STEP 4: Direction check (entry/exit + current price) ━━━');
-          const candidates = [];
+          log('━━━ STEP 4: Trend table (lastExit vs current) ━━━');
+
+          const rows = [];
           const perSymbolDebug = {};
+          const candidates = [];
+
           for (const sym of commonSymbols) {
             const ticker = tickers[sym];
-            if (!ticker || !(ticker.lastPrice > 0)) {
-              log(`  ⏭️  ${sym}: no current price — skip`);
-              continue;
-            }
+            if (!ticker || !(ticker.lastPrice > 0)) continue;
             const currentPrice = ticker.lastPrice;
 
             const d1 = computeDirection(bySymbol1[sym], currentPrice);
             const d2 = computeDirection(bySymbol2[sym], currentPrice);
 
-            log(`  ${sym}: current=${currentPrice}`);
-            log(`    worker1 entries=[${d1.entryPrices.join(', ')}]`);
-            log(`    worker1 exits  =[${d1.exitPrices.join(', ')}]  lastExit=${d1.lastExit} → ${d1.direction}(${d1.reason})`);
-            log(`    worker2 entries=[${d2.entryPrices.join(', ')}]`);
-            log(`    worker2 exits  =[${d2.exitPrices.join(', ')}]  lastExit=${d2.lastExit} → ${d2.direction}(${d2.reason})`);
+            const agree = (d1.direction !== 'neutral')
+              && (d1.direction === d2.direction);
+
+            rows.push({
+              symbol: sym,
+              w1LastExit: d1.lastExit,
+              w2LastExit: d2.lastExit,
+              current: currentPrice,
+              w1Dir: d1.direction,
+              w2Dir: d2.direction,
+              agree
+            });
 
             perSymbolDebug[sym] = {
               currentPrice,
-              worker1: { entries: d1.entryPrices, exits: d1.exitPrices, lastExit: d1.lastExit, direction: d1.direction, reason: d1.reason, avgMoveBps: d1.avgMoveBps },
-              worker2: { entries: d2.entryPrices, exits: d2.exitPrices, lastExit: d2.lastExit, direction: d2.direction, reason: d2.reason, avgMoveBps: d2.avgMoveBps }
+              worker1: d1,
+              worker2: d2,
+              agree
             };
 
-            if (d1.direction === 'neutral' || d2.direction === 'neutral') {
-              log(`    ❌ one side neutral — skip`);
-              continue;
-            }
-            if (d1.direction !== d2.direction) {
-              log(`    ❌ DISAGREE — skip`);
-              continue;
-            }
-            if (openSyms.has(sym)) {
-              log(`    ⏭️  position already open — skip`);
-              continue;
-            }
+            if (!agree) continue;
+            if (openSyms.has(sym)) continue;
 
-            const strength = (Math.abs(d1.avgMoveBps) + Math.abs(d2.avgMoveBps)) / 2;
+            // simple score = average absolute bps move from last exit (both workers)
+            const score = (Math.abs(d1.moveBps) + Math.abs(d2.moveBps)) / 2;
             candidates.push({
               symbol: sym,
               side: d1.direction,
-              strength,
+              score,
               currentPrice,
               ticker
             });
-            log(`    ✅ AGREE: ${d1.direction} (strength=${strength.toFixed(1)}bps)`);
           }
 
-          // ---- STEP 5: Rank + build ideas ----
+          // ---- Print table ----
+          const arrow = d => d === 'long' ? '🔼 UP' : d === 'short' ? '🔽 DOWN' : '⏸ FLAT';
           log('');
-          log('━━━ STEP 5: Build top ideas ━━━');
-          candidates.sort((a, b) => b.strength - a.strength);
+          log('Symbol         | W1 LastExit  | W2 LastExit  | Current      | Trend(W1) | Trend(W2) | Agree?');
+          log('---------------|--------------|--------------|--------------|-----------|-----------|-------');
+          for (const r of rows) {
+            const sym = r.symbol.padEnd(14);
+            const w1e = (r.w1LastExit ?? '-').toString().padEnd(12);
+            const w2e = (r.w2LastExit ?? '-').toString().padEnd(12);
+            const cur = r.current.toString().padEnd(12);
+            const t1 = arrow(r.w1Dir).padEnd(9);
+            const t2 = arrow(r.w2Dir).padEnd(9);
+            const ag = r.agree ? '✅' : '❌';
+            log(`${sym} | ${w1e} | ${w2e} | ${cur} | ${t1} | ${t2} | ${ag}`);
+          }
+
+          // ---- STEP 5: Rank + build ideas (score system) ----
+          log('');
+          log('━━━ STEP 5: Score + rank candidates ━━━');
+          candidates.sort((a, b) => b.score - a.score);
+          for (const c of candidates) {
+            log(`  ${c.symbol} ${c.side.toUpperCase()} score=${c.score.toFixed(1)}bps`);
+          }
           const top = candidates.slice(0, TOP_N);
 
           const sl_bps = Math.min(SL_BPS_CFG, MAX_SL_BPS);
@@ -423,20 +421,21 @@ jobs:
               quote: 'USDT',
               side: c.side,
               entry, tp_abs, sl_abs, tp_bps, sl_bps, rrr,
-              strength_bps: +c.strength.toFixed(1),
+              score_bps: +c.score.toFixed(1),
               funding_rate: c.ticker?.fundingRate || 0,
               volume_24h: c.ticker?.turnover24h || 0,
               reasons: [
-                `Both workers' entry/exit trades consistently went ${c.side === 'long' ? 'up' : 'down'}`,
-                `Current price confirms continuation (${c.currentPrice})`
+                `Both workers: current price ${c.side === 'long' ? 'above' : 'below'} last exit price`,
+                `Score (avg move from last exit) = ${c.score.toFixed(1)}bps`
               ],
               generated_at: new Date().toISOString()
             };
           });
 
+          log('');
           log(`Final ideas: ${finalIdeas.length}`);
           for (const i of finalIdeas) {
-            log(`  ${i.symbol} ${i.side.toUpperCase()} entry=${i.entry} tp=${i.tp_abs} sl=${i.sl_abs} strength=${i.strength_bps}bps`);
+            log(`  ${i.symbol} ${i.side.toUpperCase()} entry=${i.entry} tp=${i.tp_abs} sl=${i.sl_abs} score=${i.score_bps}bps`);
           }
 
           // ---- STEP 6: Write analysis gist ----
@@ -459,10 +458,11 @@ jobs:
             open_positions: positions.length,
             common_symbols: commonSymbols.length,
             candidates_found: candidates.length,
+            trend_table: rows,
             ideas: finalIdeas,
             debug_per_symbol: perSymbolDebug,
             pushed: pushedNext,
-            config: { top_n: TOP_N, tp_bps, sl_bps, notional_usd: NOTIONAL }
+            config: { top_n: TOP_N, tp_bps, sl_bps, min_move_bps: MIN_MOVE_BPS, notional_usd: NOTIONAL }
           };
           await writeAnalysisGist(output);
           log('Analysis Gist written.');
