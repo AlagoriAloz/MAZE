@@ -53,7 +53,7 @@ jobs:
           (async () => {
           'use strict';
           const crypto = require('crypto');
-          const VERSION = '2.0.0';
+          const VERSION = '2.0.1';
           const UA = `trend-analyzer/${VERSION}`;
           const log = (...a) => console.log('[analyzer]', ...a);
 
@@ -169,45 +169,48 @@ jobs:
           // ================================================================
           //  CORE: direction from entry/exit of ALL trades + current price
           // ================================================================
-          // direction = 'long' | 'short' | 'neutral'
           function computeDirection(trades, currentPrice) {
-            if (!trades.length) return { direction: 'neutral', reason: 'no_trades', avgMoveBps: 0 };
+            if (!trades.length) return {
+              direction: 'neutral', reason: 'no_trades', avgMoveBps: 0,
+              entryPrices: [], exitPrices: [], lastExit: null
+            };
 
+            const entryPrices = trades.map(t => t.entryPrice);
+            const exitPrices = trades.map(t => t.exitPrice);
             const dirs = trades.map(t => Math.sign(t.exitPrice - t.entryPrice));
             const allUp = dirs.every(d => d > 0);
             const allDown = dirs.every(d => d < 0);
-
-            if (!allUp && !allDown) {
-              return { direction: 'neutral', reason: 'mixed_trades', avgMoveBps: 0 };
-            }
 
             const moves = trades.map(t => (t.exitPrice / t.entryPrice - 1) * 10000);
             const avgMoveBps = mean(moves);
             const lastExit = trades.at(-1).exitPrice;
 
+            const base = { avgMoveBps, entryPrices, exitPrices, lastExit };
+
+            if (!allUp && !allDown) {
+              return { direction: 'neutral', reason: 'mixed_trades', ...base };
+            }
+
             if (allUp) {
-              // confirm price is still rising past the last exit
               if (currentPrice > lastExit) {
-                return { direction: 'long', reason: 'all_up_confirmed', avgMoveBps };
+                return { direction: 'long', reason: 'all_up_confirmed', ...base };
               }
-              return { direction: 'neutral', reason: 'all_up_not_confirmed', avgMoveBps };
+              return { direction: 'neutral', reason: 'all_up_not_confirmed', ...base };
             }
 
             if (allDown) {
-              // confirm price is still falling past the last exit
               if (currentPrice < lastExit) {
-                return { direction: 'short', reason: 'all_down_confirmed', avgMoveBps };
+                return { direction: 'short', reason: 'all_down_confirmed', ...base };
               }
-              return { direction: 'neutral', reason: 'all_down_not_confirmed', avgMoveBps };
+              return { direction: 'neutral', reason: 'all_down_not_confirmed', ...base };
             }
 
-            return { direction: 'neutral', reason: 'unknown', avgMoveBps: 0 };
+            return { direction: 'neutral', reason: 'unknown', ...base };
           }
 
           // ================================================================
           //  NORMALIZE TRADES FROM A WORKER
           // ================================================================
-          // Worker 1 schema (Bybit-style: side may need flip-correction)
           function normalizeWorker1Trades(pnlData) {
             const bySymbol = {};
             for (const t of pnlData) {
@@ -229,7 +232,6 @@ jobs:
             return bySymbol;
           }
 
-          // Worker 2 schema (native entryPrice/exitPrice/time)
           function normalizeWorker2Trades(pnlData2) {
             const bySymbol = {};
             for (const t of pnlData2) {
@@ -254,7 +256,7 @@ jobs:
           //  MAIN EXECUTION
           // ================================================================
           log('╔═══════════════════════════════════════════════╗');
-          log('║  Simple Entry/Exit Analyzer v' + VERSION + '           ║');
+          log('║  Simple Entry/Exit Analyzer v' + VERSION + '          ║');
           log('╚═══════════════════════════════════════════════╝');
 
           const prev = await readAnalysisGist();
@@ -347,6 +349,7 @@ jobs:
           log('');
           log('━━━ STEP 4: Direction check (entry/exit + current price) ━━━');
           const candidates = [];
+          const perSymbolDebug = {};
           for (const sym of commonSymbols) {
             const ticker = tickers[sym];
             if (!ticker || !(ticker.lastPrice > 0)) {
@@ -358,7 +361,17 @@ jobs:
             const d1 = computeDirection(bySymbol1[sym], currentPrice);
             const d2 = computeDirection(bySymbol2[sym], currentPrice);
 
-            log(`  ${sym}: worker1=${d1.direction}(${d1.reason}) worker2=${d2.direction}(${d2.reason})`);
+            log(`  ${sym}: current=${currentPrice}`);
+            log(`    worker1 entries=[${d1.entryPrices.join(', ')}]`);
+            log(`    worker1 exits  =[${d1.exitPrices.join(', ')}]  lastExit=${d1.lastExit} → ${d1.direction}(${d1.reason})`);
+            log(`    worker2 entries=[${d2.entryPrices.join(', ')}]`);
+            log(`    worker2 exits  =[${d2.exitPrices.join(', ')}]  lastExit=${d2.lastExit} → ${d2.direction}(${d2.reason})`);
+
+            perSymbolDebug[sym] = {
+              currentPrice,
+              worker1: { entries: d1.entryPrices, exits: d1.exitPrices, lastExit: d1.lastExit, direction: d1.direction, reason: d1.reason, avgMoveBps: d1.avgMoveBps },
+              worker2: { entries: d2.entryPrices, exits: d2.exitPrices, lastExit: d2.lastExit, direction: d2.direction, reason: d2.reason, avgMoveBps: d2.avgMoveBps }
+            };
 
             if (d1.direction === 'neutral' || d2.direction === 'neutral') {
               log(`    ❌ one side neutral — skip`);
@@ -376,7 +389,7 @@ jobs:
             const strength = (Math.abs(d1.avgMoveBps) + Math.abs(d2.avgMoveBps)) / 2;
             candidates.push({
               symbol: sym,
-              side: d1.direction, // 'long' or 'short'
+              side: d1.direction,
               strength,
               currentPrice,
               ticker
@@ -447,6 +460,7 @@ jobs:
             common_symbols: commonSymbols.length,
             candidates_found: candidates.length,
             ideas: finalIdeas,
+            debug_per_symbol: perSymbolDebug,
             pushed: pushedNext,
             config: { top_n: TOP_N, tp_bps, sl_bps, notional_usd: NOTIONAL }
           };
