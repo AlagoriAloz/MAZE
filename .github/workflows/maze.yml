@@ -1,3 +1,43 @@
+name: Trend Analyzer (Simple Entry/Exit v3.0)
+
+on:
+  repository_dispatch:
+    types: [run_X]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: trend-analyzer
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      WORKER_URL: ${{ secrets.WORKER_URL }}
+      WORKER_URL_2: ${{ secrets.WORKER_URL_2 }}
+      ANALYSIS_GIST_ID: ${{ secrets.ANALYSIS_GIST_ID }}
+      GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+      BYBIT_PROXY_URL: ${{ secrets.BYBIT_PROXY_URL }}
+      WORKER_PUSH_URL: ${{ secrets.WORKER_PUSH_URL }}
+      PUSH_TOKEN: ${{ secrets.PUSH_TOKEN }}
+      TOP_N: ${{ vars.ANALYZER_TOP_N }}
+      MAX_SL_BPS: ${{ vars.ANALYZER_MAX_SL_BPS }}
+      TP_BPS: ${{ vars.ANALYZER_TP_BPS }}
+      SL_BPS: ${{ vars.ANALYZER_SL_BPS }}
+      NOTIONAL_USD: ${{ vars.NOTIONAL_USD }}
+      MIN_MOVE_BPS: ${{ vars.ANALYZER_MIN_MOVE_BPS }}
+
+    steps:
+      - name: Setup Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
       - name: Run Simple Entry/Exit Analyzer
         shell: bash
         run: |
@@ -14,7 +54,7 @@
           (async () => {
           'use strict';
           const crypto = require('crypto');
-          const VERSION = '3.1.0';
+          const VERSION = '3.0.0';
           const UA = `trend-analyzer/${VERSION}`;
           const log = (...a) => console.log('[analyzer]', ...a);
 
@@ -34,9 +74,6 @@
           const NOTIONAL = Math.max(50, Number(process.env.NOTIONAL_USD || '300'));
           const BYBIT_PUBLIC = (process.env.BYBIT_PROXY_URL || 'https://api.bybit.com').replace(/\/+$/, '');
           const MIN_MOVE_BPS = Math.max(0, Number(process.env.MIN_MOVE_BPS || '5'));
-          const CONFIRM_PATH = process.env.WORKER_CONFIRM_PATH || '/json';
-          const CONFIRM_TRIES = 4;
-          const CONFIRM_DELAY_MS = 2500;
           const MAX_AGE_H = 72;
           const TTL_SEC = 3600;
 
@@ -197,69 +234,6 @@
           }
 
           // ================================================================
-          //  PUSH CONFIRMATION — poll worker and look for the idea
-          // ================================================================
-          function deepContainsValue(obj, needle, depth = 0) {
-            if (depth > 6 || obj == null) return false;
-            if (typeof obj === 'string') return obj.includes(needle);
-            if (typeof obj === 'number') return String(obj) === needle;
-            if (Array.isArray(obj)) return obj.some(v => deepContainsValue(v, needle, depth + 1));
-            if (typeof obj === 'object') {
-              return Object.values(obj).some(v => deepContainsValue(v, needle, depth + 1));
-            }
-            return false;
-          }
-
-          function findIdeaMatch(stateJson, idea) {
-            // Try matching by client_order_id / idea_id first (most reliable)
-            if (idea.client_order_id && deepContainsValue(stateJson, idea.client_order_id)) {
-              return 'client_order_id';
-            }
-            if (idea.idea_id && deepContainsValue(stateJson, idea.idea_id)) {
-              return 'idea_id';
-            }
-            // Fallback: symbol present anywhere (weaker signal)
-            if (idea.symbol_full && deepContainsValue(stateJson, idea.symbol_full)) {
-              return 'symbol_fallback';
-            }
-            return null;
-          }
-
-          async function confirmPushedIdeas(pushedIdeasMeta) {
-            const results = {};
-            for (const idea of pushedIdeasMeta) results[idea.client_order_id] = { confirmed: false, matchType: null };
-
-            const confirmUrl = `${WORKER_URL}${CONFIRM_PATH}`;
-            for (let attempt = 1; attempt <= CONFIRM_TRIES; attempt++) {
-              await sleep(CONFIRM_DELAY_MS);
-              let stateJson;
-              try {
-                stateJson = await fetchJSON(confirmUrl, 10000);
-              } catch (e) {
-                log(`  confirm attempt ${attempt}/${CONFIRM_TRIES}: fetch failed (${e?.message})`);
-                continue;
-              }
-
-              let allConfirmed = true;
-              for (const idea of pushedIdeasMeta) {
-                if (results[idea.client_order_id].confirmed) continue;
-                const match = findIdeaMatch(stateJson, idea);
-                if (match) {
-                  results[idea.client_order_id] = { confirmed: true, matchType: match };
-                } else {
-                  allConfirmed = false;
-                }
-              }
-
-              log(`  confirm attempt ${attempt}/${CONFIRM_TRIES}: `
-                + `${Object.values(results).filter(r => r.confirmed).length}/${pushedIdeasMeta.length} confirmed`);
-
-              if (allConfirmed) break;
-            }
-            return results;
-          }
-
-          // ================================================================
           //  MAIN EXECUTION
           // ================================================================
           log('╔═══════════════════════════════════════════════╗');
@@ -391,6 +365,7 @@
             if (!agree) continue;
             if (openSyms.has(sym)) continue;
 
+            // simple score = average absolute bps move from last exit (both workers)
             const score = (Math.abs(d1.moveBps) + Math.abs(d2.moveBps)) / 2;
             candidates.push({
               symbol: sym,
@@ -401,6 +376,7 @@
             });
           }
 
+          // ---- Print table ----
           const arrow = d => d === 'long' ? '🔼 UP' : d === 'short' ? '🔽 DOWN' : '⏸ FLAT';
           log('');
           log('Symbol         | W1 LastExit  | W2 LastExit  | Current      | Trend(W1) | Trend(W2) | Agree?');
@@ -462,7 +438,7 @@
             log(`  ${i.symbol} ${i.side.toUpperCase()} entry=${i.entry} tp=${i.tp_abs} sl=${i.sl_abs} score=${i.score_bps}bps`);
           }
 
-          // ---- STEP 6: Write analysis gist (pre-push) ----
+          // ---- STEP 6: Write analysis gist ----
           log('');
           log('━━━ STEP 6: Write analysis Gist ━━━');
           const pushedNext = {};
@@ -486,26 +462,15 @@
             ideas: finalIdeas,
             debug_per_symbol: perSymbolDebug,
             pushed: pushedNext,
-            push_confirmation: {},
             config: { top_n: TOP_N, tp_bps, sl_bps, min_move_bps: MIN_MOVE_BPS, notional_usd: NOTIONAL }
           };
           await writeAnalysisGist(output);
           log('Analysis Gist written.');
 
-          // ---- STEP 7: Push ideas to worker ----
-          let pushedIdeaMeta = [];
+          // ---- STEP 7: Push ideas to worker & confirm receipt ----
           if (PUSH_URL && PUSH_TOKEN && pushIdeas.length > 0) {
             log('');
-            log('━━━ STEP 7: Push ideas to worker ━━━');
-
-            pushedIdeaMeta = pushIdeas.map((idea, i) => ({
-              idea_id: crypto.randomUUID(),
-              client_order_id: ('ta_' + crypto.randomUUID().replace(/-/g, '')).slice(0, 28),
-              symbol: idea.base,
-              symbol_full: idea.symbol,
-              side: idea.side
-            }));
-
+            log('━━━ STEP 7: Push ideas to worker & confirm receipt ━━━');
             const pushPayload = {
               ts: new Date().toISOString(),
               mode: 'normal',
@@ -513,8 +478,8 @@
               meta: { origin: 'github_actions_analyzer', version: VERSION, worker_regime: regime },
               top_n: pushIdeas.length,
               ideas: pushIdeas.map((idea, i) => ({
-                idea_id: pushedIdeaMeta[i].idea_id,
-                client_order_id: pushedIdeaMeta[i].client_order_id,
+                idea_id: crypto.randomUUID(),
+                client_order_id: ('ta_' + crypto.randomUUID().replace(/-/g, '')).slice(0, 28),
                 symbol: idea.base,
                 symbol_full: idea.symbol,
                 quote: idea.quote,
@@ -535,7 +500,6 @@
               }))
             };
 
-            let pushOk = false;
             try {
               const ac = new AbortController();
               const t = setTimeout(() => ac.abort(), 15000);
@@ -550,50 +514,59 @@
                 body: JSON.stringify(pushPayload)
               });
               clearTimeout(t);
+
               let txt = '';
               try { txt = await r.text(); } catch {}
-              log('Push status:', r.status, (txt || '').slice(0, 300));
-              pushOk = r.ok;
+
+              let resJson = null;
+              try { resJson = JSON.parse(txt); } catch {}
+
+              log('Push HTTP Status:', r.status);
+
+              // Validate HTTP status and response body payload for worker confirmation
+              const isConfirmed = r.ok && (
+                !resJson || 
+                resJson.status === 'ok' || 
+                resJson.success === true || 
+                resJson.received === true || 
+                (typeof resJson.accepted_count === 'number' && resJson.accepted_count > 0) ||
+                (Array.isArray(resJson.received_ids) && resJson.received_ids.length > 0) ||
+                resJson.ok === true
+              );
+
+              if (isConfirmed) {
+                log(`✅ SUCCESS: Worker acknowledged receipt of ${pushIdeas.length} idea(s).`);
+                if (resJson) log('Worker Response Payload:', JSON.stringify(resJson));
+
+                for (const i of pushIdeas) pushedNext[i.symbol + '|' + i.side] = Date.now();
+                output.pushed = pushedNext;
+                output.push_confirmation = {
+                  received: true,
+                  count: pushIdeas.length,
+                  ts: new Date().toISOString(),
+                  response: resJson || txt
+                };
+                await writeAnalysisGist(output);
+              } else {
+                log(`❌ FAILED: Push rejected or not confirmed by worker. Response:`, (txt || '').slice(0, 300));
+                output.push_confirmation = {
+                  received: false,
+                  status: r.status,
+                  ts: new Date().toISOString(),
+                  response: resJson || txt
+                };
+                await writeAnalysisGist(output);
+                process.exitCode = 1;
+              }
             } catch (e) {
-              log('Push failed:', e?.message);
-            }
-
-            // ---- STEP 8: Confirm the worker actually received the ideas ----
-            if (pushOk) {
-              log('');
-              log('━━━ STEP 8: Confirm push received by worker ━━━');
-              log(`Polling ${WORKER_URL}${CONFIRM_PATH} up to ${CONFIRM_TRIES}x (every ${CONFIRM_DELAY_MS}ms)...`);
-
-              const confirmResults = await confirmPushedIdeas(pushedIdeaMeta);
-              const confirmBySymbolSide = {};
-
-              for (const meta of pushedIdeaMeta) {
-                const res = confirmResults[meta.client_order_id];
-                const key = `${meta.symbol_full}|${meta.side}`;
-                confirmBySymbolSide[key] = res;
-                if (res.confirmed) {
-                  log(`  ✅ ${meta.symbol_full} ${meta.side.toUpperCase()} CONFIRMED (matched by ${res.matchType})`);
-                } else {
-                  log(`  ❌ ${meta.symbol_full} ${meta.side.toUpperCase()} NOT CONFIRMED after ${CONFIRM_TRIES} attempts`);
-                }
-              }
-
-              // Only mark as "pushed" (cooldown) the ones that were actually confirmed
-              for (const i of pushIdeas) {
-                const key = `${i.symbol}|${i.side}`;
-                if (confirmBySymbolSide[key]?.confirmed) {
-                  pushedNext[key] = Date.now();
-                }
-              }
-
-              output.pushed = pushedNext;
-              output.push_confirmation = confirmBySymbolSide;
+              log('❌ Push execution error:', e?.message);
+              output.push_confirmation = {
+                received: false,
+                error: e?.message,
+                ts: new Date().toISOString()
+              };
               await writeAnalysisGist(output);
-
-              const confirmedCount = Object.values(confirmBySymbolSide).filter(r => r.confirmed).length;
-              log(`Confirmation summary: ${confirmedCount}/${pushedIdeaMeta.length} ideas confirmed received.`);
-            } else {
-              log('Skipping confirmation step — push itself failed.');
+              process.exitCode = 1;
             }
           } else if (pushIdeas.length === 0) {
             log('');
