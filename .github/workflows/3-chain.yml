@@ -1,17 +1,57 @@
 name: 3 — Chain End
-
 on:
   repository_dispatch:
     types: [run_3]
 
+concurrency:
+  group: chain-3          # only one run active at a time
+  cancel-in-progress: false  # queue, never cancel
+
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10   # raised to cover up to 5-min wait + original work
     steps:
       - name: Log trigger source
         run: |
           echo "Triggered by: ${{ github.event.client_payload.source || 'chain_2' }}"
+
+      - name: Enforce 5-minute gap since last trigger
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          # Resolve numeric workflow ID from the current run
+          WORKFLOW_ID=$(curl -s \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            | jq -r '.workflow_id')
+
+          # Find the most recent OTHER run's creation timestamp
+          LAST_CREATED=$(curl -s \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/${WORKFLOW_ID}/runs?per_page=10" \
+            | jq -r --argjson cur ${{ github.run_id }} \
+                '[.workflow_runs[] | select(.id != $cur)] | .[0].created_at // empty')
+
+          if [ -z "$LAST_CREATED" ]; then
+            echo "No previous run found — proceeding immediately."
+            exit 0
+          fi
+
+          LAST_TS=$(date -d "$LAST_CREATED" +%s)
+          NOW_TS=$(date +%s)
+          DIFF=$(( NOW_TS - LAST_TS ))
+          MIN_GAP=300   # 5 minutes in seconds
+
+          if [ "$DIFF" -lt "$MIN_GAP" ]; then
+            WAIT=$(( MIN_GAP - DIFF ))
+            echo "Previous run was triggered ${DIFF}s ago — sleeping ${WAIT}s to honour 5-minute gap."
+            sleep "$WAIT"
+          else
+            echo "Previous run was triggered ${DIFF}s ago — gap satisfied, proceeding."
+          fi
 
       - name: Sleep 1 minute
         run: sleep 60
@@ -25,7 +65,6 @@ jobs:
             -H "Accept: application/vnd.github+json" \
             https://api.github.com/repos/${{ github.repository }}/dispatches \
             -d '{"event_type":"run_X"}'
-
           curl -s -X POST \
             -H "Authorization: token $PAT" \
             -H "Accept: application/vnd.github+json" \
