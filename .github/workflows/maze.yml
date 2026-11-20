@@ -1,4 +1,4 @@
-name: Trend Analyzer (Simple Entry/Exit v4.4)
+name: Trend Analyzer (Simple Entry/Exit v4.5)
 on:
   repository_dispatch:
     types: [run_X]
@@ -33,6 +33,7 @@ jobs:
       WORKER_MODE: ${{ vars.ANALYZER_WORKER_MODE || vars.WORKER_MODE }}
       HEDGE: ${{ vars.ANALYZER_HEDGE || vars.HEDGE }}
       REVERSE: ${{ vars.ANALYZER_REVERSE || vars.REVERSE }}
+      MAX_ADVERSE_GUARD: ${{ vars.ANALYZER_MAX_ADVERSE_GUARD || vars.MAX_ADVERSE_GUARD }}
     steps:
       - name: Setup Node 20
         uses: actions/setup-node@v4
@@ -58,7 +59,7 @@ jobs:
           'use strict';
           const crypto = require('crypto');
           const WebSocket = require('ws');
-          const VERSION = '4.4.0';
+          const VERSION = '4.5.0';
           const UA = `trend-analyzer/${VERSION}`;
           const log = (...a) => console.log('[analyzer]', ...a);
 
@@ -107,6 +108,12 @@ jobs:
           // --- Reverse mode ---
           const REVERSE_RAW = String(process.env.REVERSE || '').trim().toLowerCase();
           const IS_REVERSE = ['on', 'true', '1'].includes(REVERSE_RAW);
+
+          // --- Max adverse guard: 'off' | 'on' (default 'off') ---
+          // on = drop a survivor from idea generation if, during the watch phase,
+          //      its maxAdversePct exceeded its maxFavorablePct.
+          const MAX_ADVERSE_GUARD_RAW = String(process.env.MAX_ADVERSE_GUARD || '').trim().toLowerCase();
+          const IS_MAX_ADVERSE_GUARD = ['on', 'true', '1'].includes(MAX_ADVERSE_GUARD_RAW);
 
           // --- Cooldown ---
           const TTL_SEC = 300;
@@ -296,7 +303,7 @@ jobs:
           log('==================================================');
           log(`  Simple Entry/Exit Analyzer v${VERSION}`);
           log('==================================================');
-          log(`Config: workerMode=${WORKER_MODE} hedge=${IS_HEDGE ? 'on' : 'off'} reverse=${IS_REVERSE ? 'on' : 'off'} topN=${TOP_N} pool=${WATCH_POOL} watch=${WATCH_MIN}min artificialSL=${ARTIFICIAL_SL_PCT}% cooldown=${TTL_SEC}s pnlLimit=${PNL_LIMIT} fallbackToW1=${WORKER_MODE === 'both'}`);
+          log(`Config: workerMode=${WORKER_MODE} hedge=${IS_HEDGE ? 'on' : 'off'} reverse=${IS_REVERSE ? 'on' : 'off'} maxAdverseGuard=${IS_MAX_ADVERSE_GUARD ? 'on' : 'off'} topN=${TOP_N} pool=${WATCH_POOL} watch=${WATCH_MIN}min artificialSL=${ARTIFICIAL_SL_PCT}% cooldown=${TTL_SEC}s pnlLimit=${PNL_LIMIT} fallbackToW1=${WORKER_MODE === 'both'}`);
 
           await syncServerTime();
 
@@ -532,7 +539,8 @@ jobs:
               mode: passMode, fallback: isFallback, status: 'ok',
               commonSymbols: [], rows: [], perSymbolDebug: {},
               candidates: [], pool: [], watch: [], survivors: [], finalIdeas: [],
-              watchMeta: { polls: 0, wsConnected: false }
+              watchMeta: { polls: 0, wsConnected: false },
+              adverseGuardDropped: []
             };
 
             if ((useW1 && !pnlData.length) || (useW2 && !pnlData2.length)) {
@@ -641,7 +649,7 @@ jobs:
             res.watch = watch;
             res.watchMeta = { polls, wsConnected };
 
-            // ---- STEP 7: survivors -> re-check open positions -> top N ----
+            // ---- STEP 7: survivors -> re-check open positions -> max-adverse guard -> top N ----
             log('');
             log(`━━━ ${tag}STEP 7: Select top N from survivors ━━━`);
             try {
@@ -652,7 +660,7 @@ jobs:
             } catch (e) {
               log('WARN: re-check of open positions failed:', e?.message);
             }
-            const survivors = watch
+            let survivors = watch
               .filter(w => !w.eliminated && w.last > 0)
               .filter(w => {
                 if (openSyms.has(w.symbol)) {
@@ -663,6 +671,26 @@ jobs:
               })
               .sort((a, b) => b.score - a.score);
             res.survivors = survivors;
+
+            // ---- Max adverse guard: drop survivors where adverse > favorable ----
+            if (IS_MAX_ADVERSE_GUARD) {
+              const kept = [];
+              for (const s of survivors) {
+                if (s.maxAdversePct > s.maxFavorablePct) {
+                  log(`  ${tag}${s.symbol} ${s.side.toUpperCase()} dropped by max-adverse-guard: adverse(${s.maxAdversePct.toFixed(3)}%) > favorable(${s.maxFavorablePct.toFixed(3)}%)`);
+                  res.adverseGuardDropped.push({
+                    symbol: s.symbol, side: s.side,
+                    max_adverse_pct: +s.maxAdversePct.toFixed(3),
+                    max_favorable_pct: +s.maxFavorablePct.toFixed(3)
+                  });
+                } else {
+                  kept.push(s);
+                }
+              }
+              log(`Max-adverse-guard: ${survivors.length - kept.length} dropped, ${kept.length} kept`);
+              survivors = kept;
+              res.survivors = survivors;
+            }
 
             const eligible = survivors.filter(c => {
               const sides = IS_HEDGE ? ['long', 'short'] : [c.side];
@@ -754,7 +782,7 @@ jobs:
             }
           }
 
-          const { commonSymbols, rows, perSymbolDebug, candidates, pool, watch, survivors, finalIdeas, watchMeta } = result;
+          const { commonSymbols, rows, perSymbolDebug, candidates, pool, watch, survivors, finalIdeas, watchMeta, adverseGuardDropped } = result;
 
           // ================================================================
           //  REVERSE: flip side + recalculate tp/sl right before push
@@ -776,7 +804,7 @@ jobs:
             : finalIdeas;
 
           log('');
-          log(`Final ideas: ${finalIdeas.length}${fallbackUsed ? ' (from fallback)' : ''}${IS_REVERSE ? ' [REVERSE MODE ON]' : ''}`);
+          log(`Final ideas: ${finalIdeas.length}${fallbackUsed ? ' (from fallback)' : ''}${IS_REVERSE ? ' [REVERSE MODE ON]' : ''}${IS_MAX_ADVERSE_GUARD ? ' [MAX-ADVERSE-GUARD ON]' : ''}`);
           for (const i of pushIdeas) {
             log(`  ${i.symbol} ${i.side.toUpperCase()} entry=${i.entry} tp=${i.tp_abs} sl=${i.sl_abs} score=${i.score_bps}bps${i.hedge_leg ? ' (hedge leg)' : ''}${IS_REVERSE ? ' ↩reversed' : ''}`);
           }
@@ -796,6 +824,7 @@ jobs:
             worker_mode: WORKER_MODE,
             hedge_mode: IS_HEDGE,
             reverse_mode: IS_REVERSE,
+            max_adverse_guard: IS_MAX_ADVERSE_GUARD,
             fallback_used: fallbackUsed,
             primary_pass: primarySummary,
             worker_regime: regime,
@@ -804,6 +833,7 @@ jobs:
             candidates_found: candidates.length,
             watch_pool: pool.length,
             survivors: survivors.length,
+            max_adverse_guard_dropped: adverseGuardDropped,
             watch_engine: {
               rest_confirmations: watchMeta.polls,
               ws_connected: watchMeta.wsConnected,
@@ -835,6 +865,7 @@ jobs:
               worker_mode: WORKER_MODE,
               hedge: IS_HEDGE,
               reverse: IS_REVERSE,
+              max_adverse_guard: IS_MAX_ADVERSE_GUARD,
               top_n: TOP_N, tp_bps, sl_bps, min_move_bps: MIN_MOVE_BPS, notional_usd: NOTIONAL,
               watch_min: WATCH_MIN, artificial_sl_pct: ARTIFICIAL_SL_PCT,
               watch_pool: WATCH_POOL, cooldown_sec: TTL_SEC, pnl_limit: PNL_LIMIT
@@ -854,7 +885,7 @@ jobs:
               meta: {
                 origin: 'github_actions_analyzer', version: VERSION,
                 worker_regime: regime, worker_mode: WORKER_MODE,
-                hedge: IS_HEDGE, reverse: IS_REVERSE, fallback: fallbackUsed
+                hedge: IS_HEDGE, reverse: IS_REVERSE, max_adverse_guard: IS_MAX_ADVERSE_GUARD, fallback: fallbackUsed
               },
               top_n: pushIdeas.length,
               ideas: pushIdeas.map((idea, i) => ({
