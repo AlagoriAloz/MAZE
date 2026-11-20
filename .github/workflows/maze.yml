@@ -100,7 +100,10 @@ jobs:
           // --- Reverse mode ---
           const REVERSE_RAW = String(process.env.REVERSE || '').trim().toLowerCase();
           const IS_REVERSE = ['on', 'true', '1'].includes(REVERSE_RAW);
-          // --- Reverse margin: if (maxFavorable - maxAdverse) >= threshold, skip reverse (keep original side) ---
+          // --- Reverse margin threshold (2-tier) ---
+          // margin = watch_max_favorable_pct - watch_max_adverse_pct
+          //   margin <= REVERSE_MARGIN_PCT  -> reverse the side (contested move)
+          //   margin >  REVERSE_MARGIN_PCT  -> DROP the idea entirely (clean one-sided move, do not push at all)
           const REVERSE_MARGIN_PCT = Math.max(0, Number(process.env.REVERSE_MARGIN_PCT || '0.6'));
           // --- Max adverse guard: 'off' | 'on' (default 'off') ---
           // on = drop a survivor from idea generation if, during the watch phase,
@@ -724,16 +727,22 @@ jobs:
           }
           const { commonSymbols, rows, perSymbolDebug, candidates, pool, watch, survivors, finalIdeas, watchMeta, adverseGuardDropped } = result;
           // ================================================================
-          //  REVERSE: flip side ONLY if (maxFavorable - maxAdverse) < REVERSE_MARGIN_PCT
-          //  i.e. if the watch phase showed a clean, strong move (big margin),
-          //  keep the original side. Otherwise, flip it.
+          //  REVERSE (2-tier):
+          //    margin = watch_max_favorable_pct - watch_max_adverse_pct
+          //    margin <= REVERSE_MARGIN_PCT  -> reverse the side (contested move)
+          //    margin >  REVERSE_MARGIN_PCT  -> DROP the idea entirely (clean one-sided move)
           // ================================================================
+          const reverseSkippedSymbols = [];
           const pushIdeas = IS_REVERSE
             ? finalIdeas.map(idea => {
                 const margin = idea.watch_max_favorable_pct - idea.watch_max_adverse_pct;
-                if (margin >= REVERSE_MARGIN_PCT) {
-                  log(`  ${idea.symbol} ${idea.side.toUpperCase()} reverse skipped: favorable(${idea.watch_max_favorable_pct.toFixed(3)}%) - adverse(${idea.watch_max_adverse_pct.toFixed(3)}%) = ${margin.toFixed(3)}% >= ${REVERSE_MARGIN_PCT}% (keeping original side)`);
-                  return idea;
+                if (margin > REVERSE_MARGIN_PCT) {
+                  log(`  ${idea.symbol} ${idea.side.toUpperCase()} DROPPED: margin=${margin.toFixed(3)}% > ${REVERSE_MARGIN_PCT}% (clean move, skipping symbol)`);
+                  reverseSkippedSymbols.push({
+                    symbol: idea.symbol, side: idea.side,
+                    margin_pct: +margin.toFixed(3)
+                  });
+                  return null;
                 }
                 const flippedSide = idea.side === 'long' ? 'short' : 'long';
                 const entry = idea.entry;
@@ -745,14 +754,17 @@ jobs:
                   tp_abs = +(entry * (1 - idea.tp_bps / 10000)).toPrecision(7);
                   sl_abs = +(entry * (1 + idea.sl_bps / 10000)).toPrecision(7);
                 }
-                log(`  ${idea.symbol} ${idea.side.toUpperCase()} reversed → ${flippedSide.toUpperCase()}: favorable(${idea.watch_max_favorable_pct.toFixed(3)}%) - adverse(${idea.watch_max_adverse_pct.toFixed(3)}%) = ${margin.toFixed(3)}% < ${REVERSE_MARGIN_PCT}%`);
+                log(`  ${idea.symbol} ${idea.side.toUpperCase()} reversed → ${flippedSide.toUpperCase()}: margin=${margin.toFixed(3)}% <= ${REVERSE_MARGIN_PCT}%`);
                 return { ...idea, side: flippedSide, tp_abs, sl_abs };
-              })
+              }).filter(Boolean)
             : finalIdeas;
           log('');
           log(`Final ideas: ${finalIdeas.length}${fallbackUsed ? ' (from fallback)' : ''}${IS_REVERSE ? ` [REVERSE MODE ON, margin=${REVERSE_MARGIN_PCT}%]` : ''}${IS_MAX_ADVERSE_GUARD ? ' [MAX-ADVERSE-GUARD ON]' : ''}`);
+          if (IS_REVERSE && reverseSkippedSymbols.length) {
+            log(`Reverse-skip dropped ${reverseSkippedSymbols.length} symbol(s): ${reverseSkippedSymbols.map(s => s.symbol).join(', ')}`);
+          }
           for (const i of pushIdeas) {
-            log(`  ${i.symbol} ${i.side.toUpperCase()} entry=${i.entry} tp=${i.tp_abs} sl=${i.sl_abs} score=${i.score_bps}bps${i.hedge_leg ? ' (hedge leg)' : ''}${IS_REVERSE ? ' ↩reversed-check' : ''}`);
+            log(`  ${i.symbol} ${i.side.toUpperCase()} entry=${i.entry} tp=${i.tp_abs} sl=${i.sl_abs} score=${i.score_bps}bps${i.hedge_leg ? ' (hedge leg)' : ''}`);
           }
           // ---- STEP 8: Write analysis gist ----
           log('');
@@ -769,6 +781,7 @@ jobs:
             hedge_mode: IS_HEDGE,
             reverse_mode: IS_REVERSE,
             reverse_margin_pct: REVERSE_MARGIN_PCT,
+            reverse_skipped_symbols: reverseSkippedSymbols,
             max_adverse_guard: IS_MAX_ADVERSE_GUARD,
             fallback_used: fallbackUsed,
             primary_pass: primarySummary,
@@ -830,8 +843,7 @@ jobs:
               meta: {
                 origin: 'github_actions_analyzer', version: VERSION,
                 worker_regime: regime, worker_mode: WORKER_MODE,
-                hedge: IS_HEDGE, reverse: IS_REVERSE, reverse_margin_pct: REVERSE_MARGIN_PCT,
-                max_adverse_guard: IS_MAX_ADVERSE_GUARD, fallback: fallbackUsed
+                hedge: IS_HEDGE, reverse: IS_REVERSE, reverse_margin_pct: REVERSE_MARGIN_PCT, max_adverse_guard: IS_MAX_ADVERSE_GUARD, fallback: fallbackUsed
               },
               top_n: pushIdeas.length,
               ideas: pushIdeas.map((idea, i) => ({
