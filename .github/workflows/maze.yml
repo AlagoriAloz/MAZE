@@ -33,16 +33,15 @@ jobs:
       WORKER_MODE: ${{ vars.ANALYZER_WORKER_MODE || vars.WORKER_MODE }}
       HEDGE: ${{ vars.ANALYZER_HEDGE || vars.HEDGE }}
       REVERSE: ${{ vars.ANALYZER_REVERSE || vars.REVERSE }}
+      REVERSE_MARGIN_PCT: ${{ vars.ANALYZER_REVERSE_MARGIN_PCT || vars.REVERSE_MARGIN_PCT }}
       MAX_ADVERSE_GUARD: ${{ vars.ANALYZER_MAX_ADVERSE_GUARD || vars.MAX_ADVERSE_GUARD }}
     steps:
       - name: Setup Node 20
         uses: actions/setup-node@v4
         with:
           node-version: 20
-
       - name: Install watch-phase dependencies (ws)
         run: npm install ws@8 --no-save
-
       - name: Run Simple Entry/Exit Analyzer
         shell: bash
         run: |
@@ -62,7 +61,6 @@ jobs:
           const VERSION = '4.5.0';
           const UA = `trend-analyzer/${VERSION}`;
           const log = (...a) => console.log('[analyzer]', ...a);
-
           // ================================================================
           //  CONFIGURATION
           // ================================================================
@@ -72,7 +70,6 @@ jobs:
           const GIST_TOKEN = process.env.GIST_TOKEN || '';
           const PUSH_URL = process.env.WORKER_PUSH_URL || '';
           const PUSH_TOKEN = process.env.PUSH_TOKEN || '';
-
           const TOP_N = Math.max(1, Math.min(10, Number(process.env.TOP_N || '3')));
           const MAX_SL_BPS = Math.max(10, Math.min(300, Number(process.env.MAX_SL_BPS || '80')));
           const TP_BPS_CFG = Math.max(10, Number(process.env.TP_BPS || '100'));
@@ -81,7 +78,6 @@ jobs:
           const BYBIT_PUBLIC = (process.env.BYBIT_PROXY_URL || 'https://api.bybit.com').replace(/\/+$/, '');
           const BYBIT_WS_URL = 'wss://stream.bybit.com/v5/public/linear';
           const MIN_MOVE_BPS = Math.max(0, Number(process.env.MIN_MOVE_BPS || '5'));
-
           // --- Watch phase ---
           const WATCH_MIN = Math.max(0, Math.min(15, Number(process.env.WATCH_MIN || '3')));
           const ARTIFICIAL_SL_PCT = Math.max(0.01, Math.min(5, Number(process.env.ARTIFICIAL_SL_PCT || '0.3')));
@@ -91,36 +87,30 @@ jobs:
           const DEBOUNCE_TICKS = 2;       // consecutive WS breach ticks required before "pending"
           const REST_FALLBACK_TICKS = 2;  // consecutive REST breach polls required if WS is stale
           const TICKLOG_CAP = 60;         // per-symbol audit log cap
-
           // --- Full history request size ---
           const PNL_LIMIT = Math.max(100, Number(process.env.PNL_LIMIT || '1000'));
-
           // --- Worker mode: '1' | '2' | 'both' (default 'both') ---
           const WORKER_MODE_RAW = String(process.env.WORKER_MODE || '').trim().toLowerCase();
           const WORKER_MODE = ['1', '2', 'both'].includes(WORKER_MODE_RAW) ? WORKER_MODE_RAW : 'both';
           const USE_W1 = WORKER_MODE === '1' || WORKER_MODE === 'both';
           const USE_W2 = WORKER_MODE === '2' || WORKER_MODE === 'both';
-
           // --- Hedge mode ---
           const HEDGE_RAW = String(process.env.HEDGE || '').trim().toLowerCase();
           const IS_HEDGE = ['on', 'true', '1'].includes(HEDGE_RAW);
-
           // --- Reverse mode ---
           const REVERSE_RAW = String(process.env.REVERSE || '').trim().toLowerCase();
           const IS_REVERSE = ['on', 'true', '1'].includes(REVERSE_RAW);
-
+          // --- Reverse margin: if (maxFavorable - maxAdverse) >= threshold, skip reverse (keep original side) ---
+          const REVERSE_MARGIN_PCT = Math.max(0, Number(process.env.REVERSE_MARGIN_PCT || '0.6'));
           // --- Max adverse guard: 'off' | 'on' (default 'off') ---
           // on = drop a survivor from idea generation if, during the watch phase,
           //      its maxAdversePct exceeded its maxFavorablePct.
           const MAX_ADVERSE_GUARD_RAW = String(process.env.MAX_ADVERSE_GUARD || '').trim().toLowerCase();
           const IS_MAX_ADVERSE_GUARD = ['on', 'true', '1'].includes(MAX_ADVERSE_GUARD_RAW);
-
           // --- Cooldown ---
           const TTL_SEC = 300;
           const PUSHED_KEEP_MS = Math.max(30 * 60e3, TTL_SEC * 1000 * 2);
-
           const sleep = ms => new Promise(r => setTimeout(r, ms));
-
           // ================================================================
           //  HTTP HELPERS
           // ================================================================
@@ -142,7 +132,6 @@ jobs:
               }
             }
           }
-
           // ================================================================
           //  EXCHANGE TIME SYNC (avoid CI runner clock drift)
           // ================================================================
@@ -163,7 +152,6 @@ jobs:
           }
           const exchNow = () => Date.now() + serverOffsetMs;
           const exchISO = () => new Date(exchNow()).toISOString();
-
           // ================================================================
           //  GIST I/O
           // ================================================================
@@ -206,7 +194,6 @@ jobs:
               process.exitCode = 1;
             }
           }
-
           // ================================================================
           //  BYBIT REST
           // ================================================================
@@ -240,7 +227,6 @@ jobs:
             }
             return map;
           }
-
           // ================================================================
           //  CORE: direction = compare current price vs last exit price
           // ================================================================
@@ -259,7 +245,6 @@ jobs:
             }
             return { direction: 'neutral', reason: 'too_close_to_last_exit', lastExit, moveBps };
           }
-
           // ================================================================
           //  NORMALIZE TRADES FROM A WORKER
           // ================================================================
@@ -296,25 +281,20 @@ jobs:
             }
             return bySymbol;
           }
-
           // ================================================================
           //  MAIN EXECUTION
           // ================================================================
           log('==================================================');
           log(`  Simple Entry/Exit Analyzer v${VERSION}`);
           log('==================================================');
-          log(`Config: workerMode=${WORKER_MODE} hedge=${IS_HEDGE ? 'on' : 'off'} reverse=${IS_REVERSE ? 'on' : 'off'} maxAdverseGuard=${IS_MAX_ADVERSE_GUARD ? 'on' : 'off'} topN=${TOP_N} pool=${WATCH_POOL} watch=${WATCH_MIN}min artificialSL=${ARTIFICIAL_SL_PCT}% cooldown=${TTL_SEC}s pnlLimit=${PNL_LIMIT} fallbackToW1=${WORKER_MODE === 'both'}`);
-
+          log(`Config: workerMode=${WORKER_MODE} hedge=${IS_HEDGE ? 'on' : 'off'} reverse=${IS_REVERSE ? 'on' : 'off'} reverseMarginPct=${REVERSE_MARGIN_PCT}% maxAdverseGuard=${IS_MAX_ADVERSE_GUARD ? 'on' : 'off'} topN=${TOP_N} pool=${WATCH_POOL} watch=${WATCH_MIN}min artificialSL=${ARTIFICIAL_SL_PCT}% cooldown=${TTL_SEC}s pnlLimit=${PNL_LIMIT} fallbackToW1=${WORKER_MODE === 'both'}`);
           await syncServerTime();
-
           const prev = await readAnalysisGist();
           const pushedPrev = prev.pushed || {};
-
           const cooldownActive = (sym, side) => {
             const ts = pushedPrev[sym + '|' + side];
             return !!ts && Date.now() - ts < TTL_SEC * 1000;
           };
-
           // ---- STEP 1: Fetch trades ----
           log('');
           log('━━━ STEP 1: Fetch worker trades (full history) ━━━');
@@ -357,7 +337,6 @@ jobs:
           } else {
             log('Worker 2 trades: skipped (WORKER_MODE=1)');
           }
-
           const regime = stateData?.regime?.regime || 'Unknown';
           const extractOpenSyms = st => {
             const pos = Array.isArray(st?.positions)
@@ -366,14 +345,11 @@ jobs:
           };
           let { pos: positions, syms: openSyms } = extractOpenSyms(stateData);
           log(`Regime: ${regime} | Open positions: ${positions.length}`);
-
           const bySymbol1 = USE_W1 ? normalizeWorker1Trades(pnlData) : {};
           const bySymbol2 = USE_W2 ? normalizeWorker2Trades(pnlData2) : {};
-
           const sl_bps = Math.min(SL_BPS_CFG, MAX_SL_BPS);
           const tp_bps = TP_BPS_CFG;
           const arrow = d => d === 'long' ? '🔼 UP' : d === 'short' ? '🔽 DOWN' : d === 'n/a' ? '— N/A' : '⏸ FLAT';
-
           // ================================================================
           //  WATCH PHASE ENGINE (WebSocket primary + REST dual-source confirm)
           // ================================================================
@@ -405,9 +381,7 @@ jobs:
               log(`  ${w.symbol} ${w.side.toUpperCase()} ref=${w.refEntry} elimLine=${w.elimLine}`);
             }
             if (!watch.length) return { watch, polls: 0, wsConnected: false };
-
             const byId = new Map(watch.map(w => [w.symbol, w]));
-
             const eliminate = (w, price, reason) => {
               w.eliminated = true;
               w.elimPrice = +price;
@@ -415,7 +389,6 @@ jobs:
               w.elimReason = reason;
               log(`  ❌ ${tag}${w.symbol} ${w.side.toUpperCase()} eliminated @ ${price} reason=${reason}`);
             };
-
             // ---- WebSocket: real-time primary feed ----
             let ws = null, wsAlive = false, pingTimer = null;
             try {
@@ -440,19 +413,15 @@ jobs:
                 if (d.ask1Price) w.wsCache.ask = +d.ask1Price;
                 if (d.lastPrice) w.wsCache.last = +d.lastPrice;
                 w.wsCache.ts = Date.now();
-
                 const trigger = w.side === 'long'
                   ? (w.wsCache.bid || w.wsCache.last)
                   : (w.wsCache.ask || w.wsCache.last);
                 if (!(trigger > 0)) return;
-
                 const adverse = w.side === 'long'
                   ? (w.refEntry - trigger) / w.refEntry * 100
                   : (trigger - w.refEntry) / w.refEntry * 100;
-
                 if (adverse > w.maxAdversePct) w.maxAdversePct = adverse;
                 if (-adverse > w.maxFavorablePct) w.maxFavorablePct = -adverse;
-
                 if (adverse >= ARTIFICIAL_SL_PCT) {
                   w.wsStrikes++;
                   w.wsBreachPrice = trigger;
@@ -466,7 +435,6 @@ jobs:
             } catch (e) {
               log(`  ${tag}WS setup failed, REST-only fallback:`, e?.message);
             }
-
             // ---- REST: independent confirmation + fallback poller ----
             let polls = 0;
             const endAt = Date.now() + WATCH_MIN * 60e3;
@@ -482,16 +450,13 @@ jobs:
                   const restTrigger = w.side === 'long' ? (t.bid || t.last) : (t.ask || t.last);
                   if (!(restTrigger > 0)) continue;
                   w.last = t.last || restTrigger;
-
                   const adverseRest = w.side === 'long'
                     ? (w.refEntry - restTrigger) / w.refEntry * 100
                     : (restTrigger - w.refEntry) / w.refEntry * 100;
                   if (adverseRest > w.maxAdversePct) w.maxAdversePct = adverseRest;
                   if (-adverseRest > w.maxFavorablePct) w.maxFavorablePct = -adverseRest;
-
                   const restBreach = adverseRest >= ARTIFICIAL_SL_PCT;
                   const wsStale = !wsAlive || !w.wsCache || (Date.now() - w.wsCache.ts > WS_STALE_MS);
-
                   w.tickLog.push({
                     t: exchISO(),
                     rest: { bid: t.bid, ask: t.ask, last: t.last, adversePct: +adverseRest.toFixed(4) },
@@ -499,7 +464,6 @@ jobs:
                     wsStale
                   });
                   if (w.tickLog.length > TICKLOG_CAP) w.tickLog.shift();
-
                   if (restBreach && w.wsBreachPending) {
                     eliminate(w, restTrigger, 'dual_source_confirmed');
                   } else if (restBreach && wsStale) {
@@ -517,17 +481,14 @@ jobs:
               if (remaining <= 0) break;
               await sleep(Math.min(POLL_MS, remaining));
             }
-
             if (pingTimer) clearInterval(pingTimer);
             if (ws) { try { ws.close(); } catch {} }
-
             log(`${tag}Watch finished (${polls} REST confirmations, WS connected=${wsAlive})`);
             for (const w of watch) {
               log(`  ${w.eliminated ? '❌' : '✅'} ${w.symbol} ${w.side.toUpperCase()} last=${w.last} maxAdverse=${w.maxAdversePct.toFixed(3)}% maxFavorable=${w.maxFavorablePct.toFixed(3)}% reason=${w.elimReason || '-'}`);
             }
             return { watch, polls, wsConnected: wsAlive };
           }
-
           // ================================================================
           //  ONE FULL PASS
           // ================================================================
@@ -542,14 +503,12 @@ jobs:
               watchMeta: { polls: 0, wsConnected: false },
               adverseGuardDropped: []
             };
-
             if ((useW1 && !pnlData.length) || (useW2 && !pnlData2.length)) {
               log('');
               log(`${tag}Missing closed trades for mode (${passMode}). Nothing to analyze.`);
               res.status = 'insufficient_data';
               return res;
             }
-
             // ---- STEP 2: symbols ----
             log('');
             log(`━━━ ${tag}STEP 2: Symbols (mode ${passMode}) ━━━`);
@@ -566,7 +525,6 @@ jobs:
               res.status = 'no_common_symbols';
               return res;
             }
-
             // ---- STEP 3: prices ----
             log('');
             log(`━━━ ${tag}STEP 3: Fetch current prices ━━━`);
@@ -577,7 +535,6 @@ jobs:
               if (tickers[sym]) log(`  ${sym}: $${tickers[sym].lastPrice}`);
               else log(`  ${sym}: ticker fetch failed`);
             }
-
             // ---- STEP 4: direction, agreement, open-pos, cooldown ----
             log('');
             log(`━━━ ${tag}STEP 4: Trend table (lastExit vs current) ━━━`);
@@ -588,19 +545,16 @@ jobs:
               const ticker = tickers[sym];
               if (!ticker || !(ticker.lastPrice > 0)) continue;
               const currentPrice = ticker.lastPrice;
-
               const d1 = useW1 ? computeDirection(bySymbol1[sym], currentPrice) : null;
               const d2 = useW2 ? computeDirection(bySymbol2[sym], currentPrice) : null;
               const used = [d1, d2].filter(Boolean);
               const side = used[0].direction;
               const agree = side !== 'neutral' && used.every(d => d.direction === side);
               const score = used.reduce((s, d) => s + Math.abs(d.moveBps), 0) / used.length;
-
               let skip = null;
               if (!agree) skip = 'no_agreement';
               else if (openSyms.has(sym)) skip = 'open_position';
               else if (!IS_HEDGE && cooldownActive(sym, side)) skip = 'cooldown';
-
               rows.push({
                 symbol: sym,
                 w1LastExit: d1 ? d1.lastExit : null,
@@ -612,11 +566,9 @@ jobs:
                 skip
               });
               perSymbolDebug[sym] = { currentPrice, worker1: d1, worker2: d2, agree, skip };
-
               if (skip) continue;
               candidates.push({ symbol: sym, side, score, currentPrice, ticker });
             }
-
             log('');
             log('Symbol         | W1 LastExit  | W2 LastExit  | Current      | Trend(W1) | Trend(W2) | Agree? | Skip');
             log('---------------|--------------|--------------|--------------|-----------|-----------|--------|-----');
@@ -630,7 +582,6 @@ jobs:
               const ag = r.agree ? '✅' : '❌';
               log(`${sym} | ${w1e} | ${w2e} | ${cur} | ${t1} | ${t2} | ${ag}     | ${r.skip || '-'}`);
             }
-
             // ---- STEP 5: score + rank -> pool ----
             log('');
             log(`━━━ ${tag}STEP 5: Score + rank candidates ━━━`);
@@ -641,14 +592,12 @@ jobs:
             const pool = candidates.slice(0, WATCH_POOL);
             res.pool = pool;
             log(`Watch pool: ${pool.length} candidate(s)`);
-
             // ---- STEP 6: watch phase (WS + REST dual-source, debounced) ----
             log('');
             log(`━━━ ${tag}STEP 6: Watch phase (${WATCH_MIN} min, artificial SL ${ARTIFICIAL_SL_PCT}%, dual-source confirm) ━━━`);
             const { watch, polls, wsConnected } = await runWatchPhase(pool, tag);
             res.watch = watch;
             res.watchMeta = { polls, wsConnected };
-
             // ---- STEP 7: survivors -> re-check open positions -> max-adverse guard -> top N ----
             log('');
             log(`━━━ ${tag}STEP 7: Select top N from survivors ━━━`);
@@ -671,7 +620,6 @@ jobs:
               })
               .sort((a, b) => b.score - a.score);
             res.survivors = survivors;
-
             // ---- Max adverse guard: drop survivors where adverse > favorable ----
             if (IS_MAX_ADVERSE_GUARD) {
               const kept = [];
@@ -691,14 +639,12 @@ jobs:
               survivors = kept;
               res.survivors = survivors;
             }
-
             const eligible = survivors.filter(c => {
               const sides = IS_HEDGE ? ['long', 'short'] : [c.side];
               return sides.some(s => !cooldownActive(c.symbol, s));
             });
             const top = eligible.slice(0, TOP_N);
             log(`Survivors: ${survivors.length} | Eligible (not fully cooling down): ${eligible.length} | Selected: ${top.length}`);
-
             const createIdea = (c, side) => {
               const entry = +c.last.toPrecision(7);
               let tp_abs, sl_abs;
@@ -717,7 +663,6 @@ jobs:
               const hedgeLabel = IS_HEDGE ? ` [Hedge Mode: ${isPrimary ? 'Primary' : 'Opposite'}]` : '';
               const survivedText = `Survived ${WATCH_MIN}min dual-source watch (artificial SL ${ARTIFICIAL_SL_PCT}%, max adverse ${c.maxAdversePct.toFixed(3)}%)`;
               const hedgeText = `Hedge counterpart of ${c.side} signal (not separately watched; primary ${survivedText.charAt(0).toLowerCase()}${survivedText.slice(1)})`;
-
               return {
                 symbol: c.symbol,
                 base: c.symbol.replace('USDT', ''),
@@ -742,7 +687,6 @@ jobs:
                 generated_at: new Date().toISOString()
               };
             };
-
             const finalIdeas = [];
             for (const c of top) {
               const sides = IS_HEDGE ? ['long', 'short'] : [c.side];
@@ -754,11 +698,9 @@ jobs:
                 finalIdeas.push(createIdea(c, s));
               }
             }
-
             res.finalIdeas = finalIdeas;
             return res;
           }
-
           // ---- Run primary pass, then fallback if nothing to push ----
           let result = await runPass(WORKER_MODE, false);
           let fallbackUsed = false;
@@ -769,7 +711,6 @@ jobs:
             survivors: result.survivors.length,
             ideas: result.finalIdeas.length
           };
-
           if (result.finalIdeas.length === 0 && WORKER_MODE === 'both') {
             log('');
             log('━━━ FALLBACK: primary (both) pass produced 0 ideas ━━━');
@@ -781,14 +722,19 @@ jobs:
               log('Fallback skipped: no worker 1 trades available.');
             }
           }
-
           const { commonSymbols, rows, perSymbolDebug, candidates, pool, watch, survivors, finalIdeas, watchMeta, adverseGuardDropped } = result;
-
           // ================================================================
-          //  REVERSE: flip side + recalculate tp/sl right before push
+          //  REVERSE: flip side ONLY if (maxFavorable - maxAdverse) < REVERSE_MARGIN_PCT
+          //  i.e. if the watch phase showed a clean, strong move (big margin),
+          //  keep the original side. Otherwise, flip it.
           // ================================================================
           const pushIdeas = IS_REVERSE
             ? finalIdeas.map(idea => {
+                const margin = idea.watch_max_favorable_pct - idea.watch_max_adverse_pct;
+                if (margin >= REVERSE_MARGIN_PCT) {
+                  log(`  ${idea.symbol} ${idea.side.toUpperCase()} reverse skipped: favorable(${idea.watch_max_favorable_pct.toFixed(3)}%) - adverse(${idea.watch_max_adverse_pct.toFixed(3)}%) = ${margin.toFixed(3)}% >= ${REVERSE_MARGIN_PCT}% (keeping original side)`);
+                  return idea;
+                }
                 const flippedSide = idea.side === 'long' ? 'short' : 'long';
                 const entry = idea.entry;
                 let tp_abs, sl_abs;
@@ -799,16 +745,15 @@ jobs:
                   tp_abs = +(entry * (1 - idea.tp_bps / 10000)).toPrecision(7);
                   sl_abs = +(entry * (1 + idea.sl_bps / 10000)).toPrecision(7);
                 }
+                log(`  ${idea.symbol} ${idea.side.toUpperCase()} reversed → ${flippedSide.toUpperCase()}: favorable(${idea.watch_max_favorable_pct.toFixed(3)}%) - adverse(${idea.watch_max_adverse_pct.toFixed(3)}%) = ${margin.toFixed(3)}% < ${REVERSE_MARGIN_PCT}%`);
                 return { ...idea, side: flippedSide, tp_abs, sl_abs };
               })
             : finalIdeas;
-
           log('');
-          log(`Final ideas: ${finalIdeas.length}${fallbackUsed ? ' (from fallback)' : ''}${IS_REVERSE ? ' [REVERSE MODE ON]' : ''}${IS_MAX_ADVERSE_GUARD ? ' [MAX-ADVERSE-GUARD ON]' : ''}`);
+          log(`Final ideas: ${finalIdeas.length}${fallbackUsed ? ' (from fallback)' : ''}${IS_REVERSE ? ` [REVERSE MODE ON, margin=${REVERSE_MARGIN_PCT}%]` : ''}${IS_MAX_ADVERSE_GUARD ? ' [MAX-ADVERSE-GUARD ON]' : ''}`);
           for (const i of pushIdeas) {
-            log(`  ${i.symbol} ${i.side.toUpperCase()} entry=${i.entry} tp=${i.tp_abs} sl=${i.sl_abs} score=${i.score_bps}bps${i.hedge_leg ? ' (hedge leg)' : ''}${IS_REVERSE ? ' ↩reversed' : ''}`);
+            log(`  ${i.symbol} ${i.side.toUpperCase()} entry=${i.entry} tp=${i.tp_abs} sl=${i.sl_abs} score=${i.score_bps}bps${i.hedge_leg ? ' (hedge leg)' : ''}${IS_REVERSE ? ' ↩reversed-check' : ''}`);
           }
-
           // ---- STEP 8: Write analysis gist ----
           log('');
           log('━━━ STEP 8: Write analysis Gist ━━━');
@@ -816,7 +761,6 @@ jobs:
           for (const [k, ts] of Object.entries(pushedPrev)) {
             if (Date.now() - ts < PUSHED_KEEP_MS) pushedNext[k] = ts;
           }
-
           const output = {
             ts: new Date().toISOString(),
             version: VERSION,
@@ -824,6 +768,7 @@ jobs:
             worker_mode: WORKER_MODE,
             hedge_mode: IS_HEDGE,
             reverse_mode: IS_REVERSE,
+            reverse_margin_pct: REVERSE_MARGIN_PCT,
             max_adverse_guard: IS_MAX_ADVERSE_GUARD,
             fallback_used: fallbackUsed,
             primary_pass: primarySummary,
@@ -865,6 +810,7 @@ jobs:
               worker_mode: WORKER_MODE,
               hedge: IS_HEDGE,
               reverse: IS_REVERSE,
+              reverse_margin_pct: REVERSE_MARGIN_PCT,
               max_adverse_guard: IS_MAX_ADVERSE_GUARD,
               top_n: TOP_N, tp_bps, sl_bps, min_move_bps: MIN_MOVE_BPS, notional_usd: NOTIONAL,
               watch_min: WATCH_MIN, artificial_sl_pct: ARTIFICIAL_SL_PCT,
@@ -873,7 +819,6 @@ jobs:
           };
           await writeAnalysisGist(output);
           log('Analysis Gist written.');
-
           // ---- STEP 9: Push ideas to worker & confirm receipt ----
           if (PUSH_URL && PUSH_TOKEN && pushIdeas.length > 0) {
             log('');
@@ -885,7 +830,8 @@ jobs:
               meta: {
                 origin: 'github_actions_analyzer', version: VERSION,
                 worker_regime: regime, worker_mode: WORKER_MODE,
-                hedge: IS_HEDGE, reverse: IS_REVERSE, max_adverse_guard: IS_MAX_ADVERSE_GUARD, fallback: fallbackUsed
+                hedge: IS_HEDGE, reverse: IS_REVERSE, reverse_margin_pct: REVERSE_MARGIN_PCT,
+                max_adverse_guard: IS_MAX_ADVERSE_GUARD, fallback: fallbackUsed
               },
               top_n: pushIdeas.length,
               ideas: pushIdeas.map((idea, i) => ({
@@ -979,7 +925,6 @@ jobs:
             log('');
             log('Push skipped (no WORKER_PUSH_URL or PUSH_TOKEN).');
           }
-
           log('');
           log('═══ Analysis complete ═══');
           })().catch(e => { console.error('[analyzer] FATAL', e); process.exit(1); });
