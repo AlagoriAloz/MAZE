@@ -63,14 +63,27 @@ jobs:
         env:
           WORKER_PUSH_URL: ${{ secrets.WORKER_PUSH_URL }}
         run: |
+          set +e   # don't let curl/jq failures kill the step — we handle errors ourselves
           ORIGIN=$(echo "$WORKER_PUSH_URL" | sed -E 's#(https?://[^/]+).*#\1#')
-          RESP=$(curl -s "$ORIGIN/winrate")
-          RATE=$(echo "$RESP" | jq -r '.hedge.last5.rate // empty')
-          TOTAL=$(echo "$RESP" | jq -r '.hedge.last5.total // 0')
+          echo "Resolved origin: $ORIGIN"
+
+          RESP=$(curl -s -m 15 "$ORIGIN/winrate")
+          echo "Raw response: $RESP"
+
+          # Validate it's actually JSON before trying to parse fields
+          if ! echo "$RESP" | jq -e . >/dev/null 2>&1; then
+            echo "⚠️ Response is not valid JSON — blocking X as a safe default."
+            echo "run_x=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          RATE=$(echo "$RESP" | jq -r '.hedge.last5.rate // empty' 2>/dev/null)
+          TOTAL=$(echo "$RESP" | jq -r '.hedge.last5.total // 0' 2>/dev/null)
           echo "Hedge win-rate: rate=$RATE total=$TOTAL"
+
           if [ -z "$RATE" ]; then
             echo "run_x=false" >> "$GITHUB_OUTPUT"
-            echo "⚠️ Could not fetch win-rate — blocking X as a safe default."
+            echo "⚠️ rate field missing — blocking X as a safe default."
           elif awk "BEGIN{exit !($RATE>=60)}"; then
             echo "run_x=true" >> "$GITHUB_OUTPUT"
             echo "✅ Win-rate ${RATE}% >= 60% — X will run."
@@ -78,6 +91,7 @@ jobs:
             echo "run_x=false" >> "$GITHUB_OUTPUT"
             echo "🛑 Win-rate ${RATE}% < 60% — X will NOT run."
           fi
+          exit 0
       - name: Trigger X
         if: steps.winrate.outputs.run_x == 'true'
         env:
