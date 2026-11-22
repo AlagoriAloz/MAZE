@@ -17,7 +17,7 @@ jobs:
       WORKER_URL_2: ${{ secrets.WORKER_URL_2 }}
       ANALYSIS_GIST_ID: ${{ secrets.ANALYSIS_GIST_ID }}
       GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
-      BYBIT_PROXY_URL: ${{ secrets.BYBIT_PROXY_URL }}
+      BINANCE_BASE_URL: ${{ secrets.BINANCE_BASE_URL }}
       WORKER_PUSH_URL: ${{ secrets.WORKER_PUSH_URL }}
       PUSH_TOKEN: ${{ secrets.PUSH_TOKEN }}
       TOP_N: ${{ vars.ANALYZER_TOP_N }}
@@ -75,21 +75,23 @@ jobs:
           const TP_BPS_CFG = Math.max(10, Number(process.env.TP_BPS || '100'));
           const SL_BPS_CFG = Math.max(10, Number(process.env.SL_BPS || '50'));
           const NOTIONAL = Math.max(50, Number(process.env.NOTIONAL_USD || '300'));
-          const BYBIT_PUBLIC = (process.env.BYBIT_PROXY_URL || 'https://api.bybit.com').replace(/\/+$/, '');
-          const BYBIT_WS_URL = 'wss://stream.bybit.com/v5/public/linear';
+          // ---- CHANGED: Binance Futures REST base ----
+          const BINANCE_PUBLIC = (process.env.BINANCE_BASE_URL || 'https://fapi.binance.com').replace(/\/+$/, '');
+          // ---- CHANGED: Binance Futures WebSocket base ----
+          const BINANCE_WS_BASE = 'wss://fstream.binance.com';
           const MIN_MOVE_BPS = Math.max(0, Number(process.env.MIN_MOVE_BPS || '5'));
           // --- Watch phase ---
           const WATCH_MIN = Math.max(0, Math.min(15, Number(process.env.WATCH_MIN || '3')));
           const ARTIFICIAL_SL_PCT = Math.max(0.01, Math.min(5, Number(process.env.ARTIFICIAL_SL_PCT || '0.3')));
           const WATCH_POOL = Math.max(TOP_N, Math.min(30, Number(process.env.WATCH_POOL || '10')));
-          const POLL_MS = 10000;          // REST confirmation poll interval
-          const WS_STALE_MS = 15000;      // if no WS tick in this long, treat WS as dead
-          const DEBOUNCE_TICKS = 2;       // consecutive WS breach ticks required before "pending"
-          const REST_FALLBACK_TICKS = 2;  // consecutive REST breach polls required if WS is stale
-          const TICKLOG_CAP = 60;         // per-symbol audit log cap
+          const POLL_MS = 10000;
+          const WS_STALE_MS = 15000;
+          const DEBOUNCE_TICKS = 2;
+          const REST_FALLBACK_TICKS = 2;
+          const TICKLOG_CAP = 60;
           // --- Full history request size ---
           const PNL_LIMIT = Math.max(100, Number(process.env.PNL_LIMIT || '1000'));
-          // --- Worker mode: '1' | '2' | 'both' (default 'both') ---
+          // --- Worker mode ---
           const WORKER_MODE_RAW = String(process.env.WORKER_MODE || '').trim().toLowerCase();
           const WORKER_MODE = ['1', '2', 'both'].includes(WORKER_MODE_RAW) ? WORKER_MODE_RAW : 'both';
           const USE_W1 = WORKER_MODE === '1' || WORKER_MODE === 'both';
@@ -100,14 +102,8 @@ jobs:
           // --- Reverse mode ---
           const REVERSE_RAW = String(process.env.REVERSE || '').trim().toLowerCase();
           const IS_REVERSE = ['on', 'true', '1'].includes(REVERSE_RAW);
-          // --- Reverse margin threshold (2-tier) ---
-          // margin = watch_max_favorable_pct - watch_max_adverse_pct
-          //   margin <= REVERSE_MARGIN_PCT  -> reverse the side (contested move)
-          //   margin >  REVERSE_MARGIN_PCT  -> DROP the idea entirely (clean one-sided move, do not push at all)
           const REVERSE_MARGIN_PCT = Math.max(0, Number(process.env.REVERSE_MARGIN_PCT || '0.6'));
-          // --- Max adverse guard: 'off' | 'on' (default 'off') ---
-          // on = drop a survivor from idea generation if, during the watch phase,
-          //      its maxAdversePct exceeded its maxFavorablePct.
+          // --- Max adverse guard ---
           const MAX_ADVERSE_GUARD_RAW = String(process.env.MAX_ADVERSE_GUARD || '').trim().toLowerCase();
           const IS_MAX_ADVERSE_GUARD = ['on', 'true', '1'].includes(MAX_ADVERSE_GUARD_RAW);
           // --- Cooldown ---
@@ -136,15 +132,13 @@ jobs:
             }
           }
           // ================================================================
-          //  EXCHANGE TIME SYNC (avoid CI runner clock drift)
+          //  EXCHANGE TIME SYNC — CHANGED: Binance Futures /fapi/v1/time
           // ================================================================
           let serverOffsetMs = 0;
           async function syncServerTime() {
             try {
-              const st = await fetchJSON(`${BYBIT_PUBLIC}/v5/market/time`);
-              const sec = Number(st?.result?.timeSecond);
-              const nano = Number(st?.result?.timeNano);
-              const serverMs = nano > 0 ? nano / 1e6 : (sec > 0 ? sec * 1000 : 0);
+              const st = await fetchJSON(`${BINANCE_PUBLIC}/fapi/v1/time`);
+              const serverMs = Number(st?.serverTime);
               if (serverMs > 0) {
                 serverOffsetMs = serverMs - Date.now();
                 log(`Exchange time offset: ${serverOffsetMs.toFixed(0)}ms`);
@@ -156,7 +150,7 @@ jobs:
           const exchNow = () => Date.now() + serverOffsetMs;
           const exchISO = () => new Date(exchNow()).toISOString();
           // ================================================================
-          //  GIST I/O
+          //  GIST I/O  — UNCHANGED
           // ================================================================
           async function readAnalysisGist() {
             try {
@@ -198,40 +192,42 @@ jobs:
             }
           }
           // ================================================================
-          //  BYBIT REST
+          //  BINANCE FUTURES REST — CHANGED: replaces getBybitTicker
           // ================================================================
-          async function getBybitTicker(symbol) {
-            const url = `${BYBIT_PUBLIC}/v5/market/tickers?category=linear&symbol=${symbol}`;
+          async function getBinanceTicker(symbol) {
+            const url = `${BINANCE_PUBLIC}/fapi/v1/ticker/24hr?symbol=${symbol}`;
             try {
-              const data = await fetchRetry(url, 2, 300);
-              const t = data?.result?.list?.[0];
-              if (!t) return null;
+              const t = await fetchRetry(url, 2, 300);
+              if (!t || !t.lastPrice) return null;
               return {
                 symbol: t.symbol,
                 lastPrice: +t.lastPrice,
-                bid: +t.bid1Price,
-                ask: +t.ask1Price,
-                turnover24h: +t.turnover24h,
-                fundingRate: +t.fundingRate,
-                openInterest: +t.openInterest
+                bid: +t.bidPrice,
+                ask: +t.askPrice,
+                turnover24h: +t.quoteVolume,
+                fundingRate: 0,
+                openInterest: 0
               };
             } catch { return null; }
           }
-          // REST snapshot used as the INDEPENDENT confirmation source during watch phase
+          // ================================================================
+          //  ALL TICKERS — CHANGED: Binance Futures /fapi/v1/ticker/24hr
+          // ================================================================
           async function getAllTickersFull() {
-            const url = `${BYBIT_PUBLIC}/v5/market/tickers?category=linear`;
+            const url = `${BINANCE_PUBLIC}/fapi/v1/ticker/24hr`;
             const data = await fetchRetry(url, 2, 300);
             const map = {};
-            for (const t of data?.result?.list || []) {
+            for (const t of Array.isArray(data) ? data : []) {
               const last = +t.lastPrice;
               if (last > 0) {
-                map[t.symbol] = { last, bid: +t.bid1Price || 0, ask: +t.ask1Price || 0 };
+                map[t.symbol] = { last, bid: +t.bidPrice || 0, ask: +t.askPrice || 0 };
               }
             }
             return map;
           }
           // ================================================================
           //  CORE: direction = compare current price vs last exit price
+          //  UNCHANGED
           // ================================================================
           function computeDirection(trades, currentPrice) {
             if (!trades || !trades.length) return {
@@ -249,7 +245,7 @@ jobs:
             return { direction: 'neutral', reason: 'too_close_to_last_exit', lastExit, moveBps };
           }
           // ================================================================
-          //  NORMALIZE TRADES FROM A WORKER
+          //  NORMALIZE TRADES — UNCHANGED
           // ================================================================
           function normalizeWorker1Trades(pnlData) {
             const bySymbol = {};
@@ -354,7 +350,8 @@ jobs:
           const tp_bps = TP_BPS_CFG;
           const arrow = d => d === 'long' ? '🔼 UP' : d === 'short' ? '🔽 DOWN' : d === 'n/a' ? '— N/A' : '⏸ FLAT';
           // ================================================================
-          //  WATCH PHASE ENGINE (WebSocket primary + REST dual-source confirm)
+          //  WATCH PHASE ENGINE
+          //  CHANGED: WebSocket uses Binance combined stream + Binance message format
           // ================================================================
           async function runWatchPhase(pool, tag) {
             const watch = pool.map(c => {
@@ -392,29 +389,36 @@ jobs:
               w.elimReason = reason;
               log(`  ❌ ${tag}${w.symbol} ${w.side.toUpperCase()} eliminated @ ${price} reason=${reason}`);
             };
-            // ---- WebSocket: real-time primary feed ----
+            // ---- CHANGED: Binance combined stream WebSocket ----
+            // Build URL: wss://fstream.binance.com/stream?streams=btcusdt@ticker/ethusdt@ticker
             let ws = null, wsAlive = false, pingTimer = null;
             try {
-              ws = new WebSocket(BYBIT_WS_URL);
+              const streams = watch.map(w => `${w.symbol.toLowerCase()}@ticker`).join('/');
+              const wsUrl = `${BINANCE_WS_BASE}/stream?streams=${streams}`;
+              ws = new WebSocket(wsUrl);
               ws.on('open', () => {
                 wsAlive = true;
-                ws.send(JSON.stringify({ op: 'subscribe', args: watch.map(w => `tickers.${w.symbol}`) }));
-                log(`  ${tag}WS connected, subscribed to ${watch.length} symbol(s)`);
+                log(`  ${tag}WS connected (Binance), subscribed to ${watch.length} symbol(s)`);
+                // Binance requires pong response to server ping frames
+                // ws library handles binary ping/pong automatically
+                // Send keepalive every 20s as application-level ping
                 pingTimer = setInterval(() => {
-                  try { ws.send(JSON.stringify({ op: 'ping' })); } catch {}
+                  try { ws.ping(); } catch {}
                 }, 20000);
               });
+              // ---- CHANGED: Binance combined stream message format ----
+              // { stream: "btcusdt@ticker", data: { s, c, b, a, ... } }
               ws.on('message', (raw) => {
                 let msg; try { msg = JSON.parse(raw.toString()); } catch { return; }
-                if (!msg.topic || !msg.topic.startsWith('tickers.')) return;
-                const sym = msg.topic.split('.')[1];
+                if (!msg.stream || !msg.data) return;
+                const d = msg.data;
+                const sym = d.s;   // symbol e.g. "BTCUSDT"
                 const w = byId.get(sym);
                 if (!w || w.eliminated) return;
-                const d = msg.data || {};
                 w.wsCache = w.wsCache || {};
-                if (d.bid1Price) w.wsCache.bid = +d.bid1Price;
-                if (d.ask1Price) w.wsCache.ask = +d.ask1Price;
-                if (d.lastPrice) w.wsCache.last = +d.lastPrice;
+                if (d.b) w.wsCache.bid = +d.b;   // best bid
+                if (d.a) w.wsCache.ask = +d.a;   // best ask
+                if (d.c) w.wsCache.last = +d.c;  // last price
                 w.wsCache.ts = Date.now();
                 const trigger = w.side === 'long'
                   ? (w.wsCache.bid || w.wsCache.last)
@@ -433,12 +437,13 @@ jobs:
                 }
                 w.wsBreachPending = w.wsStrikes >= DEBOUNCE_TICKS;
               });
+              ws.on('ping', () => { try { ws.pong(); } catch {} });
               ws.on('error', (e) => { wsAlive = false; log(`  ${tag}WS error:`, e?.message); });
               ws.on('close', () => { wsAlive = false; log(`  ${tag}WS closed`); });
             } catch (e) {
               log(`  ${tag}WS setup failed, REST-only fallback:`, e?.message);
             }
-            // ---- REST: independent confirmation + fallback poller ----
+            // ---- REST: independent confirmation + fallback poller — UNCHANGED ----
             let polls = 0;
             const endAt = Date.now() + WATCH_MIN * 60e3;
             while (true) {
@@ -493,7 +498,7 @@ jobs:
             return { watch, polls, wsConnected: wsAlive };
           }
           // ================================================================
-          //  ONE FULL PASS
+          //  ONE FULL PASS — UNCHANGED except getBinanceTicker call
           // ================================================================
           async function runPass(passMode, isFallback) {
             const tag = isFallback ? '[FALLBACK W1] ' : '';
@@ -528,12 +533,12 @@ jobs:
               res.status = 'no_common_symbols';
               return res;
             }
-            // ---- STEP 3: prices ----
+            // ---- STEP 3: prices — CHANGED: getBinanceTicker ----
             log('');
             log(`━━━ ${tag}STEP 3: Fetch current prices ━━━`);
             const tickers = {};
             for (const sym of commonSymbols) {
-              tickers[sym] = await getBybitTicker(sym);
+              tickers[sym] = await getBinanceTicker(sym);
               await sleep(100);
               if (tickers[sym]) log(`  ${sym}: $${tickers[sym].lastPrice}`);
               else log(`  ${sym}: ticker fetch failed`);
@@ -595,13 +600,13 @@ jobs:
             const pool = candidates.slice(0, WATCH_POOL);
             res.pool = pool;
             log(`Watch pool: ${pool.length} candidate(s)`);
-            // ---- STEP 6: watch phase (WS + REST dual-source, debounced) ----
+            // ---- STEP 6: watch phase ----
             log('');
             log(`━━━ ${tag}STEP 6: Watch phase (${WATCH_MIN} min, artificial SL ${ARTIFICIAL_SL_PCT}%, dual-source confirm) ━━━`);
             const { watch, polls, wsConnected } = await runWatchPhase(pool, tag);
             res.watch = watch;
             res.watchMeta = { polls, wsConnected };
-            // ---- STEP 7: survivors -> re-check open positions -> max-adverse guard -> top N ----
+            // ---- STEP 7: survivors ----
             log('');
             log(`━━━ ${tag}STEP 7: Select top N from survivors ━━━`);
             try {
@@ -623,7 +628,6 @@ jobs:
               })
               .sort((a, b) => b.score - a.score);
             res.survivors = survivors;
-            // ---- Max adverse guard: drop survivors where adverse > favorable ----
             if (IS_MAX_ADVERSE_GUARD) {
               const kept = [];
               for (const s of survivors) {
@@ -727,10 +731,7 @@ jobs:
           }
           const { commonSymbols, rows, perSymbolDebug, candidates, pool, watch, survivors, finalIdeas, watchMeta, adverseGuardDropped } = result;
           // ================================================================
-          //  REVERSE (2-tier):
-          //    margin = watch_max_favorable_pct - watch_max_adverse_pct
-          //    margin <= REVERSE_MARGIN_PCT  -> reverse the side (contested move)
-          //    margin >  REVERSE_MARGIN_PCT  -> DROP the idea entirely (clean one-sided move)
+          //  REVERSE (2-tier) — UNCHANGED
           // ================================================================
           const reverseSkippedSymbols = [];
           const pushIdeas = IS_REVERSE
