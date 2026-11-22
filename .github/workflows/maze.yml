@@ -1,28 +1,36 @@
-name: Ideas Pusher (MEXC Ultimate 7.7.7)
+name: Ideas Pusher (MAZE)
+
 on:
   repository_dispatch:
     types: [run_X]
   workflow_dispatch: {}
+
 permissions:
   contents: read
+
 concurrency:
   group: ideas-mexc-ultimate
   cancel-in-progress: true
+
 jobs:
   push:
     runs-on: ubuntu-latest
     timeout-minutes: 12
+
     env:
       # Required secrets
       WORKER_PUSH_URL: ${{ secrets.WORKER_PUSH_URL }}
       PUSH_TOKEN: ${{ secrets.PUSH_TOKEN }}
       WORKER_PUSH_URL_V2: ${{ secrets.WORKER_PUSH_URL_V2 }}
+
       # Required for trade reconciliation
       MEXC_API_KEY: ${{ secrets.MEXC_API_KEY }}
       MEXC_SECRET_KEY: ${{ secrets.MEXC_SECRET_KEY }}
+
       # Optional (safe defaults inside the script)
       GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
       GIST_ID: ${{ secrets.GIST_ID }}
+
       # Exchange + tuning knobs (via Repo/Org Variables)
       EXCHANGE: mexc
       MIN_QV_USD: ${{ vars.MIN_QV_USD }}
@@ -37,6 +45,7 @@ jobs:
       ACTIVE_UTC_END: ${{ vars.ACTIVE_UTC_END }}
       MEXC_BASE: ${{ vars.MEXC_BASE }}
       FORCE_SIZE_BPS: ${{ vars.FORCE_SIZE_BPS }}
+
       # New Confidence Model Knobs
       DIRECTION: ${{ vars.DIRECTION }}
       MR_SLOPE_MAX_ATR50: ${{ vars.MR_SLOPE_MAX_ATR50 }}
@@ -53,6 +62,7 @@ jobs:
       LONG_BOUNCE_SL_ATR: ${{ vars.LONG_BOUNCE_SL_ATR }}
       LONG_BOUNCE_TP_ATR: ${{ vars.LONG_BOUNCE_TP_ATR }}
       LONG_SIMILARITY_RHO: ${{ vars.LONG_SIMILARITY_RHO }}
+
       # New (MTF + Provenance + Align)
       MIN_TF_ALIGN: ${{ vars.MIN_TF_ALIGN }}
       TF_WEIGHTS: ${{ vars.TF_WEIGHTS }}
@@ -60,20 +70,24 @@ jobs:
       MODEL_VERSION: ${{ vars.MODEL_VERSION }}
       SCHEMA_VERSION: ${{ vars.SCHEMA_VERSION }}
       GIT_SHA: ${{ github.sha }}
+
     steps:
       - name: Setup Node 20
         uses: actions/setup-node@v4
         with:
           node-version: 20
+
       - name: Run pusher (always-push + clear logs)
         shell: bash
         run: |
           set -euo pipefail
+
           # Hard fail only on true misconfig (so setup problems aren't hidden)
           if [[ -z "${WORKER_PUSH_URL:-}" || -z "${PUSH_TOKEN:-}" ]]; then
             echo "[gha] Missing WORKER_PUSH_URL or PUSH_TOKEN"
             exit 1
           fi
+
           set +e
           node - <<'NODE'
           (async ()=>{
@@ -81,6 +95,7 @@ jobs:
           const crypto = require('crypto');
           const MODEL_VERSION=(process.env.MODEL_VERSION||"7.0.0");
           const UA = `gh-actions-ideas-hedge/${MODEL_VERSION} (+https://github.com/)`;
+
           // ---------------- Utils ----------------
           const clamp=(x,a,b)=>Math.max(a,Math.min(b,x));
           const tanh=(x)=>Math.tanh(x);
@@ -104,6 +119,7 @@ jobs:
           const randt=(df)=>{ if(df<=2) df=2.01; const z=randn(); let x2=0; for(let i=0;i<Math.floor(df);i++){ const z2=randn(); x2+=z2*z2; } const frac=df-Math.floor(df); if(frac>0){ const zf=randn(); x2+=frac*zf*zf; } const chi=x2||1e-6; return z / Math.sqrt(chi/df); };
           const kalman1D=(obs,{q=1e-5,r=1e-3,x0=null,p0=1e-2}={})=>{ if(!obs?.length) return []; let x=(x0==null?obs[0]:x0), p=p0; const out=[]; for(const z of obs){ p+=q; const K=p/(p+r); x=x+K*(z-x); p=(1-K)*p; out.push(x); } return out; };
           const pathEVHeavy=({entry,tp_bps,sl_bps,side,retSeries,mu,sigma,steps,N=192,cost_bps=10,t_df=5,boot_block=3})=>{ const up=(side==="long"), tpF=tp_bps/10000, slF=sl_bps/10000; let ev=0, wins=0; const rets=retSeries||[]; const boot1=()=>{ if(rets.length<8) return Array(steps).fill(0).map(()=> sigma*Math.sqrt(1/steps)*randn()); const out=[]; while(out.length<steps){ const start=Math.floor(Math.random()*(rets.length-boot_block)); for(let k=0;k<boot_block && out.length<steps;k++) out.push(rets[start+k]||0); } return out.slice(0,steps); }; for(let n=0;n<N;n++){ const mode=(n%2===0)?"t":"boot"; let S=entry, tp=up? entry*(1+tpF):entry*(1-tpF), sl=up? entry*(1-slF):entry*(1+slF); let pnl_bps=0,win=0; const rs=(mode==="t")? Array(steps).fill(0).map(()=> mu + sigma*randt(t_df)/Math.sqrt(steps)) : boot1(); for(let t=0;t<steps;t++){ S*=(1+rs[t]); if(up){ if(S>=tp){ pnl_bps=tp_bps-cost_bps; win=1; break;} if(S<=sl){ pnl_bps=-sl_bps-cost_bps; win=0; break;} } else { if(S<=tp){ pnl_bps=tp_bps-cost_bps; win=1; break;} if(S>=sl){ pnl_bps=-sl_bps-cost_bps; win=0; break;} } if(t===steps-1){ const ret=up? (S/entry-1):(entry/S-1); pnl_bps=Math.round(ret*10000)-cost_bps; win=pnl_bps>0?1:0; } } ev+=pnl_bps; wins+=win; } const p=wins/N, ev_mean=ev/N; return { p, ev_bps:Math.round(ev_mean) }; };
+
           // ---------- New Helpers ----------
           const uuidv4=()=>{ try{ return crypto.randomUUID(); }catch{ const b=crypto.randomBytes(16); b[6]=(b[6]&0x0f)|0x40; b[8]=(b[8]&0x3f)|0x80; const h=b.toString("hex"); return [h.slice(0,8),h.slice(8,12),h.slice(12,16),h.slice(16,20),h.slice(20)].join("-"); } };
           const mkClientOrderId = (prefix="mxu") => {
@@ -113,7 +129,9 @@ jobs:
           };
           const hashObj=(o)=>{ const norm=(x)=>{ if(x&&typeof x==="object"&&!Array.isArray(x)){ const ks=Object.keys(x).sort(); const y={}; for(const k of ks) y[k]=norm(x[k]); return y; } if(Array.isArray(x)) return x.map(norm); return x; }; const s=JSON.stringify(norm(o)); return crypto.createHash("sha256").update(s).digest("hex"); };
           const toCSVLine=(row,keys)=> keys.map(k=>{ let v=row?.[k]; if(v==null) return ""; if(typeof v==="object") v=JSON.stringify(v); const s=String(v); return s.includes(",")||s.includes("\n")||s.includes('"')? `"${s.replace(/"/g,'""')}"`: s; }).join(",");
+
           const slopeBps=(arr,len=21)=>{ if(!arr?.length||arr.length<Math.max(5,len)) return 0; const s=arr.slice(-len); const n=s.length; const last=s[n-1]||1; const mx=(n-1)/2; let num=0,den=0; for(let i=0;i<n;i++){ const x=i, y=((s[i]||last)-last)/last*10000; num+=(x-mx)*y; den+=(x-mx)*(x-mx); } return den>0? num/den : 0; };
+
           const computeMTFIndicators=(km,weights)=>{ const TFs=["1m","3m","5m","15m","30m","1h","2h","4h","12h","1d"]; const wNorm=(()=>{ let out={}; let sw=0; for(const tf of TFs){ const w=+((weights&&weights[tf])||0); if(w>0){ out[tf]=w; sw+=w; } } if(sw<=0){ out={"1m":0.08,"3m":0.08,"5m":0.12,"15m":0.15,"30m":0.12,"1h":0.12,"2h":0.10,"4h":0.08,"12h":0.07,"1d":0.08}; sw=1; } for(const k of Object.keys(out)) out[k]=out[k]/sw; return out; })();
             const perTF={}; const agg={ rsi:0, adx:0, atr_bps:0, roc1:0, roc3:0 }; let ww=0; const retSeries={};
             for(const tf of Object.keys(wNorm)){
@@ -135,6 +153,7 @@ jobs:
             const tfAlign=pairs>0? acc/pairs : 0;
             return { agg, tfAlign, perTF, weights:wNorm };
           };
+
           const getTradeFingerprint=(t)=>{ try{
             const sym=(t.symbol||"").toUpperCase();
             const side=(t.isBuyer===true||t.side==="BUY")?"B":"S";
@@ -146,7 +165,9 @@ jobs:
             const mk=(t.isMaker===true)?"M":(t.isMaker===false)?"T":"?";
             return [sym,side,oid,tid,q,p,cmA,mk].join(":");
           }catch{ return String(t?.id||t?.orderId||Math.random()); } };
+
           const DROPPABLE_STATUSES = new Set(["planned","placed","pending","queued","ready"]);
+
           async function cleanupPendingBeforePlanning(state, heartbeat) {
             let openAll = null;
             try { openAll = await fetchOpenOrders(); } catch (e) { log("openOrders err", e?.message || e); }
@@ -185,6 +206,7 @@ jobs:
             }
             return { dropped: dropCIDs.length, dropCIDs, scanned, droppable, orphans };
           }
+
           // ---------- Microstructure / Heavy Features helpers ----------
           const computeOBI=(depth, topN=12)=>{ if(!depth?.asks?.length || !depth?.bids?.length) return 0; const w=(i)=>Math.exp(-i*0.18); let bidNot=0, askNot=0; for(let i=0;i<Math.min(topN, depth.bids.length); i++){ const p=+depth.bids[i][0], q=+depth.bids[i][1]; if(p>0&&q>0) bidNot += p*q*w(i); } for(let i=0;i<Math.min(topN, depth.asks.length); i++){ const p=+depth.asks[i][0], q=+depth.asks[i][1]; if(p>0&&q>0) askNot += p*q*w(i); } return (bidNot+askNot>0) ? (bidNot-askNot)/(bidNot+askNot) : 0; };
           const vwapFillLevels=(levels,targetUSD)=>{ let remain=targetUSD,val=0,qty=0; for(const [ps,qs] of levels){ const p=+ps, q=+qs; if(!(p>0&&q>0)) continue; const can=p*q, take=Math.min(remain,can), tq=take/p; val+=p*tq; qty+=tq; remain-=take; if(remain<=1e-6) break; } return { px: qty>0? val/qty : null, filledUSD: (targetUSD-remain) }; };
@@ -198,13 +220,16 @@ jobs:
           const choleskySafe=(S)=>{ const L=cholesky(S); if(L) return L; const n=S.length; const Sc=S.map((r,i)=> r.map((v,j)=> v + (i===j?1e-6:0))); return cholesky(Sc); };
           const sampleMultiT=(muVec,Sigma,df=6,M=1000)=>{ const n=muVec.length; const L=choleskySafe(Sigma); if(!L) return []; const out=[]; for(let m=0;m<M;m++){ const z=Array(n).fill(0).map(()=>randn()); const y=Array(n).fill(0); for(let i=0;i<n;i++){ let s=0; for(let k=0;k<i;k++) s+=L[i][k]*z[k]; y[i]=s; } let chi=0; for(let i=0;i<df;i++){ const zc=randn(); chi+=zc*zc; } const scale=Math.sqrt(df/Math.max(1e-9,chi)); out.push(y.map((yi,i)=> (muVec[i]||0) + yi*scale)); } return out; };
           const portfolioVaR_ES_tCopula=(picks, df=6)=>{ if(!picks.length) return { VaR95_bps:0, ES95_bps:0 }; const n=picks.length, mu=Array(n).fill(0), sd=Array(n).fill(0); for(let i=0;i<n;i++){ const r5=picks[i].ret5||[]; const rMean=mean(r5), rStd=std(r5)||1e-4; const steps=Math.max(1, Math.round((picks[i].ttl_sec||600)/300)); mu[i]=rMean*steps*10000; sd[i]=rStd*Math.sqrt(steps)*10000; } const R=Array.from({length:n},()=>Array(n).fill(0)); for(let i=0;i<n;i++){ for(let j=i;j<n;j++) R[i][j]=corr(picks[i].ret5||[], picks[j].ret5||[]); R[i][i]=1; } const Sigma=Array.from({length:n},()=>Array(n).fill(0)); for(let i=0;i<n;i++) for(let j=0;j<n;j++) Sigma[i][j]=R[i][j]*sd[i]*sd[j]; const draws=sampleMultiT(mu,Sigma,df,1200); if(!draws.length) return { VaR95_bps:0, ES95_bps:0 }; const w0=picks.map(p=> p.size_bps||0); const ws=sum(w0)||1; const w=w0.map(x=> x/ws); const port=draws.map(d=> d.reduce((acc,di,ii)=> acc + w[ii]*di, 0)); port.sort((a,b)=>a-b); const idx=Math.floor(0.05*port.length); const VaR95=port[idx]||0; const ES=mean(port.slice(0,idx+1)); return { VaR95_bps:Math.round(VaR95), ES95_bps:Math.round(ES) }; };
+
           // ---------- HTTP + Concurrency ----------
           async function fetchWithTimeout(url,opts={},ms=12000){ const ac=new AbortController(); const t=setTimeout(()=>ac.abort(),ms); try{ return await fetch(url,{...opts,signal:ac.signal,headers:{"User-Agent":UA,...(opts?.headers||{})}});} finally{ clearTimeout(t);} }
           async function getJSON(url,ms=12000,tries=2){ for(let a=0;a<tries;a++){ try{ const r=await fetchWithTimeout(url,{},ms); if(r?.ok){ return await r.json(); } }catch{} await sleep(jitter(220)); } return null; }
           const cache={ k:new Map(), depth:new Map(), bt:new Map(), conv:new Map(), binance:new Map() };
           const TTL={ k: 60_000, depth: 8_000, bt: 5_000, conv: 60_000, binance: 30_000 };
+
           const getCached=(map,key,ttl)=>{ const e=map.get(key); return e && (Date.now()-e.ts<ttl)? e.v : null; };
           const setCached=(map,key,v)=>map.set(key,{ v, ts: Date.now() });
+
           // ---------- Config / ENV ----------
           const TARGET_EXCHANGE = "binance_futures";  // ← CHANGED for Binance
           const MARKET_TYPE     = "futures";
@@ -229,6 +254,7 @@ jobs:
           
           // Calibration versioning - increment to reset all coefficients
           const CALIB_VERSION = "v1.0";
+
           // Learning parameters
           const ADAPTIVE_LEARNING = true;
           const MIN_LEARNING_RATE = 0.002;
@@ -241,10 +267,13 @@ jobs:
           const CALIB_MIN_SAMPLES = 15;
           const CALIB_ERROR_WINDOW = 30;
           const CALIB_MIN_RESET_N = 40;
+
           // Anti-poison limits
           const MAX_SYMBOL_CONTRIBUTION = 0.3;
           const OUTLIER_ZSCORE = 3.5;
+
           const PUSHER_MODE=(process.env.PUSHER_MODE||"plan_only").toLowerCase();
+
           const MIN_QV_ENV = Number(process.env.MIN_QV_USD||"0") || 0;
           const TOP_N=Number(process.env.TOP_N||"3"), MAX_SPREAD_BPS=Number(process.env.MAX_SPREAD_BPS||"12");
           const EXP_LCB_MIN_BPS_BASE=Number(process.env.EXP_LCB_MIN_BPS||"12");
@@ -264,6 +293,7 @@ jobs:
           const nowH=new Date().getUTCHours();
           const todOK=(S_H==null||E_H==null)?true:(S_H<=E_H?(nowH>=S_H&&nowH<=E_H):(nowH>=S_H||nowH<=E_H));
           const STABLES=new Set(["USDT","USDC","USD","USDE","USDD","BUSD","FDUSD","TUSD","DRKUSD","DAI","USDP","PAX","USTC"]);
+
           const DIRECTION=(process.env.DIRECTION||"both").trim().toLowerCase();
           const MR_ADX_MAX_DEFAULT=20, MR_BREAKOUT_DC_N=Number(process.env.MR_BREAKOUT_DC_N||"120");
           const MR_BREAKOUT_RET15_ATR=Number(process.env.MR_BREAKOUT_RET15_ATR||"1.5"), MR_LOCKOUT_SEC=Number(process.env.MR_LOCKOUT_SEC||"1800");
@@ -275,16 +305,19 @@ jobs:
           const LONG_EDGE_MULT_MIN=Number(process.env.LONG_EDGE_MULT_MIN||"4");
           const LONG_BOUNCE_SL_ATR=Number(process.env.LONG_BOUNCE_SL_ATR||"0.50"), LONG_BOUNCE_TP_ATR=Number(process.env.LONG_BOUNCE_TP_ATR||"0.90");
           const LONG_SIMILARITY_RHO=Number(process.env.LONG_SIMILARITY_RHO||"0.84");
+
           // Golden 4 metrics ideal thresholds (for confidence scoring, NOT gates)
           const IDEAL_VOL_1H_PCT = 2.0;       // |1h price change| >= 2%
           const IDEAL_FUNDING_RATE = 0.0004;  // |funding| >= 0.04%
           const IDEAL_OI_DELTA_PCT = 10.0;    // |ΔOI 1-2h| >= 10%
           const IDEAL_VOLUME_1H_USD = 60_000_000; // 1h volume >= $60M
+
           // Confidence weights for hedge trading (sum = 1.0)
           const WEIGHT_VOL_1H = 0.40;      // 1h volatility - HIGHEST priority
           const WEIGHT_FUNDING = 0.25;     // Funding rate
           const WEIGHT_OI_DELTA = 0.20;    // Open Interest change
           const WEIGHT_VOLUME = 0.15;      // 1h volume
+
           const CONFIG_HASH=(()=>{ try{
             const knobs={
               DIRECTION, MR_BREAKOUT_DC_N, MR_BREAKOUT_RET15_ATR, MR_LOCKOUT_SEC,
@@ -297,13 +330,14 @@ jobs:
             };
             return hashObj(knobs);
           }catch{ return "cfg-unknown"; } })();
+
           // ---------- Worker endpoints ----------
           const PUSH_URL=process.env.WORKER_PUSH_URL||"", PUSH_TOKEN=process.env.PUSH_TOKEN||"";
           const PUSH_URL_V2 = process.env.WORKER_PUSH_URL_V2 || "";
           const HEALTH_URL=(()=>{ try{ const u=new URL(PUSH_URL); return `${u.origin}${u.pathname.replace(/\/signals\/push(\?.*)?$/,"/health")}`;}catch{return PUSH_URL.replace(/\/signals\/push(\?.*)?$/,"/health");}})();
-          const WINRATE_URL=(()=>{ try{ const u=new URL(PUSH_URL); return `${u.origin}${u.pathname.replace(/\/signals\/push(\?.*)?$/,"/winrate")}`;}catch{return PUSH_URL.replace(/\/signals\/push(\?.*)?$/,"/winrate");}})();
           log("health GET", HEALTH_URL);
           try{ const r=await fetchWithTimeout(HEALTH_URL,{ headers:{ "Authorization":`Bearer ${PUSH_TOKEN}`,"User-Agent":UA }},5000); let t=""; try{ t=await r.text(); }catch{} log("health status", r?.status||"ERR", (t||"").slice(0,160)); }catch(e){ log("health error", e?.message||e); }
+
           // ========== FAKE FLUSH START ==========
           log("🚀 FAKE FLUSH: Sending 2 fake ideas immediately...");
           try {
@@ -375,6 +409,7 @@ jobs:
                 reasons_text: ["FAKE_FLUSH"]
               }
             ];
+
             const fakePayload = {
               ts: new Date().toISOString(),
               mode: "normal",
@@ -392,6 +427,7 @@ jobs:
               top_n: 2,
               ideas: fakeIdeas
             };
+
             log("📤 Pushing FAKE ideas to", PUSH_URL);
             const fakeResp = await fetchWithTimeout(PUSH_URL, {
               method: "POST",
@@ -401,6 +437,7 @@ jobs:
               },
               body: JSON.stringify(fakePayload)
             }, 10000);
+
             let fakeText = "";
             try { fakeText = await fakeResp.text(); } catch {}
             log("✅ FAKE FLUSH push status:", fakeResp?.status || "ERR", (fakeText || "").slice(0, 200));
@@ -410,6 +447,7 @@ jobs:
           }
           log("🏁 FAKE FLUSH complete. Starting REAL processing...");
           // ========== FAKE FLUSH END ==========
+
           // ---------- MEXC Adapter (REMOVED - NOT NEEDED FOR BINANCE) ----------
           // Kept minimal for compatibility if needed later
           async function pickMexcBase(){ return "https://api.mexc.com"; }
@@ -428,6 +466,7 @@ jobs:
           async function getKMultiTF() { return {}; }          // Stub
           const tfInd=()=>null;                               // Stub
           async function getConversionRate() { return 1; }    // Stub
+
           // ---------- Binance Futures API Functions (Public, No Auth) ----------
           
           // FIXED: Fetch all USDT perpetual symbols from Binance Futures
@@ -474,6 +513,7 @@ jobs:
               return [];
             }
           }
+
           // Fetch 1h kline for price change % and volume
           async function fetchBinance1hKline(symbol) {
             const cacheKey = `binance_1h_${symbol}`;
@@ -512,6 +552,7 @@ jobs:
               return null;
             }
           }
+
           // Fetch current funding rate
           async function fetchBinanceFundingRate(symbol) {
             const cacheKey = `binance_funding_${symbol}`;
@@ -538,6 +579,7 @@ jobs:
               return null;
             }
           }
+
           // Fetch current Open Interest
           async function fetchBinanceOI(symbol) {
             const cacheKey = `binance_oi_${symbol}`;
@@ -561,6 +603,7 @@ jobs:
               return null;
             }
           }
+
           // Fetch OI history for ΔOI calculation
           async function fetchBinanceOIHist(symbol) {
             const cacheKey = `binance_oi_hist_${symbol}`;
@@ -598,6 +641,7 @@ jobs:
               return null;
             }
           }
+
           // Fetch spot price for basis calculation
           async function fetchBinanceSpotPrice(symbol) {
             const cacheKey = `binance_spot_${symbol}`;
@@ -621,6 +665,7 @@ jobs:
               return null;
             }
           }
+
           // NEW: Fetch Binance Futures orderbook
           async function fetchBinanceFuturesDepth(symbol) {
             const cacheKey = `binance_depth_${symbol}`;
@@ -638,6 +683,7 @@ jobs:
               return null;
             }
           }
+
           // NEW: Fetch Binance Futures ticker (bid/ask)
           async function fetchBinanceFuturesTicker(symbol) {
             const cacheKey = `binance_ticker_${symbol}`;
@@ -664,6 +710,7 @@ jobs:
               return null;
             }
           }
+
           // Calculate basis (futures premium over spot)
           function calculateBasis(futuresPrice, spotPrice) {
             if (!futuresPrice || !spotPrice || spotPrice <= 0) return { basis: 0, basis_bps: 0 };
@@ -673,6 +720,7 @@ jobs:
               basis_bps: Math.round(basis * 10000)
             };
           }
+
           // Fetch all 4 golden metrics for a symbol
           async function fetchGoldenMetrics(symbol) {
             try {
@@ -708,6 +756,7 @@ jobs:
               return null;
             }
           }
+
           // Calculate hedge confidence score based on 4 golden metrics
           function calculateHedgeConfidence(metrics) {
             if (!metrics) return 0;
@@ -733,6 +782,7 @@ jobs:
               return { ok:true, path };
             }catch(e){ log("secondary store stub error", e?.message||e); return { ok:false, error:String(e) }; }
           }
+
           // ---------- Heartbeat & Zombie detection ----------
           // CHANGED: Disabled for Binance version (no signed API needed for reads)
           async function heartbeatCheck(state){
@@ -740,24 +790,7 @@ jobs:
             // Binance version doesn't check open orders (would require API keys)
             return res;
           }
-          async function checkHedgeWinrateGate(){
-            try{
-              const data = await getJSON(WINRATE_URL, 10000, 2);
-              const rate = data?.hedge?.last5?.rate;
-              const total = data?.hedge?.last5?.total ?? 0;
-              if (rate == null || !isFinite(rate)) {
-                return { ok:false, rate:null, total, reason:"winrate_fetch_failed" };
-              }
-              if (total < 5) {
-                // Insufficient sample size → permissive pass (change to ok:false to block instead)
-                return { ok:true, rate, total, reason:"insufficient_data_permissive_pass" };
-              }
-              if (rate >= 60) return { ok:true, rate, total, reason:"pass" };
-              return { ok:false, rate, total, reason:"below_threshold" };
-            }catch(e){
-              return { ok:false, rate:null, total:0, reason:"exception:"+(e?.message||e) };
-            }
-          }
+
           // ---------- State (Gist) + Calibration + Audit ----------
           // ⚠️ THIS SECTION IS 100% UNCHANGED FROM ORIGINAL
           async function loadState(){
@@ -781,6 +814,7 @@ jobs:
               const g=await r.json();
               const c=g.files?.["state.json"]?.content;
               const s=c?JSON.parse(c):init;
+
               if(!s.cooldown)s.cooldown={};
               if(!s.cooldown_side)s.cooldown_side={};
               if(!Array.isArray(s.pending))s.pending=[];
@@ -795,24 +829,29 @@ jobs:
               if (!Array.isArray(s.learned_trade_keys)) s.learned_trade_keys = [];
               if (!s.calib_symbol_counts) s.calib_symbol_counts = {};
               if (s.run_counter == null) s.run_counter = 0;
+
               if (s.calib_last_version !== CALIB_VERSION) {
                 log(`🔄 Calibration version change: ${s.calib_last_version} → ${CALIB_VERSION}`);
                 s.calibCoeffs = {};
                 s.calib_last_version = CALIB_VERSION;
               }
+
               return { state:s, persist:{ id, token, etag } };
             }catch(e){ log("loadState warn", e?.message||e); return { state:init, persist:null }; }
           }
           
           function mergeStates(remote, local) {
             const merged = { ...remote };
+
             merged.run_counter = Math.max(local.run_counter || 0, remote.run_counter || 0);
+
             const remoteKeys = Array.isArray(remote.learned_trade_keys) ? remote.learned_trade_keys : [];
             const localKeys = Array.isArray(local.learned_trade_keys) ? local.learned_trade_keys : [];
             
             const localSet = new Set(localKeys);
             const uniqueRemote = remoteKeys.filter(k => !localSet.has(k));
             merged.learned_trade_keys = [...uniqueRemote, ...localKeys].slice(-2000);
+
             const rCounts = remote.calib_symbol_counts || {};
             const lCounts = local.calib_symbol_counts || {};
             const allCountKeys = new Set([...Object.keys(rCounts), ...Object.keys(lCounts)]);
@@ -821,8 +860,10 @@ jobs:
               mergedCounts[k] = (rCounts[k] || 0) + (lCounts[k] || 0);
             }
             merged.calib_symbol_counts = mergedCounts;
+
             const dropSet = new Set((local.__drop_pending_cids || []).map(x => String(x).trim()).filter(Boolean));
             const id = (p) => String(p?.client_order_id || p?.clientOrderId || p?.idea_id || "").trim();
+
             const remotePending = (remote.pending || []).filter(p => !dropSet.has(id(p)));
             const remoteIds = new Set(remotePending.map(id));
             const newLocalPending = (local.pending || []).filter(p => {
@@ -830,14 +871,17 @@ jobs:
               return k && !remoteIds.has(k);
             });
             merged.pending = [...remotePending, ...newLocalPending];
+
             merged.equity = Array.isArray(remote.equity) ? remote.equity : [];
             merged.sym_stats_real = remote.sym_stats_real || {};
             merged.sym_stats = remote.sym_stats || {};
             merged.lastReconcileTs = remote.lastReconcileTs || 0;
             if ('fees' in remote) merged.fees = remote.fees;
+
             merged.cooldown = local.cooldown || {};
             merged.cooldown_side = local.cooldown_side || {};
             merged.mr_lockout = local.mr_lockout || {};
+
             merged.calibCoeffs = {};
             const allKeys = new Set([
               ...Object.keys(remote.calibCoeffs || {}),
@@ -877,16 +921,22 @@ jobs:
             });
             
             merged.version_ts = Date.now();
+
             log("[gha] mergeStates: remote_pending_after_drops", remotePending.length,
                         "appended_new_local", newLocalPending.length,
                         "merged_pending", merged.pending.length);
+
             return merged;
           }
+
           async function saveState(persist, state, auditOut, retries=2, blindFallback=true) {
             if (!persist) { log("WARN: No persist—skipping Gist save."); return; }
+
             const gistUrl = `https://api.github.com/gists/${persist.id}`;
             const mkFiles = (s) => ({ "state.json": { content: JSON.stringify(s) } });
+
             const wipeToEmpty = state && Object.keys(state).length === 1 && state.run_counter === 0;
+
             async function patch(files, etag) {
               const headers = {
                 Authorization: `Bearer ${persist.token}`,
@@ -901,8 +951,10 @@ jobs:
                 body: JSON.stringify({ files })
               }, 15000);
             }
+
             let toSave = state;
             let etag = persist.etag || null;
+
             for (let attempt = 0; attempt <= retries; attempt++) {
               log("DEBUG: saveState attempt", attempt, "etag?", !!etag, "pending=", (toSave.pending||[]).length);
               const r = await patch(mkFiles(toSave), etag);
@@ -912,14 +964,17 @@ jobs:
                 log("SUCCESS: Gist updated! Status=", r.status, "pending now=", (toSave.pending||[]).length);
                 return;
               }
+
               const body = (await r.text().catch(()=> ""))?.slice(0, 300) || "";
               log("WARN: saveState failed status=", r.status, "body=", body);
+
               if (r.status === 429) {
                 const ra = Number(r.headers.get("retry-after") || 2);
                 log("WARN: Rate limited. Backing off", ra, "s");
                 await sleep(ra * 1000);
                 continue;
               }
+
               if (r.status === 412) {
                 if (wipeToEmpty) {
                   log("DEBUG: 412 during wipe - skipping merge");
@@ -945,8 +1000,10 @@ jobs:
                 await sleep(250 + Math.floor(Math.random()*250));
                 continue;
               }
+
               break;
             }
+
             if (blindFallback) {
               log("WARN: Falling back to blind PATCH (no If-Match).");
               
@@ -959,6 +1016,7 @@ jobs:
                         "User-Agent": UA
                       }
                     }, 12000);
+
                     if (r2.ok) {
                       const remoteGist = await r2.json();
                       const remoteContent = remoteGist.files?.["state.json"]?.content;
@@ -1019,6 +1077,7 @@ jobs:
             
             log(`🧹 Cleaned cooldowns: ${Object.keys(state.cooldown || {}).length} base, ${Object.keys(state.cooldown_side || {}).length} side, ${Object.keys(state.mr_lockout || {}).length} mr_lockout`);
           }
+
           function cleanExpiredClosedTrades(state) {
             const MAX_CLOSED_TRADES = 10;
             
@@ -1045,6 +1104,7 @@ jobs:
             const removed = before - state.closed.length;
             log(`🗑️  Kept ${MAX_CLOSED_TRADES} most recent closed trades, removed ${removed} old ones`);
           }
+
           const getCoeffs = (state, side, regime) => {
             const key = `${side}_${regime}`;
             if (!state.calibCoeffs) state.calibCoeffs = {};
@@ -1078,6 +1138,7 @@ jobs:
             
             return existing;
           };
+
           function learnFromGistRealFills(state){
             if (!Array.isArray(state.learned_trade_keys)) state.learned_trade_keys = [];
             const learnedSet = new Set(state.learned_trade_keys);
@@ -1096,6 +1157,7 @@ jobs:
               log("📚 No new fills to learn from this cycle.");
               return;
             }
+
             log(`📚 Learning from ${learnable.length} real fills...`);
             
             const pRawValues = learnable.map(c => c.p_raw).filter(p => p != null);
@@ -1111,11 +1173,13 @@ jobs:
                 stats.skipped_invalid++;
                 continue;
               }
+
               if (useOutlierFilter && Math.abs((c.p_raw - pMean) / pStd) > OUTLIER_ZSCORE) {
                 log(`⚠️  Outlier p_raw=${c.p_raw.toFixed(4)} z=${((c.p_raw - pMean) / pStd).toFixed(2)}`);
                 stats.skipped_outlier++;
                 continue;
               }
+
               const cid = c.client_order_id || c.trade_details?.client_order_id || "";
               const sym = c.symbolFull || c.symbol || "UNK";
               const side = c.side || "?";
@@ -1132,6 +1196,7 @@ jobs:
                 stats.skipped_dup++;
                 continue;
               }
+
               const symCountKey = `${side}_${reg}_${sym}`;
               const currentTotal = state.calibCoeffs?.[`${side}_${reg}`]?.n || 0;
               const currentSymCount = state.calib_symbol_counts[symCountKey] || 0;
@@ -1144,6 +1209,7 @@ jobs:
                 stats.skipped_poison++;
                 continue;
               }
+
               const tp_hit = exit === "tp" || c.realized?.tp_hit === true;
               const sl_hit = exit === "sl" || c.realized?.sl_hit === true;
               
@@ -1226,6 +1292,7 @@ jobs:
                 Math.abs(coeff.a) < COEFF_BOUND_A * 0.8 &&
                 Math.abs(coeff.b) < COEFF_BOUND_B * 0.8 &&
                 (brier_cal == null || brier_cal < 0.23);
+
               report[key] = {
                 n: coeff.n,
                 n_tp: coeff.n_tp || 0,
@@ -1254,6 +1321,7 @@ jobs:
           
           function updateCalibration(state, side, regime, pRaw, outcome) {
             if (pRaw == null || !isFinite(pRaw) || pRaw <= 0 || pRaw >= 1) return;
+
             const coeff = getCoeffs(state, side, regime);
             
             if (!coeff) {
@@ -1272,28 +1340,36 @@ jobs:
             
             const before_a = coeff.a;
             const before_b = coeff.b;
+
             const warmup_n = 20;
             const warmup_factor = Math.min(1, (coeff.n + 1) / warmup_n);
             const base_lr = MIN_LEARNING_RATE + (MAX_LEARNING_RATE - MIN_LEARNING_RATE) / Math.sqrt(1 + coeff.n / 10);
             const lr = base_lr * warmup_factor;
+
             const eps = 1e-7;
             const pSafe = Math.max(eps, Math.min(1 - eps, pRaw));
             const x = Math.log(pSafe / (1 - pSafe));
             const x_clamped = Math.max(-6, Math.min(6, x));
+
             const z = coeff.a + coeff.b * x_clamped;
             const z_clamped = Math.max(-10, Math.min(10, z));
             const pHat = 1 / (1 + Math.exp(-z_clamped));
+
             const error = outcome - pHat;
             const grad_a = -error;
             const grad_b = -error * x_clamped;
+
             const beta1 = MOMENTUM_RATE;
             coeff.momentum_a = beta1 * coeff.momentum_a - lr * grad_a;
             coeff.momentum_b = beta1 * coeff.momentum_b - lr * grad_b;
+
             const lambda = LEARNING_DECAY;
             const a_next = (1 - lambda * lr) * coeff.a + coeff.momentum_a;
             const b_next = (1 - lambda * lr) * coeff.b + coeff.momentum_b;
+
             const hit_a = (a_next < -COEFF_BOUND_A || a_next > COEFF_BOUND_A);
             const hit_b = (b_next < -COEFF_BOUND_B || b_next > COEFF_BOUND_B);
+
             if (b_next < 0.05) {
               log(`⚠️  Negative slope [${side}_${regime}]: b=${b_next.toFixed(3)} → reset to 1.0`);
               coeff.b = 1.0;
@@ -1306,15 +1382,18 @@ jobs:
               if (hit_a) coeff.momentum_a *= 0.5;
               if (hit_b) coeff.momentum_b *= 0.5;
             }
+
             if (!coeff.recent_errors) coeff.recent_errors = [];
             coeff.recent_errors.push(Math.abs(error));
             if (coeff.recent_errors.length > CALIB_ERROR_WINDOW) {
               coeff.recent_errors.shift();
             }
+
             const alpha = 0.1;
             const weights = coeff.recent_errors.map((_, i) => Math.exp(alpha * i));
             const weight_sum = weights.reduce((a, b) => a + b, 0) || 1;
             const weighted_error = coeff.recent_errors.reduce((acc, e, i) => acc + e * weights[i], 0) / weight_sum;
+
             const should_reset = (
               weighted_error > CALIBRATION_RESET_THRESHOLD &&
               coeff.n > CALIB_MIN_RESET_N &&
@@ -1330,28 +1409,34 @@ jobs:
               coeff.recent_errors = [];
               coeff.last_reset_n = coeff.n;
             }
+
             coeff.n++;
             if (outcome === 1) coeff.n_tp = (coeff.n_tp || 0) + 1;
             else coeff.n_sl = (coeff.n_sl || 0) + 1;
             coeff.last_updated = Date.now();
+
             const mag = Math.sqrt(grad_a * grad_a + grad_b * grad_b);
             log(`📚 [${side}_${regime}] n=${coeff.n} (${coeff.n_tp}tp/${coeff.n_sl}sl) lr=${lr.toFixed(5)} |∇|=${mag.toFixed(4)}`);
             log(`   p_raw=${pRaw.toFixed(4)} → p̂=${pHat.toFixed(4)} vs y=${outcome} (err=${error.toFixed(4)})`);
             log(`   a: ${before_a.toFixed(4)}→${coeff.a.toFixed(4)} | b: ${before_b.toFixed(4)}→${coeff.b.toFixed(4)}${(hit_a || hit_b) ? ' [CLIP]' : ''}`);
             log(`   Quality: weighted_err=${weighted_error.toFixed(3)} window=${coeff.recent_errors.length}`);
+
             state.calibCoeffs[`${side}_${regime}`] = coeff;
           }
+
           const calibrateP=(state, side, regime, pRaw)=>{
             const coeff = getCoeffs(state, side, regime);
             if (!coeff || pRaw == null || !isFinite(pRaw)) return 0.5;
             const x = Math.max(-5, Math.min(5, logit(pRaw)));
             return sigmoid(coeff.a + coeff.b * x);
           };
+
           const calibratorInfo=(state,side,regime)=>{ 
             const coeff=getCoeffs(state,side,regime); 
             if (!coeff) return { type:"logistic", n:0, a:0, b:1 };
             return { type:"logistic", n:coeff.n, a:coeff.a, b:coeff.b };
           };
+
           function getSymbolAdj(state, base) {
             const real = state.sym_stats_real?.[base];
             const s = real || state.sym_stats?.[base];
@@ -1363,6 +1448,7 @@ jobs:
             if (avgPnL < 0) m *= 0.8;
             return clamp(m, 0.5, 1.2);
           }
+
           const TRADE_CSV_KEYS=["ts_close_iso","idea_id","client_order_id","symbol","side","pnl_bps","entry_ts_ms","exit_ts_ms","entry_price","exit_price","qty","commission_bps","commission_quote_usdt","commission_asset_entry","commission_asset_exit","maker_taker_entry","maker_taker_exit","slip_realized_bps","reconciliation","fingerprint_entry","fingerprint_exit","calib_key","p_raw","p_pred","regime","source"];
           function buildAuditOutputs(state){
             const lastNClosed=(state.closed||[]).slice(-5000);
@@ -1406,6 +1492,7 @@ jobs:
             const tradesCsv=[header,...rows].join("\n");
             return { closedAudit, disagreements, tradesCsv };
           }
+
           // CHANGED: Stub for candle sim (not needed for Binance-only)
           async function candleSimForIdea(p){
             return { status:"sim_disabled", closed:false };
@@ -1414,10 +1501,13 @@ jobs:
           let reason="ok", selectionTier="confidence";
           try{
             const { state, persist } = await loadState();
+
             // Increment run counter and check for wipe
             state.run_counter = (state.run_counter || 0) + 1;
             log(`🔄 Run ${state.run_counter}/6`);
+
             const SHOULD_WIPE = (state.run_counter >= 6);
+
             if (SHOULD_WIPE) {
               log("🗑️  RUN 6: WIPE GIST AND RESTART FRESH");
               await saveState(persist, { run_counter: 0 }, {}, 2, true);
@@ -1441,12 +1531,16 @@ jobs:
               
               log("♻️  State reset to fresh. Continuing with idea generation...");
             }
+
             // 📚 Learn from ALL closed trades FIRST
             learnFromGistRealFills(state);
+
             // 🧹 Clean expired cooldowns
             cleanExpiredCooldowns(state);
+
             // 🗑️  Keep only last 10 closed trades AFTER learning
             cleanExpiredClosedTrades(state);
+
             // Preserve cleaned state
             const preserved = {
               v: state.v || "binance-hedge-7.0",
@@ -1470,58 +1564,14 @@ jobs:
               calibration_holdout: [],
               lastReconcileTs: 0
             };
+
             Object.assign(state, preserved);
             log(`♻️  Fresh cycle: ${Object.keys(state.cooldown).length} cooldowns, ${(state.closed||[]).length} closed trades, ${Object.keys(state.calibCoeffs || {}).length} calib models`);
             
             const calibHealth = validateCalibration(state);
             
             if(!todOK) reason="tod_gate";
-            
-            // ===== HEDGE WIN-RATE GATE =====
-            log("🛡️  Checking hedge win-rate gate:", WINRATE_URL);
-            const gate = await checkHedgeWinrateGate();
-            log(`🛡️  Gate result: ok=${gate.ok} rate=${gate.rate} total=${gate.total} reason=${gate.reason}`);
-            
-            if (!gate.ok) {
-              reason = "hedge_wr_gate_failed";
-              state.hedge_gate = {
-                status: "hedge_wr_gate_failed",
-                hedge_last5_rate: gate.rate,
-                hedge_last5_total: gate.total,
-                gate_reason: gate.reason,
-                ts_ms: Date.now()
-              };
-              try { await saveState(persist, state, {}, 2, true); } catch(e){ log("gate saveState warn", e?.message||e); }
-            
-              const gatePayload = {
-                ts: new Date().toISOString(),
-                mode: "normal",
-                source: "external_pusher",
-                meta: {
-                  origin: "github_actions",
-                  reason: "hedge_wr_gate_failed",
-                  hedge_last5_rate: gate.rate,
-                  hedge_last5_total: gate.total,
-                  exchange: "binance_futures"
-                },
-                top_n: 0,
-                ideas: []
-              };
-              log(`🛑 Hedge WR gate failed (rate=${gate.rate}, total=${gate.total}) — pushing 0 ideas, exiting clean.`);
-              try {
-                const rg = await fetchWithTimeout(PUSH_URL, {
-                  method: "POST",
-                  headers: { "Content-Type": "application/json", "Authorization": "Bearer " + PUSH_TOKEN },
-                  body: JSON.stringify(gatePayload)
-                }, 15000);
-                let tg=""; try{ tg = await rg.text(); }catch{}
-                log("gate push status", rg?.status || "ERR", (tg||"").slice(0,200));
-              } catch(e){ log("gate push failed", e?.message||e); }
-            
-              return; // clean exit — code 0, outer shell fallback does NOT trigger
-            }
-            // ===== END HEDGE WIN-RATE GATE =====
-            
+
             // ========== DYNAMIC UNIVERSE FROM BINANCE FUTURES (NO VALIDATION NEEDED) ==========
             log("📡 Fetching Binance Futures universe...");
             const binanceSymbols = await fetchBinanceFuturesSymbols();
@@ -1533,10 +1583,12 @@ jobs:
             }
             
             log(`✅ Binance Futures universe: ${binanceSymbols.length} USDT perpetuals`);
+
             // DD/throttle
             const equityStats=(eq)=>{ const day=Date.now()-24*3600*1000; let pnl24=0,cum=0,peak=0,dd=0; for(const e of eq||[]){ if(e.ts_ms>=day) pnl24+=e.pnl_bps; cum+=e.pnl_bps; if(cum>peak) peak=cum; dd=Math.min(dd,cum-peak); } return { pnl24_bps:Math.round(pnl24), peak_dd_bps:Math.round(dd) }; };
             const { pnl24_bps, peak_dd_bps } = equityStats(state.equity);
             const throttle=(pnl24_bps<=DD_24H_LIMIT_BPS) || (peak_dd_bps<=DD_PEAK_LIMIT_BPS);
+
             // ========== FETCH GOLDEN METRICS FOR ALL BINANCE SYMBOLS ==========
             log("📊 Fetching golden metrics for all symbols...");
             
@@ -1583,6 +1635,7 @@ jobs:
             }
             
             log(`📈 Fetched metrics for ${allMetrics.length}/${binanceSymbols.length} symbols`);
+
             // ========== RANK BY HEDGE CONFIDENCE ==========
             // Sort by hedge confidence (highest first)
             allMetrics.sort((a, b) => b.hedge_confidence - a.hedge_confidence);
@@ -1593,6 +1646,7 @@ jobs:
               const m = allMetrics[i];
               log(`   ${i+1}. ${m.symbol} conf=${m.hedge_confidence} vol1h=${m.vol_1h_pct.toFixed(2)}% fund=${(m.funding_rate*100).toFixed(4)}% oi_delta=${m.oi_delta_pct.toFixed(1)}% vol=$${Math.round(m.volume_1h_usd/1e6)}M`);
             }
+
             // ========== SELECT TOP CANDIDATES FOR DETAILED ANALYSIS ==========
             const MAX_DETAILED = 30;
             const topCandidates = allMetrics.slice(0, MAX_DETAILED);
@@ -1813,6 +1867,7 @@ jobs:
             }
             
             log(`🔍 Refined ${refined.length} candidates with execution quality analysis`);
+
             // ========== FINAL SELECTION ==========
             refined.sort((a, b) => b.confidence - a.confidence);
             
@@ -1842,6 +1897,7 @@ jobs:
             }
             
             log(`✅ Selected ${selected.length} ideas for pushing`);
+
             // ========== GENERATE FLIPPED IDEAS ==========
             const flipped = selected.map(orig => ({
               ...orig,
@@ -1851,11 +1907,13 @@ jobs:
             }));
             
             const selectedWithFlipped = [...selected, ...flipped];
+
             // Risk weights via softmax of EV
             const wEv = softmax(selectedWithFlipped.map(x => x.exp_lcb_bps), 20);
             // Build full v2 ideas
             let picksV2 = selectedWithFlipped.map((x, i) => {
               const mid = x.mark_price;
+
               // Compute abs exits
               let entry_limit = null, tp_abs = null, sl_abs = null;
               if (mid != null) {
@@ -1870,46 +1928,57 @@ jobs:
                   sl_abs = entry_limit * (1 + slF);
                 }
               }
+
               const idea_id = uuidv4();
               const client_order_id = mkClientOrderId("bnh");  // ← CHANGED prefix for Binance Hedge
+
               const ttl = clamp(Math.round((x.hold_sec || 3600) + i * 12), TTL_MIN, TTL_MAX);
               const size_bps = (Number(process.env.FORCE_SIZE_BPS || "0") > 0)
                 ? Math.round(Number(process.env.FORCE_SIZE_BPS))
                 : (x.sl_bps > 0 ? Math.min(220, Math.round((wEv[i] * TARGET_PORT_RISK_BPS / x.sl_bps) * 100)) : 0);
+
               return {
                 idea_id, client_order_id,
+
                 symbol: x.base,
                 symbol_full: x.symbol,
                 symbolFull: x.symbol,
                 quote: x.quote,
                 side: x.side,
                 rank: i + 1,
+
                 // v2/futures intent
                 target_exchange: TARGET_EXCHANGE,  // "binance_futures"
                 market_type: MARKET_TYPE,
                 margin_mode: MARGIN_MODE,
                 leverage: LEVERAGE,
+
                 // code2 entry intent
                 entry_policy: "maker_join",
                 exec: { exec: "post_only" },
+
                 // entry + exits
                 entry_mid: mid,
                 entry_limit,
                 tp_abs,
                 sl_abs,
+
                 tp_bps: x.tp_bps,
                 sl_bps: x.sl_bps,
                 rrr: x.rrr,
                 exp_lcb_bps: x.exp_lcb_bps,
                 ev_bps: x.exp_bps,
                 cost_bps: x.cost_bps,
+
                 p_win: x.p_lcb,
                 p_lcb: x.p_lcb,
                 p_raw: x.p_raw,
                 calib_key: `side:${x.side}|regime:${x.regime}`,
                 regime: x.regime,
+
                 ttl_sec: ttl,
                 size_bps,
+
                 predicted: {
                   ts_ms: Date.now(),
                   p_cal: x.p_lcb,
@@ -1925,9 +1994,11 @@ jobs:
                   basis_bps: x.basis_bps,
                   hedge_confidence: x.hedge_confidence
                 },
+
                 confidence: x.confidence,
                 reasons: x.reasons,
                 reasons_text: (x.reasons || []).slice(0, 3).map(r => `${r.factor}:${r.value}(${r.contribution >= 0 ? "+" : ""}${r.contribution})`),
+
                 // Keep hedge metrics for state/debug
                 hedge_metrics: {
                   vol_1h_pct: x.vol_1h_pct,
@@ -1941,36 +2012,44 @@ jobs:
                 }
               };
             });
+
             // Convert v2 ideas to v1-compatible shape for current Worker
             const toV1Compat = (pv2) => ({
               idea_id: pv2.idea_id,
               client_order_id: pv2.client_order_id,
+
               symbol: pv2.symbol,
               symbol_full: pv2.symbol_full,
               quote: pv2.quote,
               side: pv2.side,
               rank: pv2.rank,
+
               // v1 entry shape
               entry_policy: "smart_swing_limit",
               entry_type: "limit",
               activation: "on_fill",
+
               entry_mid: pv2.entry_mid,
               entry_limit: pv2.entry_limit,
               tp_abs: pv2.tp_abs,
               sl_abs: pv2.sl_abs,
+
               tp_bps: pv2.tp_bps,
               sl_bps: pv2.sl_bps,
               rrr: pv2.rrr,
               exp_lcb_bps: pv2.exp_lcb_bps,
               ev_bps: pv2.ev_bps,
               cost_bps: pv2.cost_bps,
+
               p_win: pv2.p_lcb,
               p_lcb: pv2.p_lcb,
               p_raw: pv2.p_raw,
               calib_key: pv2.calib_key,
               regime: pv2.regime,
+
               ttl_sec: pv2.ttl_sec,
               size_bps: pv2.size_bps,
+
               predicted: {
                 ...pv2.predicted,
                 meta: {
@@ -1989,12 +2068,15 @@ jobs:
                   }
                 }
               },
+
               confidence: pv2.confidence,
               reasons: pv2.reasons,
               reasons_text: pv2.reasons_text,
               hedge_metrics: pv2.hedge_metrics
             });
+
             let picks = picksV2.map(toV1Compat);
+
             // Portfolio VaR/ES throttle on sizes
             try {
               // For hedge trades, simplified size allocation based on volatility
@@ -2007,6 +2089,7 @@ jobs:
             } catch (e) {
               log("[gha] Portfolio risk adjustment warn", e?.message || e);
             }
+
             // Update state with pending ideas + cooldowns
             try {
               const nowMs = Date.now();
@@ -2018,33 +2101,41 @@ jobs:
                   ts: ideasTs,
                   ts_ms: nowMs,
                   ttl_ts_ms: nowMs + p.ttl_sec * 1000,
+
                   symbolFull: p.symbol_full,
                   flipped: p.predicted?.flipped || false,
                   base: p.symbol,
                   quote: p.quote,
                   side: p.side,
+
                   entry_limit: p.entry_limit,
                   tp_abs: p.tp_abs,
                   sl_abs: p.sl_abs,
+
                   hold_sec: p.ttl_sec,
                   tp_bps: p.tp_bps,
                   sl_bps: p.sl_bps,
                   cost_bps: p.cost_bps,
                   tier: p.tier || "confidence",
+
                   p_lcb: p.p_lcb,
                   p_raw: p.p_raw,
                   calib_key: p.calib_key,
                   predicted: p.predicted,
                   regime: p.regime,
+
                   decision_context: {
                     source: "binance_futures",
                     golden_metrics: p.hedge_metrics
                   },
+
                   notional_usd: NOTIONAL,
                   size_bps: p.size_bps,
+
                   idea_id: p.idea_id,
                   client_order_id: p.client_order_id,
                   hedge_metrics: p.hedge_metrics,
+
                   status: "planned",
                   entry_ts_ms: null,
                   entry_price: null,
@@ -2056,11 +2147,13 @@ jobs:
             } catch (e) {
               log("state update warn", e?.message || e);
             }
+
             // Persist state + audit artifacts
             const auditOut = buildAuditOutputs(state);
             log("DEBUG: Pre-save: pending length=", (state.pending || []).length);
             await saveState(persist, state, auditOut, 2, true);
             log("DEBUG: saveState call complete.");
+
             // Build meta and payload
             for (const p of picks) {
               log(`idea ${p.symbol_full} ${p.side} conf=${p.confidence} vol1h=${(p.predicted?.vol_1h_pct || 0).toFixed(2)}% fund=${((p.hedge_metrics?.funding_rate_raw || 0) * 100).toFixed(4)}% reasons=${(p.reasons_text || []).join("; ")}`);
@@ -2081,6 +2174,7 @@ jobs:
               ev_bps: p.ev_bps,
               idea_id: p.idea_id
             }));
+
             const meta = {
               origin: "github_actions",
               reason,
@@ -2120,6 +2214,7 @@ jobs:
                 features_requested: ["maker_join", "post_only", "futures", "hedge_trading", "binance_execution"]
               }
             };
+
             const payload = {
               ts: new Date().toISOString(),
               mode: "normal",
@@ -2142,6 +2237,7 @@ jobs:
             } catch (e) {
               log("push failed", e?.message || e);
             }
+
             // Push v2 ideas to separate endpoint if configured
             if (PUSH_URL_V2) {
               const payloadV2 = {
@@ -2204,14 +2300,18 @@ jobs:
           }
           })();
           NODE
+
           EXIT_CODE=$?
+
           # Shell-level fallback (in case node crashed before posting)
           set -e
           if [[ $EXIT_CODE -ne 0 ]]; then
             echo "[gha] pusher exited with code $EXIT_CODE — sending minimal payload so tail shows a [push] line"
+
             # Sanitize and derive URLs
             raw_push_url="$(printf '%s' "${WORKER_PUSH_URL}" | tr -d '\r\n')"
             health_url="$(printf '%s' "${raw_push_url}" | sed -E 's#/signals/push(\?.*)?$#/health#')"
+
             # 1) Fallback health GET (guaranteed Worker hit)
             echo "[gha] fallback health GET ${health_url}"
             http_code_h=$(curl -g -sS -o /dev/null -w "%{http_code}" \
@@ -2219,6 +2319,7 @@ jobs:
               --max-time 8 \
               "${health_url}" || true)
             echo "[gha] fallback health status ${http_code_h}"
+
             # 2) Minimal POST with 0 ideas
             now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
             payload='{"ts":"'"${now}"'","mode":"normal","source":"external_pusher","meta":{"origin":"github_actions","reason":"fallback_node_error","exchange":"binance_futures"},"top_n":0,"ideas":[]}'
