@@ -2,9 +2,11 @@ name: 3 — Chain End
 on:
   repository_dispatch:
     types: [run_3]
+
 concurrency:
   group: chain-3          # only one run active at a time
   cancel-in-progress: false  # queue, never cancel
+
 jobs:
   run:
     runs-on: ubuntu-latest
@@ -13,6 +15,7 @@ jobs:
       - name: Log trigger source
         run: |
           echo "Triggered by: ${{ github.event.client_payload.source || 'chain_2' }}"
+
       - name: Check 5-minute gap (Cancel in 2nd minute if < 5 min gap)
         env:
           GH_TOKEN: ${{ secrets.PAT_TOKEN }}
@@ -23,6 +26,7 @@ jobs:
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
             | jq -r '.workflow_id')
+
           # Find the most recent OTHER run's creation timestamp
           LAST_CREATED=$(curl -s \
             -H "Authorization: token $GH_TOKEN" \
@@ -30,14 +34,17 @@ jobs:
             "https://api.github.com/repos/${{ github.repository }}/actions/workflows/${WORKFLOW_ID}/runs?per_page=10" \
             | jq -r --argjson cur ${{ github.run_id }} \
                 '[.workflow_runs[] | select(.id != $cur)] | .[0].created_at // empty')
+
           if [ -z "$LAST_CREATED" ]; then
             echo "No previous run found — proceeding immediately."
             exit 0
           fi
+
           LAST_TS=$(date -d "$LAST_CREATED" +%s)
           NOW_TS=$(date +%s)
           DIFF=$(( NOW_TS - LAST_TS ))
           MIN_GAP=300   # 5 minutes in seconds
+
           if [ "$DIFF" -lt "$MIN_GAP" ]; then
             echo "5-minute gap scenario triggered: Previous run was ${DIFF}s ago (< 5 minutes)."
             echo "Waiting 2 minutes (120 seconds) before cancelling..."
@@ -56,17 +63,27 @@ jobs:
           else
             echo "Previous run was triggered ${DIFF}s ago — 5-minute gap satisfied, proceeding."
           fi
+
       - name: Sleep 1 minute
         run: sleep 60
+
       - name: Check hedge win-rate (Worker 1) — gate X
         id: winrate
         env:
           BALANCE_MONITOR_URL: ${{ secrets.BALANCE_MONITOR_URL }}
+          HEDGE_ENABLED: ${{ secrets.HEDGE_ENABLED || 'true' }} # Set to 'true' or 'false'
         run: |
-          set +e   # don't let curl/jq failures kill the step — we handle errors ourselves
+          # 1. Check if Hedge is enabled
+          if [ "$HEDGE_ENABLED" != "true" ]; then
+            echo "⏸️ Hedge is OFF — skipping 5-trade win-rate check."
+            echo "run_x=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # 2. If Hedge is ON, run current behavior
+          set +e   # don't let curl/jq failures kill the step — handle errors manually
           BASE="${BALANCE_MONITOR_URL%/}"
           echo "Using base: $BASE"
-
           RESP=$(curl -s -m 15 "$BASE/winrate")
           echo "Raw response: $RESP"
 
@@ -91,6 +108,7 @@ jobs:
             echo "🛑 Win-rate ${RATE}% < 60% — X will NOT run."
           fi
           exit 0
+
       - name: Trigger X
         if: steps.winrate.outputs.run_x == 'true'
         env:
@@ -101,6 +119,7 @@ jobs:
             -H "Accept: application/vnd.github+json" \
             https://api.github.com/repos/${{ github.repository }}/dispatches \
             -d '{"event_type":"run_X"}'
+
       - name: Restart Chain 1
         env:
           PAT: ${{ secrets.PAT_TOKEN }}
