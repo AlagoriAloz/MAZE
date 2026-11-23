@@ -1,64 +1,131 @@
-name: 🔄 A3 (20 min)
+name: 3 — Chain End
 on:
   repository_dispatch:
-    types: [run_A3]
-  workflow_dispatch: {}
-permissions:
-  actions: write
-  contents: write
+    types: [run_3]
+
+concurrency:
+  group: chain-3          # only one run active at a time
+  cancel-in-progress: false  # queue, never cancel
+
 jobs:
-  a3:
+  run:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 10
     steps:
-      - name: 🛡️ Guard - cancel if another A3 is running
-        id: guard
-        uses: actions/github-script@v7
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          script: |
-            const { owner, repo } = context.repo;
-            const myRunId = context.runId;
-            const me = await github.rest.actions.getWorkflowRun({ owner, repo, run_id: myRunId });
-            const workflowId = me.data.workflow_id;
-            const others = [];
-            for (const status of ['in_progress', 'queued', 'waiting', 'pending']) {
-              const runs = await github.rest.actions.listWorkflowRuns({
-                owner, repo, workflow_id: workflowId, status, per_page: 100
-              });
-              for (const run of runs.data.workflow_runs) {
-                if (run.id !== myRunId && run.id < myRunId) { others.push(run); }
-              }
-            }
-            if (others.length === 0) {
-              core.setOutput('skip', 'false');
-              return;
-            }
-            core.setOutput('skip', 'true');
-            await github.rest.actions.cancelWorkflowRun({ owner, repo, run_id: myRunId });
-      - name: 🚀 A3 Work
-        if: steps.guard.outputs.skip != 'true'
+      - name: Log trigger source
         run: |
-          echo "⏳ A3 started at $(date)"
-          sleep 300  # 20 minutes
-          echo "✅ A3 done at $(date)"
-      - name: 🔁 Trigger X and Restart Loop (A1)
-        if: steps.guard.outputs.skip != 'true'
-        uses: actions/github-script@v7
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          script: |
-            // 1. Trigger X (Ideas Pusher)
-            await github.rest.repos.createDispatchEvent({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              event_type: 'run_X'
-            });
-            console.log('✅ Dispatched run_X');
-            // 2. Trigger A1 (Restart the loop)
-            await github.rest.repos.createDispatchEvent({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              event_type: 'run_A1'
-            });
-            console.log('✅ Dispatched run_A1');
+          echo "Triggered by: ${{ github.event.client_payload.source || 'chain_2' }}"
+
+      - name: Check 5-minute gap (Cancel in 2nd minute if < 5 min gap)
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          # Resolve numeric workflow ID from the current run
+          WORKFLOW_ID=$(curl -s \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            | jq -r '.workflow_id')
+
+          # Find the most recent OTHER run's creation timestamp
+          LAST_CREATED=$(curl -s \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/${WORKFLOW_ID}/runs?per_page=10" \
+            | jq -r --argjson cur ${{ github.run_id }} \
+                '[.workflow_runs[] | select(.id != $cur)] | .[0].created_at // empty')
+
+          if [ -z "$LAST_CREATED" ]; then
+            echo "No previous run found — proceeding immediately."
+            exit 0
+          fi
+
+          LAST_TS=$(date -d "$LAST_CREATED" +%s)
+          NOW_TS=$(date +%s)
+          DIFF=$(( NOW_TS - LAST_TS ))
+          MIN_GAP=300   # 5 minutes in seconds
+
+          if [ "$DIFF" -lt "$MIN_GAP" ]; then
+            echo "5-minute gap scenario triggered: Previous run was ${DIFF}s ago (< 5 minutes)."
+            echo "Waiting 2 minutes (120 seconds) before cancelling..."
+            
+            # Wait 2 minutes (120 seconds)
+            sleep 120
+            
+            echo "2 minutes reached. Cancelling this run..."
+            curl -s -X POST \
+              -H "Authorization: token $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/cancel"
+            
+            sleep 5
+            exit 1
+          else
+            echo "Previous run was triggered ${DIFF}s ago — 5-minute gap satisfied, proceeding."
+          fi
+
+      - name: Sleep 1 minute
+        run: sleep 60
+
+      - name: Check hedge win-rate (Worker 1) — gate X
+        id: winrate
+        env:
+          BALANCE_MONITOR_URL: ${{ secrets.BALANCE_MONITOR_URL }}
+          HEDGE_ENABLED: ${{ secrets.HEDGE_ENABLED || 'true' }} # Set to 'true' or 'false'
+        run: |
+          # 1. Check if Hedge is enabled
+          if [ "$HEDGE_ENABLED" != "true" ]; then
+            echo "⏸️ Hedge is OFF — skipping 5-trade win-rate check."
+            echo "run_x=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # 2. If Hedge is ON, run current behavior
+          set +e   # don't let curl/jq failures kill the step — handle errors manually
+          BASE="${BALANCE_MONITOR_URL%/}"
+          echo "Using base: $BASE"
+          RESP=$(curl -s -m 15 "$BASE/winrate")
+          echo "Raw response: $RESP"
+
+          if ! echo "$RESP" | jq -e . >/dev/null 2>&1; then
+            echo "⚠️ Response is not valid JSON — blocking X as a safe default."
+            echo "run_x=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          RATE=$(echo "$RESP" | jq -r '.hedge.last5.rate // empty')
+          TOTAL=$(echo "$RESP" | jq -r '.hedge.last5.total // 0')
+          echo "Hedge last5 win-rate: rate=$RATE total=$TOTAL"
+
+          if [ -z "$RATE" ]; then
+            echo "run_x=false" >> "$GITHUB_OUTPUT"
+            echo "⚠️ rate field missing — blocking X as a safe default."
+          elif awk "BEGIN{exit !($RATE>=60)}"; then
+            echo "run_x=true" >> "$GITHUB_OUTPUT"
+            echo "✅ Win-rate ${RATE}% >= 60% — X will run."
+          else
+            echo "run_x=false" >> "$GITHUB_OUTPUT"
+            echo "🛑 Win-rate ${RATE}% < 60% — X will NOT run."
+          fi
+          exit 0
+
+      - name: Trigger X
+        if: steps.winrate.outputs.run_x == 'true'
+        env:
+          PAT: ${{ secrets.PAT_TOKEN }}
+        run: |
+          curl -s -X POST \
+            -H "Authorization: token $PAT" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/${{ github.repository }}/dispatches \
+            -d '{"event_type":"run_X"}'
+
+      - name: Restart Chain 1
+        env:
+          PAT: ${{ secrets.PAT_TOKEN }}
+        run: |
+          curl -s -X POST \
+            -H "Authorization: token $PAT" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/${{ github.repository }}/dispatches \
+            -d '{"event_type":"run_1","client_payload":{"source":"chain_3_loop"}}'
