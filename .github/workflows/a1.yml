@@ -1,0 +1,29 @@
+name: 🔄 A1 (20 min)
+on:
+  repository_dispatch:
+    types: [run_A1]
+  workflow_dispatch: {}  # Manual start
+permissions:
+  actions: write
+  contents: write
+jobs:
+  a1:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: 🚀 A1 Work
+        run: |
+          echo "⏳ A1 started at $(date)"
+          sleep 300  # 20 minutes
+          echo "✅ A1 done at $(date)"
+      - name: ➡️ Trigger A2
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            await github.rest.repos.createDispatchEvent({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              event_type: 'run_A2'
+            });
+            console.log('✅ Triggered A2');
