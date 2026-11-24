@@ -9,6 +9,7 @@ jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # environment: your-environment-name   # <-- uncomment ONLY if HEDGE_ENABLED is stored under Settings → Environments
     steps:
       - name: Log trigger source
         run: |
@@ -69,18 +70,36 @@ jobs:
         id: winrate
         env:
           BALANCE_MONITOR_URL: ${{ secrets.BALANCE_MONITOR_URL }}
-          HEDGE_ENABLED: ${{ secrets.HEDGE_ENABLED || 'true' }} # Set to 'true' or 'false'
+          # Reads Variable first, then Secret, then defaults to 'true'
+          # accepts: true/false, on/off, 1/0, yes/no
+          HEDGE_ENABLED: ${{ vars.HEDGE_ENABLED || secrets.HEDGE_ENABLED || 'true' }}
         run: |
-          # Normalize value (so "True", "TRUE", " true " all count as true)
-          HEDGE_NORM=$(echo "$HEDGE_ENABLED" | tr '[:upper:]' '[:lower:]' | xargs)
+          # Normalize: lowercase + remove all whitespace
+          HEDGE_NORM=$(echo "$HEDGE_ENABLED" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
 
           echo "=============================================="
           echo " HEDGE GATE — decision log"
           echo "=============================================="
-          echo "Q1: Is HEDGE_ENABLED true?  (value = '$HEDGE_NORM')"
+          echo "HEDGE_ENABLED raw value = '$HEDGE_ENABLED' → normalized = '$HEDGE_NORM'"
+
+          # Map the value to ON / OFF
+          case "$HEDGE_NORM" in
+            true|on|1|yes)
+              HEDGE_STATE="on"
+              ;;
+            false|off|0|no)
+              HEDGE_STATE="off"
+              ;;
+            *)
+              echo "⚠️ Unrecognized value '$HEDGE_NORM' — treating Hedge as ON (safe default)."
+              HEDGE_STATE="on"
+              ;;
+          esac
+
+          echo "Q1: Is Hedge ON?"
 
           # ---------- CASE A: Hedge OFF ----------
-          if [ "$HEDGE_NORM" != "true" ]; then
+          if [ "$HEDGE_STATE" = "off" ]; then
             echo "A1: NO  → Hedge is OFF"
             echo "A2: Win-rate check SKIPPED (not needed)"
             echo "A3: DECISION → run_x=true  → X WILL RUN ✅"
