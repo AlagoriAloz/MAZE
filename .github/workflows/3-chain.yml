@@ -9,21 +9,7 @@ jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    # environment: your-environment-name   # <-- uncomment ONLY if HEDGE_ENABLED is stored under Settings → Environments
     steps:
-      - name: Version marker
-        run: echo "WORKFLOW VERSION = v4-vars-enabled"
-
-      - name: DEBUG — where does HEDGE_ENABLED come from?
-        env:
-          V_VAL: ${{ vars.HEDGE_ENABLED }}
-          S_VAL: ${{ secrets.HEDGE_ENABLED }}
-        run: |
-          echo "workflow file: ${{ github.workflow_ref }}"
-          echo "ref: ${{ github.ref }}  (default branch: ${{ github.event.repository.default_branch }})"
-          echo "vars.HEDGE_ENABLED   = '${V_VAL}'  (empty means NOT FOUND)"
-          if [ -n "$S_VAL" ]; then echo "secrets.HEDGE_ENABLED = SET (hidden)"; else echo "secrets.HEDGE_ENABLED = NOT FOUND"; fi
-
       - name: Log trigger source
         run: |
           echo "Triggered by: ${{ github.event.client_payload.source || 'chain_2' }}"
@@ -83,36 +69,18 @@ jobs:
         id: winrate
         env:
           BALANCE_MONITOR_URL: ${{ secrets.BALANCE_MONITOR_URL }}
-          # Reads Variable first, then Secret, then defaults to 'true'
-          # accepts: true/false, on/off, 1/0, yes/no
-          HEDGE_ENABLED: ${{ vars.HEDGE_ENABLED || secrets.HEDGE_ENABLED || 'true' }}
+          HEDGE_ENABLED: ${{ vars.HEDGE_ENABLED || 'true' }} # Read from Variables. Set to 'true' or 'false'
         run: |
-          # Normalize: lowercase + remove all whitespace
-          HEDGE_NORM=$(echo "$HEDGE_ENABLED" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+          # Normalize value (so "True", "TRUE", " true " all count as true)
+          HEDGE_NORM=$(echo "$HEDGE_ENABLED" | tr '[:upper:]' '[:lower:]' | xargs)
 
           echo "=============================================="
           echo " HEDGE GATE — decision log"
           echo "=============================================="
-          echo "HEDGE_ENABLED raw value = '$HEDGE_ENABLED' → normalized = '$HEDGE_NORM'"
-
-          # Map the value to ON / OFF
-          case "$HEDGE_NORM" in
-            true|on|1|yes)
-              HEDGE_STATE="on"
-              ;;
-            false|off|0|no)
-              HEDGE_STATE="off"
-              ;;
-            *)
-              echo "⚠️ Unrecognized value '$HEDGE_NORM' — treating Hedge as ON (safe default)."
-              HEDGE_STATE="on"
-              ;;
-          esac
-
-          echo "Q1: Is Hedge ON?"
+          echo "Q1: Is HEDGE_ENABLED true?  (value = '$HEDGE_NORM')"
 
           # ---------- CASE A: Hedge OFF ----------
-          if [ "$HEDGE_STATE" = "off" ]; then
+          if [ "$HEDGE_NORM" != "true" ]; then
             echo "A1: NO  → Hedge is OFF"
             echo "A2: Win-rate check SKIPPED (not needed)"
             echo "A3: DECISION → run_x=true  → X WILL RUN ✅"
