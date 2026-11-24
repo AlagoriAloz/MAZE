@@ -13,7 +13,7 @@ jobs:
       - name: Log trigger source
         run: |
           echo "Triggered by: ${{ github.event.client_payload.source || 'chain_2' }}"
-          
+
       - name: Check 5-minute gap (Cancel in 2nd minute if < 5 min gap)
         env:
           GH_TOKEN: ${{ secrets.PAT_TOKEN }}
@@ -46,16 +46,16 @@ jobs:
           if [ "$DIFF" -lt "$MIN_GAP" ]; then
             echo "5-minute gap scenario triggered: Previous run was ${DIFF}s ago (< 5 minutes)."
             echo "Waiting 2 minutes (120 seconds) before cancelling..."
-            
+
             # Wait 2 minutes (120 seconds)
             sleep 120
-            
+
             echo "2 minutes reached. Cancelling this run..."
             curl -s -X POST \
               -H "Authorization: token $GH_TOKEN" \
               -H "Accept: application/vnd.github+json" \
               "https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/cancel"
-            
+
             sleep 5
             exit 1
           else
@@ -71,14 +71,30 @@ jobs:
           BALANCE_MONITOR_URL: ${{ secrets.BALANCE_MONITOR_URL }}
           HEDGE_ENABLED: ${{ secrets.HEDGE_ENABLED || 'true' }} # Set to 'true' or 'false'
         run: |
-          # 1. If Hedge is OFF, bypass win-rate check and allow X to run
-          if [ "$HEDGE_ENABLED" != "true" ]; then
-            echo "⏸️ Hedge is OFF — skipping win-rate check and proceeding with X."
+          # Normalize value (so "True", "TRUE", " true " all count as true)
+          HEDGE_NORM=$(echo "$HEDGE_ENABLED" | tr '[:upper:]' '[:lower:]' | xargs)
+
+          echo "=============================================="
+          echo " HEDGE GATE — decision log"
+          echo "=============================================="
+          echo "Q1: Is HEDGE_ENABLED true?  (value = '$HEDGE_NORM')"
+
+          # ---------- CASE A: Hedge OFF ----------
+          if [ "$HEDGE_NORM" != "true" ]; then
+            echo "A1: NO  → Hedge is OFF"
+            echo "A2: Win-rate check SKIPPED (not needed)"
+            echo "A3: DECISION → run_x=true  → X WILL RUN ✅"
             echo "run_x=true" >> "$GITHUB_OUTPUT"
+            echo "### Hedge gate" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Hedge: **OFF**" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Win-rate check: **skipped**" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Result: **X runs ✅**" >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
 
-          # 2. If Hedge is ON, enforce the win-rate check
+          # ---------- CASE B: Hedge ON ----------
+          echo "A1: YES → Hedge is ON"
+          echo "A2: Checking win-rate (needs >= 60%)..."
           set +e   # don't let curl/jq failures kill the step — handle errors manually
           BASE="${BALANCE_MONITOR_URL%/}"
           echo "Using base: $BASE"
@@ -86,25 +102,41 @@ jobs:
           echo "Raw response: $RESP"
 
           if ! echo "$RESP" | jq -e . >/dev/null 2>&1; then
-            echo "⚠️ Response is not valid JSON — blocking X as a safe default."
+            echo "A3: Response is NOT valid JSON"
+            echo "A4: DECISION → run_x=false → X WILL NOT RUN 🛑 (safe default)"
             echo "run_x=false" >> "$GITHUB_OUTPUT"
+            echo "### Hedge gate" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Hedge: **ON**" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Win-rate: **invalid response**" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Result: **X blocked 🛑**" >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
 
           RATE=$(echo "$RESP" | jq -r '.hedge.last5.rate // empty')
           TOTAL=$(echo "$RESP" | jq -r '.hedge.last5.total // 0')
-          echo "Hedge last5 win-rate: rate=$RATE total=$TOTAL"
+          echo "A3: Hedge last5 → rate=${RATE:-missing}  total=$TOTAL"
 
           if [ -z "$RATE" ]; then
+            echo "A4: Rate field missing"
+            echo "A5: DECISION → run_x=false → X WILL NOT RUN 🛑 (safe default)"
             echo "run_x=false" >> "$GITHUB_OUTPUT"
-            echo "⚠️ rate field missing — blocking X as a safe default."
+            RESULT="X blocked 🛑 (rate missing)"
           elif awk "BEGIN{exit !($RATE>=60)}"; then
+            echo "A4: Win-rate ${RATE}% >= 60%"
+            echo "A5: DECISION → run_x=true → X WILL RUN ✅"
             echo "run_x=true" >> "$GITHUB_OUTPUT"
-            echo "✅ Win-rate ${RATE}% >= 60% — X will run."
+            RESULT="X runs ✅"
           else
+            echo "A4: Win-rate ${RATE}% < 60%"
+            echo "A5: DECISION → run_x=false → X WILL NOT RUN 🛑"
             echo "run_x=false" >> "$GITHUB_OUTPUT"
-            echo "🛑 Win-rate ${RATE}% < 60% — X will NOT run."
+            RESULT="X blocked 🛑"
           fi
+
+          echo "### Hedge gate" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Hedge: **ON**" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Win-rate (last5): **${RATE:-n/a}%** (total trades: $TOTAL)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Result: **$RESULT**" >> "$GITHUB_STEP_SUMMARY"
           exit 0
 
       - name: Trigger X
@@ -112,11 +144,18 @@ jobs:
         env:
           PAT: ${{ secrets.PAT_TOKEN }}
         run: |
+          echo "▶️ run_x=true → dispatching event 'run_X'..."
           curl -s -X POST \
             -H "Authorization: token $PAT" \
             -H "Accept: application/vnd.github+json" \
             https://api.github.com/repos/${{ github.repository }}/dispatches \
             -d '{"event_type":"run_X"}'
+          echo "✅ run_X dispatched."
+
+      - name: X skipped (log only)
+        if: steps.winrate.outputs.run_x != 'true'
+        run: |
+          echo "⏭️ run_x=false → X was NOT triggered this cycle."
 
       - name: Restart Chain 1
         env:
