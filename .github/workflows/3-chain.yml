@@ -2,11 +2,9 @@ name: 3 — Chain End
 on:
   repository_dispatch:
     types: [run_3]
-
 concurrency:
   group: chain-3          # only one run active at a time
   cancel-in-progress: false  # queue, never cancel
-
 jobs:
   run:
     runs-on: ubuntu-latest
@@ -15,7 +13,7 @@ jobs:
       - name: Log trigger source
         run: |
           echo "Triggered by: ${{ github.event.client_payload.source || 'chain_2' }}"
-
+          
       - name: Check 5-minute gap (Cancel in 2nd minute if < 5 min gap)
         env:
           GH_TOKEN: ${{ secrets.PAT_TOKEN }}
@@ -73,14 +71,14 @@ jobs:
           BALANCE_MONITOR_URL: ${{ secrets.BALANCE_MONITOR_URL }}
           HEDGE_ENABLED: ${{ secrets.HEDGE_ENABLED || 'true' }} # Set to 'true' or 'false'
         run: |
-          # 1. Check if Hedge is enabled
+          # 1. If Hedge is OFF, bypass win-rate check and allow X to run
           if [ "$HEDGE_ENABLED" != "true" ]; then
-            echo "⏸️ Hedge is OFF — skipping 5-trade win-rate check."
-            echo "run_x=false" >> "$GITHUB_OUTPUT"
+            echo "⏸️ Hedge is OFF — skipping win-rate check and proceeding with X."
+            echo "run_x=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          # 2. If Hedge is ON, run current behavior
+          # 2. If Hedge is ON, enforce the win-rate check
           set +e   # don't let curl/jq failures kill the step — handle errors manually
           BASE="${BALANCE_MONITOR_URL%/}"
           echo "Using base: $BASE"
