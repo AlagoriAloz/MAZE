@@ -243,8 +243,8 @@ jobs:
           const MEXC_BASES=[process.env.MEXC_BASE,"https://api.mexc.com","https://www.mexc.com"].filter(Boolean);
           
           // Binance Futures endpoints (public, no API key needed)
-          const BINANCE_FAPI = " https://railway-2-63tt.onrender.com/testnet";
-          const BINANCE_SPOT = " https://railway-2-63tt.onrender.com/testnet";
+          const BINANCE_FAPI = " https://lonely-manya-mazetofutures-c11b521d.koyeb.app/testnet";
+          const BINANCE_SPOT = " https://lonely-manya-mazetofutures-c11b521d.koyeb.app/testnet";
           
           const MIN_TF_ALIGN=(Number(process.env.MIN_TF_ALIGN||"0.60"));
           let TF_WEIGHTS={}; try{ TF_WEIGHTS=JSON.parse(process.env.TF_WEIGHTS||"{}"); }catch{ TF_WEIGHTS={}; }
