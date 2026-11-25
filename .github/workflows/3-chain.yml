@@ -1,33 +1,46 @@
 name: 3 — Chain End
+
 on:
   repository_dispatch:
     types: [run_3]
+
 concurrency:
-  group: chain-3          # only one run active at a time
-  cancel-in-progress: false  # queue, never cancel
+  group: chain-3          # Only one run active at a time
+  cancel-in-progress: false  # Queue, never cancel queued jobs
+
 jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+
     steps:
       - name: Log trigger source
         run: |
           echo "Triggered by: ${{ github.event.client_payload.source || 'chain_2' }}"
 
-      - name: Check 5-minute gap (Cancel in 2nd minute if < 5 min gap)
+      - name: Check 5-minute gap
+        id: check_gap
         env:
-          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
         run: |
-          # Resolve numeric workflow ID from the current run
-          WORKFLOW_ID=$(curl -s \
-            -H "Authorization: token $GH_TOKEN" \
+          set -e
+
+          # 1. Resolve numeric workflow ID
+          WORKFLOW_ID=$(curl -s -m 10 \
+            -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
-            | jq -r '.workflow_id')
+            | jq -r '.workflow_id // empty')
 
-          # Find the most recent OTHER run's creation timestamp
-          LAST_CREATED=$(curl -s \
-            -H "Authorization: token $GH_TOKEN" \
+          if [ -z "$WORKFLOW_ID" ]; then
+            echo "⚠️ Could not resolve workflow ID. Proceeding safely."
+            exit 0
+          fi
+
+          # 2. Find creation timestamp of the previous run
+          LAST_CREATED=$(curl -s -m 10 \
+            -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${{ github.repository }}/actions/workflows/${WORKFLOW_ID}/runs?per_page=10" \
             | jq -r --argjson cur ${{ github.run_id }} \
@@ -44,23 +57,22 @@ jobs:
           MIN_GAP=300   # 5 minutes in seconds
 
           if [ "$DIFF" -lt "$MIN_GAP" ]; then
-            echo "5-minute gap scenario triggered: Previous run was ${DIFF}s ago (< 5 minutes)."
-            echo "Waiting 2 minutes (120 seconds) before cancelling..."
-
-            # Wait 2 minutes (120 seconds)
+            echo "⚠️ Rate limit hit: Previous run was ${DIFF}s ago (< 300s)."
+            echo "Waiting 120s before cancelling run..."
             sleep 120
 
-            echo "2 minutes reached. Cancelling this run..."
-            curl -s -X POST \
-              -H "Authorization: token $GH_TOKEN" \
+            echo "Cancelling this run via GitHub API..."
+            curl -s -m 10 -X POST \
+              -H "Authorization: Bearer $PAT_TOKEN" \
               -H "Accept: application/vnd.github+json" \
               "https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/cancel"
 
-            sleep 5
+            # Sleep to allow GitHub runner to catch the cancel signal cleanly
+            sleep 30
             exit 1
-          else
-            echo "Previous run was triggered ${DIFF}s ago — 5-minute gap satisfied, proceeding."
           fi
+
+          echo "✅ Previous run was ${DIFF}s ago — 5-minute gap satisfied."
 
       - name: Sleep 1 minute
         run: sleep 60
@@ -69,25 +81,25 @@ jobs:
         id: winrate
         env:
           BALANCE_MONITOR_URL: ${{ secrets.BALANCE_MONITOR_URL }}
-          HEDGE_ENABLED: ${{ secrets.HEDGE_ENABLED || 'true' }} # Set to 'true' or 'false'
+          HEDGE_ENABLED: ${{ vars.HEDGE_ENABLED || 'true' }}
         run: |
-          # Normalize value (so "True", "TRUE", " true " all count as true)
           HEDGE_NORM=$(echo "$HEDGE_ENABLED" | tr '[:upper:]' '[:lower:]' | xargs)
 
           echo "=============================================="
           echo " HEDGE GATE — decision log"
           echo "=============================================="
-          echo "Q1: Is HEDGE_ENABLED true?  (value = '$HEDGE_NORM')"
+          echo "Q1: Is HEDGE_ENABLED true? (value = '$HEDGE_NORM')"
 
           # ---------- CASE A: Hedge OFF ----------
-          if [ "$HEDGE_NORM" != "true" ]; then
-            echo "A1: NO  → Hedge is OFF"
-            echo "A2: Win-rate check SKIPPED (not needed)"
-            echo "A3: DECISION → run_x=true  → X WILL RUN ✅"
+          if [ "$HEDGE_NORM" != "true" ] && [ "$HEDGE_NORM" != "on" ]; then
+            echo "A1: NO → Hedge is OFF"
+            echo "A2: Win-rate check SKIPPED"
+            echo "A3: DECISION → run_x=true → X WILL RUN ✅"
             echo "run_x=true" >> "$GITHUB_OUTPUT"
+
             echo "### Hedge gate" >> "$GITHUB_STEP_SUMMARY"
             echo "- Hedge: **OFF**" >> "$GITHUB_STEP_SUMMARY"
-            echo "- Win-rate check: **skipped**" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Win-rate check: **Skipped**" >> "$GITHUB_STEP_SUMMARY"
             echo "- Result: **X runs ✅**" >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
@@ -95,33 +107,34 @@ jobs:
           # ---------- CASE B: Hedge ON ----------
           echo "A1: YES → Hedge is ON"
           echo "A2: Checking win-rate (needs >= 60%)..."
-          set +e   # don't let curl/jq failures kill the step — handle errors manually
+
+          set +e
           BASE="${BALANCE_MONITOR_URL%/}"
-          echo "Using base: $BASE"
           RESP=$(curl -s -m 15 "$BASE/winrate")
           echo "Raw response: $RESP"
 
           if ! echo "$RESP" | jq -e . >/dev/null 2>&1; then
             echo "A3: Response is NOT valid JSON"
-            echo "A4: DECISION → run_x=false → X WILL NOT RUN 🛑 (safe default)"
+            echo "A4: DECISION → run_x=false → X WILL NOT RUN 🛑"
             echo "run_x=false" >> "$GITHUB_OUTPUT"
+
             echo "### Hedge gate" >> "$GITHUB_STEP_SUMMARY"
             echo "- Hedge: **ON**" >> "$GITHUB_STEP_SUMMARY"
-            echo "- Win-rate: **invalid response**" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Win-rate: **Invalid JSON Response**" >> "$GITHUB_STEP_SUMMARY"
             echo "- Result: **X blocked 🛑**" >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
 
           RATE=$(echo "$RESP" | jq -r '.hedge.last5.rate // empty')
           TOTAL=$(echo "$RESP" | jq -r '.hedge.last5.total // 0')
-          echo "A3: Hedge last5 → rate=${RATE:-missing}  total=$TOTAL"
+          echo "A3: Hedge last5 → rate=${RATE:-missing} total=$TOTAL"
 
-          if [ -z "$RATE" ]; then
+          if [ -z "$RATE" ] || [ "$RATE" = "null" ]; then
             echo "A4: Rate field missing"
-            echo "A5: DECISION → run_x=false → X WILL NOT RUN 🛑 (safe default)"
+            echo "A5: DECISION → run_x=false → X WILL NOT RUN 🛑"
             echo "run_x=false" >> "$GITHUB_OUTPUT"
             RESULT="X blocked 🛑 (rate missing)"
-          elif awk "BEGIN{exit !($RATE>=60)}"; then
+          elif awk -v rate="$RATE" 'BEGIN { exit !(rate >= 60) }'; then
             echo "A4: Win-rate ${RATE}% >= 60%"
             echo "A5: DECISION → run_x=true → X WILL RUN ✅"
             echo "run_x=true" >> "$GITHUB_OUTPUT"
@@ -145,8 +158,8 @@ jobs:
           PAT: ${{ secrets.PAT_TOKEN }}
         run: |
           echo "▶️ run_x=true → dispatching event 'run_X'..."
-          curl -s -X POST \
-            -H "Authorization: token $PAT" \
+          curl -s -m 10 -X POST \
+            -H "Authorization: Bearer $PAT" \
             -H "Accept: application/vnd.github+json" \
             https://api.github.com/repos/${{ github.repository }}/dispatches \
             -d '{"event_type":"run_X"}'
@@ -161,9 +174,10 @@ jobs:
         env:
           PAT: ${{ secrets.PAT_TOKEN }}
         run: |
-          curl -s -X POST \
-            -H "Authorization: token $PAT" \
+          echo "🔁 Looping back to Chain 1..."
+          curl -s -m 10 -X POST \
+            -H "Authorization: Bearer $PAT" \
             -H "Accept: application/vnd.github+json" \
             https://api.github.com/repos/${{ github.repository }}/dispatches \
             -d '{"event_type":"run_1","client_payload":{"source":"chain_3_loop"}}'
-
+          echo "✅ Chain 1 triggered."
