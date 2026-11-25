@@ -1,4 +1,3 @@
-0
 name: Trend Analyzer (Simple Entry/Exit v4.5)
 on:
   repository_dispatch:
